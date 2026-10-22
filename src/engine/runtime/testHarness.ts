@@ -41,6 +41,10 @@ import { LogEngine } from "./engine";
 import { submitNs } from "./logApi";
 import { causalWindowProblem, DEFAULT_TUNING, type EngineOptions, type EngineTuning } from "./options";
 import { retryReaderQuarantine } from "./quarantineRelease";
+import { setEvictedHandleGuard } from "../body/handles";
+
+// Engine tests and the sim (src/sim/device.ts imports this module): an evicted handle used is an error (handles.ts).
+setEvictedHandleGuard(true);
 
 /** Timers shrunk so multi-engine tests settle in well under a second. */
 export const FAST_TUNING: Partial<EngineTuning> = {
@@ -287,8 +291,7 @@ export async function editDoc(e: LogEngine, docId: DocId, fn: (text: Y.Text, doc
 
 /** The doc's replica text (loads it). */
 export async function docText(e: LogEngine, docId: DocId): Promise<string> {
-	const h = await e.c.handles.load(e.streamOf(docId));
-	return h.doc.getText("text").toString();
+	return e.c.handles.withResident(e.streamOf(docId), (h) => h.doc.getText("text").toString());
 }
 
 /** The retry of reader-dependent quarantine that runs after every session start, run now. */

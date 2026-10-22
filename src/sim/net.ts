@@ -507,11 +507,11 @@ export class SimNet {
 			} else if (d.kind === "canvas") {
 				// The relay's canvas state as a fresh device builds it (checkpoint + tail), projected as a merge job would.
 				let done = false;
-				void eng.c.handles.load(eng.streamOf(d.docId)).then((h) => {
+				void eng.c.handles.withResident(eng.streamOf(d.docId), (h) => {
 					const p = projectCanvasBytes(h.doc);
 					if (p.ok) text = p.text;
 					else invalid = p.reason;
-				}, (e) => (invalid = `load failed: ${e instanceof Error ? e.message : String(e)}`)).finally(() => (done = true));
+				}).catch((e: unknown) => (invalid = `load failed: ${e instanceof Error ? e.message : String(e)}`)).finally(() => (done = true));
 				await this.clock.runUntil(() => done, 30_000);
 				if (!done) invalid = "load timed out";
 			}

@@ -177,7 +177,7 @@ export class DocRuntime {
 		});
 	}
 
-	/** Apply rows to one replica in one REMOTE transaction; unresolved refs are kept for retry. */
+	/** Apply rows to one replica in one REMOTE transaction; unresolved refs are kept for retry. The caller pins `h`. */
 	async applyToHandle(h: Handle, rows: readonly TailRecord[], extra: Uint8Array | null = null): Promise<void> {
 		const updates: Uint8Array[] = extra && extra.length > 0 ? [extra] : [];
 		for (const row of rows) {
@@ -207,8 +207,13 @@ export class DocRuntime {
 		if (h.unresolvedRows.length === 0) return;
 		const rows = h.unresolvedRows.splice(0);
 		h.unresolvedRefs = 0;
-		await this.applyToHandle(h, rows);
-		this.checkDoc(h);
+		h.pins++; // across the ref resolution's awaits
+		try {
+			await this.applyToHandle(h, rows);
+			this.checkDoc(h);
+		} finally {
+			this.c.handles.unpin(h); // and the rows grew the replica: the budget is enforced
+		}
 	}
 
 	/** One resolution attempt of a ref row; its outcome counts towards the §10.2 quarantine of the doc. */
@@ -273,7 +278,7 @@ export class DocRuntime {
 			return;
 		}
 		await this.retryHandleRefs(h);
-		if (h.unresolvedRows.length === 0) this.clearRefRetry(stream);
+		if (h.unresolvedRows.length === 0 && this.c.handles.peek(stream) === h) this.clearRefRetry(stream);
 	}
 
 	/**
@@ -339,7 +344,8 @@ export class DocRuntime {
 	private async thaw(h: Handle): Promise<void> {
 		if (!(await this.c.thaw(h.stream, CAUSAL_HOLE))) return;
 		this.holeRereads.delete(h.stream);
-		this.checkDoc(h); // the other stage-3 checks were skipped while it was frozen
+		// The other stage-3 checks were skipped while it was frozen; an eviction meanwhile leaves them to its next load.
+		if (this.c.handles.peek(h.stream) === h) this.checkDoc(h);
 	}
 
 	/**
@@ -382,6 +388,8 @@ export class DocRuntime {
 		if (c.adoptMap.has(key)) return;
 		const g = await gate(c.gateCtx, { t: "provisional", stream: ev.stream, deviceId: ev.deviceId, clientFrameId: ev.clientFrameId, payload: ev.payload });
 		if (!g.ok || g.t !== "body") return; // refs / failures: wait for the committed row
+		// Unbound (and evicted) during the gate: the committed row comes as for any doc that is not bound.
+		if (c.handles.peek(ev.stream) !== h || h.bound === 0) return;
 		h.pins++;
 		let adopted = false;
 		try {
@@ -396,11 +404,11 @@ export class DocRuntime {
 				this.stats.adopted++;
 				adopted = true;
 			});
+			this.checkDoc(h); // still pinned: the unpin below may evict it
 		} finally {
 			c.handles.unpin(h);
 		}
 		if (adopted) c.noteBodyChange([ev.stream]);
-		this.checkDoc(h);
 	}
 
 	onProvisionalDropped(ev: Dropped): Promise<void> {

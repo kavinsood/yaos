@@ -452,18 +452,22 @@ export class EngineCtx {
 		}
 		for (const [stream, rows] of bodies) {
 			if (s.live) this.ckpt.lastActivity.set(stream, mono);
+			// Resident, loading, or a cold doc frozen by a causal hole (load it: the rows may have filled the hole, §d.6
+			// thaw). Pinned across the apply's awaits (ref resolution), so no eviction drops it mid-apply.
 			let h = this.handles.peek(stream);
-			if (!h) {
-				const loading = this.handles.loadingOf(stream);
-				if (loading) h = await loading.catch(() => undefined);
-			}
-			// A cold doc frozen by a causal hole: load it, the rows may have filled the hole (§d.6 thaw).
-			if (!h && this.docs.needsHoleCheck(stream)) h = await this.handles.load(stream).catch(() => undefined);
+			if (h) h.pins++; // not acquire: remote rows do not touch the LRU clock
+			else if (this.handles.loadingOf(stream) !== undefined || this.docs.needsHoleCheck(stream)) h = await this.handles.acquire(stream).catch(() => undefined);
 			if (!h) continue;
-			const ck = read?.stream === stream ? read.checkpointState : null;
-			if (ck || rows.length > 0) await this.docs.applyToHandle(h, rows, ck);
-			this.docs.checkDoc(h);
+			try {
+				const ck = read?.stream === stream ? read.checkpointState : null;
+				if (ck || rows.length > 0) await this.docs.applyToHandle(h, rows, ck);
+				this.docs.checkDoc(h);
+			} finally {
+				h.pins = Math.max(0, h.pins - 1); // the budget is enforced once, below
+			}
 		}
+		// The rows grew resident replicas (and a hole check may have loaded one): evict for them (DESIGN §d.1).
+		if (bodies.size > 0) this.handles.enforceBudget();
 		// Own receipts are the only rows that change nothing here (§d.7).
 		const changed = s.tailPut.filter((r) => r.deviceId !== this.self || !s.skip.has(r.seq)).map((r) => r.stream);
 		if (read && (read.done || read.checkpointState)) changed.push(read.stream);

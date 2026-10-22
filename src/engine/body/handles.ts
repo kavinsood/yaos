@@ -5,7 +5,8 @@
  *
  * load = one Y.transact(LOAD): snapshot, every tail row (refs resolved), then
  * every own non-poisoned outbox record of the stream in order. O(doc), once per
- * residency. Clean-only LRU eviction within maxResidentDocs / maxResidentBytes.
+ * residency. Clean-only LRU eviction within maxResidentDocs / maxResidentBytes: before a load (room for it) and
+ * after it (its bytes), on unpin and unbind, after applied rows (growth) and on every maintenance tick.
  */
 
 import * as Y from "yjs";
@@ -50,6 +51,25 @@ export interface HandleHooks {
 	monotonic(): number;
 }
 
+/**
+ * Debug guard (sim and test builds turn it on; production leaves it off): an evicted or dropped handle's `doc`
+ * throws, and so does grow() on one. A holder that kept a handle across an await without pinning it, and used it
+ * after an eviction, fails loudly instead of editing a destroyed Y.Doc.
+ */
+let evictedGuard = false;
+export function setEvictedHandleGuard(on: boolean): void {
+	evictedGuard = on;
+}
+export class EvictedHandleError extends Error {
+	constructor(detail: string) {
+		super(detail);
+		// Recorded too: an engine path that catches and logs the throw must not hide it from the sim / tests.
+		if (evictedHandleUses.length < 100) evictedHandleUses.push(detail);
+	}
+}
+/** Every EvictedHandleError raised in this process (debug guard on), for the sim's checks. */
+export const evictedHandleUses: string[] = [];
+
 export class HandleManager {
 	private readonly handles = new Map<StreamName, Handle>();
 	private readonly loading = new Map<StreamName, Promise<Handle>>();
@@ -93,17 +113,31 @@ export class HandleManager {
 	}
 
 	/** Load (or return) the handle and pin it; callers must unpin(). */
-	async acquire(stream: StreamName): Promise<Handle> {
-		const h = await this.load(stream);
-		h.pins++;
-		return h;
+	acquire(stream: StreamName): Promise<Handle> {
+		return this.withResident(stream, (h) => {
+			h.pins++;
+			return h;
+		});
+	}
+
+	/**
+	 * Load (or return) the handle and run `fn` on it synchronously while it is resident. Any await between a load
+	 * and its use (a shared load promise resolves its waiters in later microtasks) lets another path's eviction drop
+	 * a clean handle: then it is loaded again. `fn` pins or binds it to keep it past its own return.
+	 */
+	async withResident<T>(stream: StreamName, fn: (h: Handle) => T): Promise<T> {
+		for (;;) {
+			const h = await this.load(stream);
+			if (this.handles.get(stream) === h) return fn(h);
+		}
 	}
 	unpin(h: Handle): void {
 		h.pins = Math.max(0, h.pins - 1);
 		this.enforceBudget();
 	}
 
-	async load(stream: StreamName): Promise<Handle> {
+	/** The handle once loaded; it may be evicted before the caller resumes: use withResident / acquire. */
+	private async load(stream: StreamName): Promise<Handle> {
 		const existing = this.get(stream);
 		if (existing) return existing;
 		const inflight = this.loading.get(stream);
@@ -164,11 +198,14 @@ export class HandleManager {
 		this.handles.set(stream, h);
 		this.loads++;
 		this.hooks.onLoaded(h);
+		// The room made before the load did not know its bytes: evict for them now (not the new handle, the caller's).
+		this.enforceBudget(0, h);
 		return h;
 	}
 
 	/** Account applied bytes towards the residency estimate. */
 	grow(h: Handle, bytes: number): void {
+		if (evictedGuard && this.handles.get(h.stream) !== h) throw new EvictedHandleError(`grow on an evicted handle: ${h.stream}`);
 		h.bytesEstimate += 3 * bytes;
 	}
 
@@ -179,14 +216,21 @@ export class HandleManager {
 		this.handles.delete(stream);
 		h.doc.destroy();
 		this.hooks.onEvict(h);
+		if (evictedGuard) {
+			Object.defineProperty(h, "doc", {
+				get: () => {
+					throw new EvictedHandleError(`evicted handle used: ${stream}`);
+				},
+			});
+		}
 	}
 
-	/** Evict clean handles, LRU first, until within budget (`extra` = slots to make room for). */
-	enforceBudget(extra = 0): void {
+	/** Evict clean handles, LRU first, until within budget (`extra` = slots to make room for; `keep` is not evicted). */
+	enforceBudget(extra = 0, keep?: Handle): void {
 		const overDocs = () => this.handles.size + extra > this.budgets.maxResidentDocs;
 		const overBytes = () => this.bytes > this.budgets.maxResidentBytes;
 		if (!overDocs() && !overBytes()) return;
-		const clean = [...this.handles.values()].filter((h) => this.isClean(h)).sort((a, b) => a.lastAccessMono - b.lastAccessMono);
+		const clean = [...this.handles.values()].filter((h) => h !== keep && this.isClean(h)).sort((a, b) => a.lastAccessMono - b.lastAccessMono);
 		for (const h of clean) {
 			if (!overDocs() && !overBytes()) break;
 			this.drop(h.stream);
