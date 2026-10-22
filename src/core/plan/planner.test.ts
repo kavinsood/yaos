@@ -227,6 +227,10 @@ test("an untracked file of a remote doc renamed away (observed): the doc moves w
 	// body not caught up: the doc waits, the file is not created meanwhile
 	const behind = run({ ...sc, remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, caughtUp: false } })] });
 	assert.deepEqual(behind.ops, [{ op: "wait", docId: "d1", reason: "body-not-caught-up" }]);
+	// ... and only memory has the rename (no synced record to keep it on): the plan asks to keep it (sim suite-1
+	// wipe/revoke/roll seed 40, 16 steps: dropped after this wait, the file became a new doc on the next pass)
+	assert.deepEqual(behind.keepRenames, [{ from: "a.md", to: "b.md", atMs: 1 }]);
+	assert.equal(p.keepRenames, undefined, "moved: nothing to keep");
 });
 
 test("a rename onto the same path key (case only, or the same path) does not hold the doc's edits while ns is not ready", () => {

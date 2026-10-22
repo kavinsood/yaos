@@ -591,6 +591,11 @@ export interface Plan {
 	readonly brake: PlannedBrake | null;
 	/** Fresh docIds consumed from PlannerInput.freshDocIds. */
 	readonly consumedDocIds: number;
+	/**
+	 * Observed renames a doc still waits on that no synced record keeps (an untracked file's move, paired with its
+	 * remote doc): the reconciler keeps them in memory past this plan. Absent = none.
+	 */
+	readonly keepRenames?: readonly ObservedRename[];
 }
 
 /** Signature WP-B implements in src/core/plan/planner.ts. Pure. */

@@ -184,6 +184,18 @@ export function syncedFileKey(s: SyncedEntry, renames: readonly ObservedRename[]
 	return away ? pk(away.to) : s.fileGone ? null : s.pathKey;
 }
 
+/** The observed rename events of the chain starting at `key`, in order. */
+function renameChain(renames: readonly ObservedRename[], key: PathKey, pk: PathKeyFn): ObservedRename[] {
+	let at = key;
+	const out: ObservedRename[] = [];
+	for (const e of [...renames].sort((x, y) => x.atMs - y.atMs)) {
+		if (pk(e.from) !== at) continue;
+		at = pk(e.to);
+		out.push(e);
+	}
+	return out;
+}
+
 /** The end of the observed rename chain starting at `key` (its last event), if any. */
 export function renamedAway(renames: readonly ObservedRename[], key: PathKey, pk: PathKeyFn): { to: VaultPath; atMs: number } | null {
 	let at = key;
@@ -455,6 +467,8 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 	// and the doc came back at the old path, with what the user had deleted in the file (sim suite-1
 	// wipe/revoke/roll seed 40: a canvas edited while key-missing, renamed after an epoch restore).
 	const movedUntracked = new Map<DocId, LocalEntry>();
+	const movedChain = new Map<DocId, ObservedRename[]>();
+	const keepRenames: ObservedRename[] = [];
 	if (ctx.nsReady && renamedFrom.size > 0) {
 		const used = new Set([...inferred.values()].map((rn) => rn.to.pathKey));
 		const fresh = new Set(freshLocal.map((l) => l.pathKey));
@@ -467,6 +481,7 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 			const l = away ? input.local.get(pk(away.to)) : undefined;
 			if (!l || l.excluded || l.kind !== r.kind || !fresh.has(l.pathKey) || used.has(l.pathKey) || input.remoteByPathKey.has(l.pathKey)) continue;
 			movedUntracked.set(id, l);
+			movedChain.set(id, renameChain(input.renames, from, pk));
 			used.add(l.pathKey);
 		}
 	}
@@ -881,10 +896,15 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		const moved = movedUntracked.get(docId);
 		if (moved) {
 			claimed.add(moved.pathKey);
-			if (r.body?.frozen) return push([waitOp(docId, "frozen")]);
-			if (moved.hash === null) return push([{ op: "needHash", path: moved.path }]);
-			if (r.pendingLocal) return push([waitOp(docId, "pending-ns")]);
-			if (!r.body || !r.body.caughtUp) return push([waitOp(docId, "body-not-caught-up")]);
+			// While the doc waits, only memory has the rename (no synced record to keep it on): it stays there.
+			const wait = (op: PlannerOp): void => {
+				keepRenames.push(...(movedChain.get(docId) ?? []));
+				push([op]);
+			};
+			if (r.body?.frozen) return wait(waitOp(docId, "frozen"));
+			if (moved.hash === null) return wait({ op: "needHash", path: moved.path });
+			if (r.pendingLocal) return wait(waitOp(docId, "pending-ns"));
+			if (!r.body || !r.body.caughtUp) return wait(waitOp(docId, "body-not-caught-up"));
 			return push([
 				{ op: "nsRename", docId, path: moved.path },
 				{ op: "reconcileContent", docId, path: moved.path, kind: r.kind as ContentKind, hasBase: false, basePath: r.path },
@@ -997,5 +1017,6 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		held: orderOps(outcome.held.flatMap((u) => u.ops), pk),
 		brake: outcome.report,
 		consumedDocIds: consumed,
+		...(keepRenames.length > 0 ? { keepRenames } : {}),
 	};
 }

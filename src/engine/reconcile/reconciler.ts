@@ -216,7 +216,8 @@ export class Reconciler {
 		if (ctx.localComplete && view.nsReady) {
 			const used = new Set(renames);
 			const unread = unhashedChains(renames, ctx);
-			ctx.renames = ctx.renames.filter((r) => !used.has(r) || unread.has(r));
+			const kept = new Set(plan.keepRenames ?? []);
+			ctx.renames = ctx.renames.filter((r) => !used.has(r) || unread.has(r) || kept.has(r));
 			// Onboarding / the first pass after start has planned its creates with the hold: later creates are live.
 			if (scope.t === "full") ctx.liveCreates = true;
 		}
