@@ -255,7 +255,14 @@ export class BindingManager {
 		// resync: the worker dropped events (main fell behind its window); the mirror is behind but consistent.
 		if (change.t === "resync") return this.resync(doc, doc.mirror?.text ?? null);
 		for (const slot of [...doc.slots]) {
+			// Frozen: the engine dropped the doc's binding first, so the keystrokes unbindSlot pushes now are refused, and
+			// the re-open stays unbound ("edits are kept locally"). The editor is then their only copy until Obsidian's
+			// 2 s save, and a write by another app inside that window reloads the unbound view over them (sim suite 1
+			// seed 1482901505: a revoked device's doc froze 5 ms after a keystroke). Saved now, they are on disk, where
+			// the doc's reconcile takes them after the release like any outside edit.
+			const unsaved = change.t === "frozen" && slot.view.isDirty();
 			this.unbindSlot(slot);
+			if (unsaved) void slot.view.save().catch(() => undefined);
 			void this.open(slot);
 		}
 	}

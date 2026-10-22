@@ -6,7 +6,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { utf8Encode } from "../../core/codec/lib0";
 import { KeyRecordKind } from "./record";
-import { FORGED, K, RK_A, device, genesis, holds, persistedEpochs, revoke, roll } from "./testkit/world";
+import { FORGED, K, RK_A, RK_B, device, genesis, holds, persistedEpochs, revoke, roll } from "./testkit/world";
 
 const pinned = async (n: number) => {
 	const records = [await genesis()];
@@ -52,6 +52,21 @@ describe("keyring: own records (§11.4, §14.2)", () => {
 		assert.equal(d.kc.sealEpoch(), 3);
 		assert.equal(d.kr.minSendEpoch(), 3);
 		assert.deepEqual(d.codes(), ["keyring/adopted", "keyring/duplicate"]);
+	});
+
+	it("own revoke behind an earlier revoke under another RK: it does not win past the row it cannot judge (seed 264)", async () => {
+		const { d } = await pinned(2);
+		const own = await d.kr.propose(KeyRecordKind.revoke, RK_A.slice());
+		assert.equal(own.e, 3);
+		await d.ingest([7, await revoke(3, RK_B, K(2), FORGED(3))], [10, own.bytes]);
+		assert.equal(await d.kr.settleOwn(), "pending", "every device that can judge the seq-7 record took it");
+		assert.equal(d.kc.sealEpoch(), 2, "no frame goes out under the own K_3");
+		assert.equal(d.kr.keyMissing(), "revoked-epoch");
+		assert.equal(await d.kr.installQr(3, FORGED(3)), "verified");
+		assert.equal(await d.kr.settleOwn(), "lost");
+		assert.ok(await holds(d, 3, FORGED(3)));
+		assert.equal(d.kc.sealEpoch(), 3);
+		assert.equal(d.kr.keyMissing(), null);
 	});
 
 	it("propose refuses: a genesis over a non-empty k, a revoke without the RK, a second record in flight", async () => {

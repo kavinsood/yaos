@@ -15,7 +15,8 @@
  * the vault. A revoke can have several (kept devices re-keying at once, §14.2), each under a recovery key of its own
  * when it generated a new one: a device holding another RK cannot open the earlier record, cannot tell it from
  * garbage, and adopted its own later record or one its RK opens, while every other device followed the first (suite-1
- * seed 89423454: devices sealing under two different K_2, each side's rows failing auth on the other). The device
+ * seed 89423454: devices sealing under two different K_2, each side's rows failing auth on the other; suite-1 seed 264:
+ * two devices revoking each other, the second adopting its own K_r behind the first's record). The device
  * waits instead (key-missing, revoked-epoch) until an out-of-band key judges the row (§11.3: a hostile server's
  * garbage record is denial of service only; a QR key marks it invalid). Only an authoritative key passes over a
  * record, and it never finds one pending: it judges every record of its epoch. A pending roll holds nothing back

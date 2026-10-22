@@ -9,9 +9,12 @@ import { test } from "node:test";
 import type { ContentHash, DiskFingerprint, DocId, PathKey, Seq, VaultPath } from "../../core/types";
 import { createWebClock } from "../adapters/webClock";
 import { createWebHash } from "../adapters/webHash";
+import { MemStoragePort } from "../../sim/storage";
+import { encodeOutboxMirror, UNTRUSTED_CONTENT_HASH, type MirrorIdentity } from "../runtime/mirrors";
 import { MemSideFiles } from "../runtime/testHarness";
-import type { SyncedRecord } from "../store/schema";
-import { SyncedMirrorWriter } from "./syncedMirror";
+import type { DiskSchema } from "../reconcile/store";
+import { DB_SCHEMA_VERSION, STORE, STORE_SPECS, type SyncedRecord } from "../store/schema";
+import { importSyncedMirror, SyncedMirrorWriter } from "./syncedMirror";
 
 const rec: SyncedRecord = {
 	docId: "ovKII8dvM_BlX4o2D6nFKw" as DocId, path: "a.md" as VaultPath, pathKey: "a.md" as PathKey, kind: "markdown", contentHash: "ab".repeat(32) as ContentHash,
@@ -61,4 +64,30 @@ test("synced mirror: not written while the outbox mirror is behind; written once
 	await w.flush(); // still dirty
 	assert.equal(w.stats.writes, 1);
 	assert.ok(side.files.has("synced-a.bin"));
+});
+
+test("recovery: a doc the outbox mirror lists as unmirrored is imported with no trusted content hash (sim suite 1 seed 197)", async () => {
+	const other: SyncedRecord = { ...rec, docId: "Qp-d2zcQZkXoWhSso7XJ7A" as DocId, path: "b.md" as VaultPath, pathKey: "b.md" as PathKey };
+	const identity = { vaultId: "v", vaultEpoch: "e", deviceId: "dev" } as MirrorIdentity;
+	const hash = createWebHash();
+	const run = async (unmirrored: readonly DocId[] | undefined): Promise<Map<string, ContentHash>> => {
+		const side = new MemSideFiles();
+		const w = new SyncedMirrorWriter({ side, hash, clock: createWebClock(), identity: () => identity, entries: () => [rec, other], nsCoversSeq: () => 2 as Seq, debounceMs: 60_000 });
+		w.markDirty();
+		await w.flush();
+		// The store's outbox held an own record of `rec`'s doc it could not mirror (an unsealed stale copy): listed.
+		await side.write("outbox-a.bin", await encodeOutboxMirror({ ...identity, generation: 1, writtenAtMs: 0, frames: [], ...(unmirrored ? { unmirrored } : {}) }, hash));
+		const storage = new MemStoragePort();
+		const db = await storage.open<DiskSchema>("fresh", DB_SCHEMA_VERSION, STORE_SPECS);
+		const n = await importSyncedMirror({ db, side, hash, identity, pathKey: (p) => p as PathKey, nowMs: 1 });
+		assert.equal(n, 2);
+		const rows = await db.tx([STORE.synced], "readonly", (tx) => tx.getAll(STORE.synced));
+		db.close();
+		return new Map(rows.map((r) => [r.docId, r.contentHash]));
+	};
+	const listed = await run([rec.docId]);
+	assert.equal(listed.get(rec.docId), UNTRUSTED_CONTENT_HASH, "its sync point rests on a record recovery lost");
+	assert.equal(listed.get(other.docId), other.contentHash);
+	const none = await run(undefined);
+	assert.equal(none.get(rec.docId), rec.contentHash);
 });

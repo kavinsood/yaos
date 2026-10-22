@@ -1,0 +1,217 @@
+{
+ "seed": 264,
+ "config": {
+  "devices": 3,
+  "faults": {
+   "engineCrash": 3,
+   "appCrash": 2,
+   "commitCrash": 2,
+   "idbWipe": 3,
+   "idbLost": 2,
+   "offline": 4,
+   "ioFail": 2,
+   "background": 3,
+   "socketDrop": 4,
+   "relayRestart": 1,
+   "relayDrain": 1,
+   "httpFail": 1,
+   "dailyLimit": 0.5,
+   "epochReset": 0.3,
+   "clockSkew": 1,
+   "keyStoreLoss": 1,
+   "keyRoll": 2,
+   "revoke": 2,
+   "epochRestore": 0.5,
+   "hostileReplay": 2,
+   "hostileDowngrade": 1,
+   "blobStall": 0,
+   "blobSlow": 0,
+   "relaySubsLost": 0,
+   "suspendKill": 0,
+   "clone": 0,
+   "syncedConfig": 0,
+   "targetedDrop": 0,
+   "lostSend": 0,
+   "commitFail": 0,
+   "hostile": 0,
+   "conflictCrash": 0,
+   "floodRewrite": 0
+  },
+  "crypto": "suite1",
+  "faultRate": 0.3,
+  "seed": 264
+ },
+ "violations": [
+  {
+   "inv": "convergence",
+   "detail": "notes/seed1.md differs: A=\"[C.94] [C.20]\\ns[C.45]\\n[A.34][B.91]   e[C.59] ed 1 [C.15] [C.55]  \\n\" B=\"[C.94] \\ns[C.45]\\n   e[C.59] ed 1 [C.15] [C.55]  \\n\""
+  },
+  {
+   "inv": "convergence",
+   "detail": "notes/n0.md differs: A=\"[C.30][C.80] [C.69]\\n\\n\" B=\"[C.30][C.80] [C.69]\\n\\n[B.101]\\n\""
+  },
+  {
+   "inv": "convergence",
+   "detail": "notes/seed1.md differs: A=\"[C.94] [C.20]\\ns[C.45]\\n[A.34][B.91]   e[C.59] ed 1 [C.15] [C.55]  \\n\" C=\"[C.94] \\ns[C.45]\\n   e ed 1 [C.15] [C.55]  \\n\""
+  },
+  {
+   "inv": "convergence",
+   "detail": "notes/n0.md differs: A=\"[C.30][C.80] [C.69]\\n\\n\" C=\"[C.30] [C.80] [C.117] [C.69]\\n\\n[B.101]\\n\""
+  },
+  {
+   "inv": "convergence",
+   "detail": "notes/n2.md differs: A=\"[C.61][A.107] \\n\" C=\"[C.61]\\n\""
+  },
+  {
+   "inv": "convergence",
+   "detail": "relay notes/n0.md=\"\" disk=\"[C.30][C.80] [C.69]\\n\\n\""
+  },
+  {
+   "inv": "convergence",
+   "detail": "relay notes/seed1.md=\"\" disk=\"[C.94] [C.20]\\ns[C.45]\\n[A.34][B.91]   e[C.59] ed 1 [C.15] [C.55]  \\n\""
+  },
+  {
+   "inv": "convergence",
+   "detail": "A: body replica of notes/seed1.md=\"[C.94] \\ns[C.45]\\n   e[C.59] ed 1 [C.15] [C.55]  \\n\" disk=\"[C.94] [C.20]\\ns[C.45]\\n[A.34][B.91]   e[C.59] ed 1 [C.15] [C.55]  \\n\""
+  },
+  {
+   "inv": "convergence",
+   "detail": "A: body replica of notes/n0.md=\"[C.30][C.80] [C.69]\\n\\n[B.101]\\n\" disk=\"[C.30][C.80] [C.69]\\n\\n\""
+  },
+  {
+   "inv": "convergence",
+   "detail": "ns fold bytes differ: oracle,A,B=3373:d32dda1f C=3396:aecb4eb3"
+  },
+  {
+   "inv": "convergence",
+   "detail": "cfg fold bytes differ: oracle,A,B=455:c4c83b6f C=360:cf40b53b"
+  },
+  {
+   "inv": "convergence",
+   "detail": "config snippets/s1.css: A=\".k1 { --t: \\\"[B.177]\\\"; }\\n\" C=\"-\""
+  },
+  {
+   "inv": "tokens",
+   "detail": "lost [B.101] (create on B at step 101)"
+  },
+  {
+   "inv": "tokens",
+   "detail": "lost [C.117] (typed on C at step 117)"
+  },
+  {
+   "inv": "destroyed",
+   "detail": "[B.101] was on B:notes/n0.md (user) and is gone"
+  },
+  {
+   "inv": "destroyed",
+   "detail": "[C.117] was on C:notes/n0.md (save) and is gone"
+  },
+  {
+   "inv": "clean",
+   "detail": "A: status pendingDiskOps=0 outbox=0 unreceipted=0 frozen=2"
+  },
+  {
+   "inv": "clean",
+   "detail": "B: status pendingDiskOps=0 outbox=0 unreceipted=0 frozen=2"
+  },
+  {
+   "inv": "clean",
+   "detail": "C: status pendingDiskOps=0 outbox=0 unreceipted=0 frozen=3"
+  },
+  {
+   "inv": "checkpoint",
+   "detail": "A: b:w5V70LXjOBb3iwVdKFXD9Q frozen (crypto-auth)"
+  },
+  {
+   "inv": "checkpoint",
+   "detail": "A: b:6XEKQx_vqc7_aDKMtOXRFg frozen (crypto-unknown-key)"
+  },
+  {
+   "inv": "checkpoint",
+   "detail": "B: b:w5V70LXjOBb3iwVdKFXD9Q frozen (checkpoint-disputed)"
+  },
+  {
+   "inv": "checkpoint",
+   "detail": "B: b:6XEKQx_vqc7_aDKMtOXRFg frozen (crypto-auth)"
+  },
+  {
+   "inv": "checkpoint",
+   "detail": "B: 1 streams behind the relay: b:w5V70LXjOBb3iwVdKFXD9Q at 113 of 122 stale (gc 122)"
+  },
+  {
+   "inv": "checkpoint",
+   "detail": "C: b:cs_uKu3VnZ8cT34CI8MJQg frozen (crypto-auth)"
+  },
+  {
+   "inv": "checkpoint",
+   "detail": "C: c:VhGgxIcF00MSvLpN7Aj9Sw frozen (crypto-auth)"
+  },
+  {
+   "inv": "checkpoint",
+   "detail": "C: b:JiT0azdKWtpTTuv7NrdFyA frozen (crypto-auth)"
+  }
+ ],
+ "minimizedPlan": [
+  {
+   "i": 65,
+   "gapMs": 874,
+   "user": {
+    "t": "open",
+    "dev": 2,
+    "file": 0.02742178994230926
+   }
+  },
+  {
+   "i": 110,
+   "gapMs": 1073,
+   "user": {
+    "t": "deleteToken",
+    "dev": 2,
+    "view": 0.3131038937717676,
+    "pick": 0.4551800957415253
+   }
+  },
+  {
+   "i": 112,
+   "gapMs": 74,
+   "fault": {
+    "t": "revoke",
+    "dev": 2,
+    "by": 1,
+    "rekeyMs": 51958,
+    "rkSeed": 2087814449
+   }
+  },
+  {
+   "i": 175,
+   "gapMs": 79,
+   "canvas": {
+    "t": "cMove",
+    "dev": 1,
+    "file": 0.13519782363437116,
+    "node": 0.09546962124295533
+   }
+  },
+  {
+   "i": 113,
+   "gapMs": 220,
+   "fault": {
+    "t": "revoke",
+    "dev": 1,
+    "by": 2,
+    "rekeyMs": 5032,
+    "rkSeed": 1561154449
+   }
+  },
+  {
+   "i": 115,
+   "gapMs": 929,
+   "fault": {
+    "t": "offline",
+    "dev": 1,
+    "durationMs": 37993
+   }
+  }
+ ],
+ "runs": 250
+}

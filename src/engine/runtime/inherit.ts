@@ -14,7 +14,9 @@
  *    whatever their state (Yjs updates are idempotent). Snap-index and keyring frames are not inherited: the snapshot
  *    job uploads the moved local snapshots again, and the keyring flow restarts from the committed `k` stream.
  * 3. The newest valid synced mirror among the dirs is imported as at any recovery (§i.5 step 3: hasBase false,
- *    bodyVersion null), in the same transaction as the outbox records (Repo.tInherit).
+ *    bodyVersion null), in the same transaction as the outbox records (Repo.tInherit). A doc any dir's outbox mirror
+ *    lists as unmirrored (own records it could not carry: mirrors.ts unmirroredDocs) gets no trusted content hash:
+ *    its edits are gone with the store, so its disk text is re-derived, never taken as already synced.
  * 4. Local snapshots are copied into this store's dir (the predecessor's copies go with its dir).
  * 5. The caller writes this store's outbox mirror before anything is sent; the predecessors' dirs are removed once
  *    this store's outbox and synced mirrors are both on disk (compose/vaultRuntime.ts).
@@ -22,14 +24,14 @@
 
 import { newClientFrameId } from "../../core/codec/ids";
 import { pathKey } from "../../core/paths/pathKey";
-import { streamClass, type DeviceId, type DiskFingerprint } from "../../core/types";
+import { streamClass, type DeviceId, type DiskFingerprint, type DocId } from "../../core/types";
 import type { SideFileName, SideFilePort } from "../../ports/vault";
 import { resolveRefContent } from "../body/refs";
 import { openEnvelope, sealFrame } from "../ingest/envelope";
 import { descName, listLocal, partName, readLocal } from "../snapshots/localStore";
 import type { FrameOrigin, MetaInherit, OutboxMirrorFrame, OutboxRecord, SyncedRecord } from "../store/schema";
 import type { EngineCtx } from "./context";
-import { pickOutboxMirror, pickSyncedMirror } from "./mirrors";
+import { pickOutboxMirror, pickSyncedMirror, untrustedSyncPoint } from "./mirrors";
 
 const OUTBOX: readonly SideFileName[] = ["outbox-a.bin", "outbox-b.bin"];
 const SYNCED: readonly SideFileName[] = ["synced-a.bin", "synced-b.bin"];
@@ -63,23 +65,24 @@ export async function inheritFromLineage(c: EngineCtx, inh: MetaInherit, side: (
 	const dirs = inh.dirs.filter((d) => d !== c.self);
 	let outbox: { dir: DeviceId; frames: readonly OutboxMirrorFrame[] } | null = null;
 	let synced: { dir: DeviceId; recs: SyncedRecord[] } | null = null;
+	// Every dir's list, not only the source's: the synced mirror may come from an older dir than the outbox frames.
+	const untrusted = new Set<DocId>();
 	for (const dir of dirs) {
 		const id = { vaultId, vaultEpoch, deviceId: dir };
-		if (!outbox) {
-			const picked = await pickOutboxMirror(await readPair(side(dir), OUTBOX), id, c.ports.hash);
-			if (picked) outbox = { dir, frames: picked.mirror.frames };
-		}
+		const ob = await pickOutboxMirror(await readPair(side(dir), OUTBOX), id, c.ports.hash);
+		for (const d of ob?.mirror.unmirrored ?? []) untrusted.add(d);
+		if (!outbox && ob) outbox = { dir, frames: ob.mirror.frames };
 		if (!synced) {
 			const picked = await pickSyncedMirror(await readPair(side(dir), SYNCED), id, c.ports.hash);
 			if (picked) synced = { dir, recs: picked.mirror.entries.map((e) => syncedRecordOf(e, c.now())) };
 		}
-		if (outbox && synced) break;
 	}
+	if (synced && untrusted.size > 0) synced = { dir: synced.dir, recs: synced.recs.map((r) => untrustedSyncPoint(r, untrusted)) };
 	const { records, skipped } = outbox ? await reissue(c, outbox.dir, outbox.frames) : { records: [], skipped: 0 };
 	const syncedN = await c.repo.tInherit(records, synced?.recs ?? []);
 	let snapshots = 0;
 	for (const dir of dirs) snapshots += await copySnapshots(side(dir), c.opts.sideFiles ?? null, (e) => c.diag("inherit-snapshot-failed", { error: String(e) }));
-	c.diag("inherited", { from: outbox?.dir ?? null, frames: records.length, skipped, synced: syncedN, snapshots, fenced: inh.fenced });
+	c.diag("inherited", { from: outbox?.dir ?? null, frames: records.length, skipped, synced: syncedN, untrusted: untrusted.size, snapshots, fenced: inh.fenced });
 	return { from: outbox?.dir ?? null, frames: records.length, skipped, synced: syncedN, snapshots };
 }
 

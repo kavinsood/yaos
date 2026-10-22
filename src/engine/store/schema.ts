@@ -558,6 +558,8 @@ export interface OutboxMirror {
 	readonly generation: number;
 	readonly writtenAtMs: number;
 	readonly frames: readonly OutboxMirrorFrame[];
+	/** Docs with own outbox records `frames` leaves out (outbox mirror format 3; runtime/mirrors.ts unmirroredDocs). */
+	readonly unmirrored?: readonly DocId[];
 }
 
 export interface SyncedMirrorEntry {

@@ -1656,6 +1656,7 @@ frameCount × {
   varuint originCount, originCount × { varstring deviceId, varstring clientFrameId, varuint frameNo },   (v2)
   varbytes sealed
 }
+varuint unmirroredCount, unmirroredCount × varstring docId   (v3)
 32B sha256(all preceding bytes)
 ```
 
@@ -1665,6 +1666,14 @@ frameCount × {
   - the target is the slot with the lower or invalid generation.
 - **Size limit.** Over `OUTBOX_MIRROR_MAX_BYTES`, the mirror keeps all ns/cfg/snap frames first, then body frames by
   `order` until full. Unmirrored body edits are still on disk and are re-derived by reconcile.
+- **Unmirrored docs** (v3). The docs with an own outbox record the mirror leaves out (over the size limit, or an
+  unsealed copy of an own stale commit, e2ee-design §14.2 step 4): a body / canvas record names its doc, an ns record
+  every doc its ops touch (`src/engine/runtime/mirrors.ts` `unmirroredDocs`). Their synced records may rest on those
+  records (a merge that absorbed a disk edit records the disk as synced once its frame is in the outbox). After IDB
+  loss the frames are gone, and a synced mirror entry that still says so makes the planner take the disk as the merge
+  base and write the remote text over the edit (sim suite 1 seed 197). Recovery therefore imports these docs' synced
+  records with no trusted content hash (§i.5 step 3): "re-derived by reconcile" holds only then. Written in the same
+  file as the frames, so the list and the frames it describes cannot disagree.
 - **Why it exists.** It preserves **frame identity** (`clientFrameId`) across IDB loss:
   - a resent ns frame is deduped by the relay window or the fold ring instead of creating duplicate docs;
   - body frames would converge anyway.
@@ -2377,7 +2386,10 @@ Further caps:
 2. Import the outbox mirror: same `clientFrameId`s, `order`s and states (a legacy `sent` → pending), and `outboxOrder.next =
    max + 1`.
 3. Import the synced mirror as `SyncedEntry` with `hasBase = false` and `bodyVersion = null`. With `bodyVersion =
-   null` the planner compares content instead: `Rc := streams.textHash ≠ S.contentHash`.
+   null` the planner compares content instead: `Rc := streams.textHash ≠ S.contentHash`. A doc the outbox mirror
+   lists as unmirrored (§e.4) gets `contentHash = UNTRUSTED_CONTENT_HASH` (all zeros, no text's hash): its file reads
+   as changed, neither side matches the synced content, and the merge keeps the replica's text with the disk text as
+   a no-base conflict copy. Never the remote text over a disk edit whose frames died with the store.
 4. `identity.recoveredFromMirror = true` and cursor 0.
 5. Full catch-up: feed from 0, ns first, then reads with `preferCheckpoint`.
 6. Full scan, with every file hashed.
@@ -2405,7 +2417,8 @@ no frameNo of the two can collide (e2ee-design §8.2; no floor, skip or renumber
      `clientFrameId`, a new ns / cfg frameNo from this store's allocator, sealed under this store, in the same order,
      `dependsOn` mapped. ns / cfg frames keep their old identities (`origins`). Snap-index and keyring frames are not
      inherited (the snapshot job uploads again; the keyring flow restarts from `k`);
-   - the newest valid synced mirror is imported as in step 3 above (`hasBase = false`, `bodyVersion = null`);
+   - the newest valid synced mirror is imported as in step 3 above (`hasBase = false`, `bodyVersion = null`; a doc
+     any lineage dir's outbox mirror lists as unmirrored without a trusted content hash);
    - local snapshots are copied into this store's dir.
 3. **Commit check**, at every session start while inherited frames wait, after both streams are read and before ns /
    cfg sends open: an inherited frame whose origin committed (its `clientFrameId` in the origin's recent-frames ring,

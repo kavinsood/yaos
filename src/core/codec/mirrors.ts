@@ -20,10 +20,10 @@ export const SYNCED_MIRROR_MAGIC = new Uint8Array([0x59, 0x41, 0x4f, 0x53, 0x53,
 export const MIRROR_FORMAT_VERSION = 1;
 /**
  * The outbox mirror's format: 2 adds each frame's origins (identity-per-store §5.2: a frame inherited from a lost
- * predecessor store and re-issued under this one keeps the identity it had there, for the commit check). Version 1
- * (no origins) still decodes.
+ * predecessor store and re-issued under this one keeps the identity it had there, for the commit check); 3 adds the
+ * docs with own outbox records the mirror does not carry (`unmirrored`). Versions 1 and 2 still decode (no list).
  */
-export const OUTBOX_MIRROR_FORMAT_VERSION = 2;
+export const OUTBOX_MIRROR_FORMAT_VERSION = 3;
 
 /** A predecessor store's identity of a re-issued frame (identity-per-store §5.2 step 3): its deviceId, id and frameNo. */
 export interface MirrorFrameOrigin {
@@ -60,6 +60,12 @@ export interface OutboxMirrorData extends MirrorIdentity {
 	readonly generation: number;
 	readonly writtenAtMs: number;
 	readonly frames: readonly MirrorOutboxFrame[];
+	/**
+	 * Format 3: docs with an own outbox record left out of `frames` (an unsealed stale copy, a frame over the size
+	 * limit). Their edits live only in the store and on disk: a synced mirror's sync point for them may rest on those
+	 * records, so recovery must not trust it (engine/runtime/mirrors.ts unmirroredDocs). Absent: none (or format < 3).
+	 */
+	readonly unmirrored?: readonly DocId[];
 }
 
 export interface SyncedMirrorEntryData {
@@ -143,6 +149,9 @@ export function encodeOutboxMirror(m: OutboxMirrorData, hash: Sha): Promise<Uint
 		for (const o of origins) w.varstring(o.deviceId).varstring(o.clientFrameId).varuint(o.frameNo);
 		w.varbytes(f.sealed);
 	}
+	const unmirrored = m.unmirrored ?? [];
+	w.varuint(unmirrored.length);
+	for (const d of unmirrored) w.varstring(d);
 	return seal(w, hash);
 }
 
@@ -179,8 +188,11 @@ export function decodeOutboxMirror(bytes: Uint8Array, hash: Sha): Promise<Mirror
 			}
 			frames.push({ clientFrameId, stream, order, state, authorNsSeq, dependsOn, adoptOf, sealed: r.varbytes(), ...(origins.length > 0 ? { origins } : {}) });
 		}
-		return { ...id, frames };
-	}, [1, OUTBOX_MIRROR_FORMAT_VERSION]);
+		const unmirrored: DocId[] = [];
+		const nu = version >= 3 ? r.varuint() : 0;
+		for (let j = 0; j < nu; j++) unmirrored.push(r.varstring() as DocId);
+		return { ...id, frames, ...(unmirrored.length > 0 ? { unmirrored } : {}) };
+	}, [1, 2, OUTBOX_MIRROR_FORMAT_VERSION]);
 }
 
 export function encodeSyncedMirror(m: SyncedMirrorData, hash: Sha): Promise<Uint8Array> {

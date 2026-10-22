@@ -86,3 +86,18 @@ test("ownCommitCopy: an own snap frame committed stale is stored as readers stor
 	assert.equal(copy.row.flags, LOCAL_FLAG_STALE_EPOCH);
 	assert.equal(copy.row.content.length, 0);
 });
+
+test("ownCommitCopy: the committed bytes' keyEpoch decides, not the record's re-sealed one (sim suite 1 seed 264)", () => {
+	const ob: OutboxRecord = {
+		clientFrameId: "cf" as ClientFrameId, order: 1, stream: NS_STREAM, kind: "nsOps", state: "pending", sealed: under(4), content: new Uint8Array([1, 2]),
+		authorNsSeq: 0, flags: 0, frameNo: null, keyEpoch: 4, dependsOn: null, adoptOf: null, createdAtMs: 0,
+	};
+	assert.equal(ownCommitCopy(ctx, new SeededRandom(1), "dev-x" as DeviceId, ob, 11), null, "judged by the record: a good commit");
+	const stale = ownCommitCopy(ctx, new SeededRandom(1), "dev-x" as DeviceId, ob, 11, under(2));
+	assert.ok(stale?.row, "the bytes that committed were sealed under 2: stale");
+	assert.equal(stale.row.flags, LOCAL_FLAG_STALE_EPOCH);
+	const held = ownCommitCopy(ctx, new SeededRandom(1), "dev-x" as DeviceId, ob, 11, under(9));
+	assert.ok(held?.row);
+	assert.equal(held.row.flags, LOCAL_FLAG_UNOPENED);
+	assert.deepEqual(held.row.content, under(9), "held unopened as committed, not as re-sealed since");
+});

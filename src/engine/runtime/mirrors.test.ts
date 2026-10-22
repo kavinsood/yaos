@@ -11,8 +11,9 @@ import {
 import { CodecError, Writer, concatBytes, hexToBytes } from "../../core/codec/lib0";
 import {
 	decodeOutboxMirror, decodeSyncedMirror, encodeOutboxMirror, encodeSyncedMirror, mirrorFrameSize, nextMirrorSlot,
-	pickOutboxMirror, pickSyncedMirror, selectMirrorFrames, toMirrorFrame,
+	pickOutboxMirror, pickSyncedMirror, selectMirrorFrames, toMirrorFrame, UNTRUSTED_CONTENT_HASH, unmirroredDocs, untrustedSyncPoint,
 } from "./mirrors";
+import { encodeNsOps } from "../../core/codec/nsOps";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -131,6 +132,10 @@ function outboxBody(m: OutboxMirror, forge: Forge = {}): Uint8Array {
 		}
 		w.varbytes(f.sealed);
 	});
+	if (version >= 3) {
+		w.varuint(m.unmirrored?.length ?? 0);
+		for (const d of m.unmirrored ?? []) w.varstring(d);
+	}
 	if (forge.trailing) w.raw(forge.trailing);
 	return w.finish();
 }
@@ -183,12 +188,22 @@ describe("outbox mirror codec", () => {
 		const body = outboxBody(FULL_OUTBOX);
 		assert.deepEqual(bytes, withChecksum(body));
 		assert.deepEqual(bytes.subarray(0, 8), new TextEncoder().encode("YAOSOBX1"));
-		assert.equal(bytes[8], 2);
+		assert.equal(bytes[8], 3);
 	});
 
 	it("decodes a format-1 file (no origins field)", async () => {
 		const v1 = { ...FULL_OUTBOX, frames: FULL_OUTBOX.frames.map(({ origins: _o, ...f }) => f) };
 		assert.deepEqual(await decodeOutboxMirror(withChecksum(outboxBody(v1, { version: 1 })), sha), v1);
+	});
+
+	it("round-trips the unmirrored docs (format 3) and matches the layout; a format-2 file decodes with none", async () => {
+		const m: OutboxMirror = { ...FULL_OUTBOX, unmirrored: [D("AAAAAAAAAAAAAAAAAAAAAA"), D("BBBBBBBBBBBBBBBBBBBBBB")] };
+		const bytes = await encodeOutboxMirror(m, sha);
+		assert.deepEqual(bytes, withChecksum(outboxBody(m)));
+		assert.deepEqual(await decodeOutboxMirror(bytes, sha), m);
+		const back = await decodeOutboxMirror(withChecksum(outboxBody(FULL_OUTBOX, { version: 2 })), sha);
+		assert.deepEqual(back, FULL_OUTBOX);
+		assert.equal(back?.unmirrored, undefined);
 	});
 
 	it("decoded sealed bytes do not alias the input buffer", async () => {
@@ -211,7 +226,7 @@ describe("outbox mirror codec", () => {
 	});
 
 	it("rejects an unsupported format version even with a valid checksum", async () => {
-		for (const version of [0, 3, 255]) {
+		for (const version of [0, 4, 255]) {
 			assert.equal(await decodeOutboxMirror(withChecksum(outboxBody(FULL_OUTBOX, { version })), sha), null, `version ${version}`);
 		}
 	});
@@ -560,5 +575,39 @@ describe("toMirrorFrame / selectMirrorFrames", () => {
 		const sizes = records.map((r) => mirrorFrameSize(toMirrorFrame(r)));
 		const budget = (sizes[0] as number) + (sizes[1] as number) + (sizes[3] as number) + 100;
 		assert.deepEqual(selectMirrorFrames(records, budget).map((f) => f.clientFrameId), ["n", "small1"]);
+	});
+});
+
+describe("unmirroredDocs / untrustedSyncPoint (sync points recovery cannot back)", () => {
+	const d1 = D("d1AAAAAAAAAAAAAAAAAAAA");
+	const d2 = D("d2AAAAAAAAAAAAAAAAAAAA");
+	const d3 = D("d3AAAAAAAAAAAAAAAAAAAA");
+
+	it("names the docs of records the mirror leaves out: an unsealed stale copy, a frame over the size limit, ns ops", () => {
+		const nsContent = encodeNsOps([{ t: "rename", docId: d3, path: "x.md" as never }]);
+		const records = [
+			record("kept", 1, `b:${d1}`, 10),
+			// e2ee-design §14.2 step 4: the copy of an own stale commit, empty sealed until it is re-sealed.
+			record("copy", 2, `b:${d2}`, 0),
+			record("nscopy", 3, "ns", 0, { kind: "nsOps", content: nsContent }),
+			record("cfgcopy", 4, "cfg", 0),
+		];
+		const frames = selectMirrorFrames(records, OUTBOX_MIRROR_MAX_BYTES);
+		assert.deepEqual(frames.map((f) => f.clientFrameId), ["kept"]);
+		assert.deepEqual(unmirroredDocs(records, frames), [d2, d3].sort());
+		// Over the size limit: the dropped body frame's doc is listed as well.
+		const big = [record("n", 1, "ns", 10, { kind: "nsOps", content: nsContent }), record("small", 2, `b:${d1}`, 10), record("huge", 3, `b:${d2}`, 5_000)];
+		const capped = selectMirrorFrames(big, mirrorFrameSize(toMirrorFrame(big[0]!)) + mirrorFrameSize(toMirrorFrame(big[1]!)));
+		assert.deepEqual(unmirroredDocs(big, capped), [d2]);
+		// Everything carried: nothing listed.
+		assert.deepEqual(unmirroredDocs([records[0]!], selectMirrorFrames([records[0]!], OUTBOX_MIRROR_MAX_BYTES)), []);
+	});
+
+	it("drops the content hash of a listed doc only; the sentinel is no text's hash", () => {
+		const rec = { docId: d1, contentHash: H("ab".repeat(32)) };
+		assert.equal(untrustedSyncPoint(rec, new Set([d2])), rec);
+		assert.deepEqual(untrustedSyncPoint(rec, new Set([d1])), { docId: d1, contentHash: UNTRUSTED_CONTENT_HASH });
+		assert.equal(UNTRUSTED_CONTENT_HASH, H("0".repeat(64)));
+		assert.notEqual(UNTRUSTED_CONTENT_HASH, H(createHash("sha256").update("").digest("hex")));
 	});
 });
