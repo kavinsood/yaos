@@ -38,6 +38,7 @@ export type EngineE2ee =
 
 interface OwnFlow {
 	readonly e: number;
+	readonly kind: KeyRecordKind;
 	readonly bytes: Uint8Array;
 	readonly cfid: ClientFrameId;
 	/** Seq of the own record in `k`, once receipted or read. */
@@ -125,10 +126,19 @@ export class KeyringRuntime {
 	}
 
 	/** GateCtx.staleCheck (gate.ts). seq null: a provisional, which commits after everything judged so far. */
-	staleCheck(keyEpoch: number, seq: Seq | null): StaleVerdict {
+	staleCheck(keyEpoch: number, seq: Seq | null, own = false): StaleVerdict {
 		if (this.suite !== 1) return null;
 		const at = seq ?? Number.MAX_SAFE_INTEGER;
 		if (!this.kComplete(at)) return "hold";
+		// An own revoke not seen in `k` yet: if it commits (it may have), its seq is S_rot, and another device's row past
+		// it sealed below its epoch is stale for every reader. That row can arrive before the revoke's receipt (R2 orders
+		// rows, not this device's receipts among them), and applied then it stayed in the replica and in checkpoints
+		// built from it while every other reader ignored it (sim suite-1 wipe/revoke/roll seed 40: the revoker kept a
+		// revoked device's edit the others never had). Held, it is judged once the record settles. This device's own
+		// receipts come in commit order with the revoke's, so they need no hold (one would copy every own frame
+		// committed meanwhile, and the copies again, until the record settled).
+		const f = this.flow;
+		if (!own && f !== null && f.seq === null && f.kind === KeyRecordKind.revoke && keyEpoch < f.e) return "hold";
 		return this.kr.staleCheck(keyEpoch, at);
 	}
 
@@ -269,7 +279,7 @@ export class KeyringRuntime {
 		if (this.flow) throw new KeyringRefusedError("a key record is already in flight");
 		const own = await this.kr.propose(kind, rk);
 		return new Promise<OwnOutcome>((resolve, reject) => {
-			const f: OwnFlow = { e: own.e, bytes: own.bytes, cfid: newClientFrameId(this.c.ports.random), seq: null, resolve, reject };
+			const f: OwnFlow = { e: own.e, kind, bytes: own.bytes, cfid: newClientFrameId(this.c.ports.random), seq: null, resolve, reject };
 			this.flow = f;
 			this.c.diag("keyring/propose", { e: own.e, kind });
 			this.send(f.cfid, f.bytes);

@@ -30,9 +30,10 @@ import { checkYjsUpdate } from "./yjsCheck";
 /**
  * e2ee-design §14.3 for a frame at `seq` (null: a provisional, not committed yet) or a checkpoint at coversSeq,
  * sealed under keyEpoch. "stale": below the winning revoke and past S_rot. "hold": not decidable by this reader
- * yet (a revoke it cannot settle, or `k` rows not judged yet); reader-dependent.
+ * yet (a revoke it cannot settle, or `k` rows not judged yet); reader-dependent. `own`: the receipt of this device's
+ * own frame (sync/ingestRow.ts ownCommitCopy), which reaches it in commit order with its own `k` receipts.
  */
-export type StaleCheck = (keyEpoch: number, seq: Seq | null) => "stale" | "hold" | null;
+export type StaleCheck = (keyEpoch: number, seq: Seq | null, own?: boolean) => "stale" | "hold" | null;
 
 /**
  * The highest fold rules version this reader implements, per fold (DESIGN §c.10). Production: the constants

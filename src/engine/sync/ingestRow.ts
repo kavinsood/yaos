@@ -146,7 +146,7 @@ export function ownCommitCopy(ctx: GateCtx, random: RandomPort, self: DeviceId, 
 	// and readers would ignore the row (sim suite 1 seed 264, before reseal.ts renamed sent ns / cfg records).
 	const outer = committed !== null ? decodeOuter(committed) : null;
 	const keyEpoch = outer?.ok ? outer.header.keyEpoch : ob.keyEpoch;
-	const v = ctx.staleCheck(keyEpoch, seq);
+	const v = ctx.staleCheck(keyEpoch, seq, true);
 	if (v === null) return null;
 	const cls = streamClass(ob.stream);
 	if (cls !== "ns" && cls !== "cfg" && cls !== "snap") return { clientFrameId: newClientFrameId(random), row: null };

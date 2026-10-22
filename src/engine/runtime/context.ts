@@ -176,7 +176,7 @@ export class EngineCtx {
 		// The deps getter below reads the live repo through this arrow: a getter's own `this` is the deps object.
 		const liveRepo = () => this.repo;
 		// §14.3: held (reader-dependent) until the keyring is open.
-		const staleCheck = (e: number, seq: Seq | null) => (this.keyring ? this.keyring.staleCheck(e, seq) : "hold" as const);
+		const staleCheck = (e: number, seq: Seq | null, own?: boolean) => (this.keyring ? this.keyring.staleCheck(e, seq, own) : "hold" as const);
 		this.gateCtx = { crypto: opts.ports.crypto, vaultId: opts.vaultId, maxCheckpointStateBytes: this.tuning.maxCheckpointStateBytes, staleCheck, knownRules: this.tuning.knownRules };
 		// The one write gate (writeGate.ts): shut until the keyring is open, then whenever it reports key-missing.
 		const gate = (): KeyMissingReason | null => (this.keyring ? this.keyring.keyMissing() : "no-pin");

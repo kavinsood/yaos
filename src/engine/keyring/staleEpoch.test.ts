@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import * as Y from "yjs";
 import { encodeNsOps } from "../../core/codec/nsOps";
 import { KEYRING_STREAM, NS_STREAM, type ContentHash, type DocId, type VaultPath } from "../../core/types";
+import { VirtualClock } from "../../sim/clock";
 import { SimRelay } from "../../sim/relay";
 import { converged, until, createDoc, docText } from "../runtime/testHarness";
 import { keyMissing, live, oldEpochFrame, rawAppend, start, type Dev } from "./testkit/engines";
@@ -91,6 +92,35 @@ describe("stale-epoch rule (§14.3) in the engine", () => {
 		} finally {
 			await y!.engine.stop();
 			await x!.engine.stop();
+		}
+	});
+
+	it("the revoker holds other devices' rows sealed below its revoke while the record is not seen in k: a row past it would be stale", async () => {
+		// Sim suite-1 wipe/revoke/roll seed 40: B's revoke committed, then A's frame sealed under epoch 1; A's frame
+		// reached B before B's receipt. B judged it with no revoke known (not stale) and applied it; every other reader
+		// ignored it (stale past S_rot), and B's replica and the checkpoints it built kept A's edit.
+		const clock = new VirtualClock(Date.UTC(2026, 0, 1, 12, 0));
+		const relay = new SimRelay({ clock });
+		const g = await genesis();
+		const x = await start(relay, "dev-x", { keys: [{ e: 1, k: K(1) }], records: [g] }, { clock }); // re-publishes g
+		try {
+			await until(() => x.engine.status().phase === "live" && relay.rows(KEYRING_STREAM).length === 1 && x.engine.isIdle(), 10_000, "live", clock);
+			relay.setDailyLimit(true, 60_000); // the revoke record stays on the device: refused, resent later
+			let won: string | null = null;
+			void x.engine.revokeRekey(RK_A.slice()).then((o) => (won = o));
+			await until(() => relay.counters().dailyLimitRejects > 0, 5_000, "the revoke append refused", clock);
+			const past = relay.head() + 5;
+			assert.equal(x.engine.c.gateCtx.staleCheck(1, past), "hold", "below the revoke in flight: not decidable yet");
+			assert.equal(x.engine.c.gateCtx.staleCheck(2, past), null, "at its epoch: never stale");
+			assert.equal(x.engine.c.gateCtx.staleCheck(1, past, true), null, "its own receipts come in order with the revoke's");
+			relay.setDailyLimit(false);
+			await until(() => won !== null, 120_000, "the revoke settled", clock);
+			assert.equal(won, "won");
+			const sRot = lastK(relay);
+			assert.equal(x.engine.c.gateCtx.staleCheck(1, sRot + 1), "stale");
+			assert.equal(x.engine.c.gateCtx.staleCheck(1, sRot - 1), null);
+		} finally {
+			await x.engine.stop();
 		}
 	});
 });

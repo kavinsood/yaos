@@ -1280,6 +1280,11 @@ answer is `"stale"`, `"hold"` or null (always null under suite 0):
   is not judged, if `k` was not read on this session, or if the `k` stream is itself stale. A held ns or cfg row is
   stored unopened (`LOCAL_FLAG_UNOPENED`) and halts the fold; a held body row is quarantined `"keyring-hold"`, which
   freezes the doc until it settles. A live batch ends after a `k` event, so rows behind a revoke wait for it.
+- **The revoker's own record in flight.** Until its revoke r shows in `k` (receipt or read), the revoker holds
+  other devices' rows sealed below r: if the record committed, a row past it is stale for every reader, and that row
+  can reach the revoker before the record's own receipt. Applied then, it stayed in the revoker's replica and in the
+  checkpoints it built while every other reader ignored it (sim suite-1 wipe/revoke/roll seed 40). Its own receipts
+  come in commit order with the record's, so `ownCommitCopy` judges them by the plain rule.
 - **Devices that have not re-keyed** do not learn r from the record header alone: an open revoke (a winning revoke
   for an epoch whose key the device lacks) shuts the write gate (`revoked-epoch`) and holds every row past it.
   When the re-key QR or RK arrives (§14.2 step 3), the held and unopened rows are re-gated: stale ones are
