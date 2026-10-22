@@ -111,8 +111,21 @@ Each has a minimized plan in `src/sim/open-repros/` (README there: replay with `
 replayed by the regressions test). All checked still failing on `integrate-3` (2026-10-22); "base" = also failing on
 `client-remake-next` 6a1fb3e5 before the reclaim / generators / governance merges.
 
-No data-loss failure open on `integrate-3`. Two non-data-loss failures stay open: one resurrection (no text lost)
-and one liveness timeout.
+No data-loss failure open on `integrate-3`. Three non-data-loss failures stay open: one resurrection (no text lost),
+one liveness timeout and one resource bound.
+
+### SOAK-BOUND-RESIDENT-BYTES: two big bound notes go past a small resident byte budget
+
+- **Repro.** `bound-big-notes-past-resident-byte-budget.json` (soak 944223017 #218, CONFLICT_FAULTS tuned big
+  small-cap, 3 devices, 127 steps; base, identical).
+- **What happens.** B has two big notes open in editors: 1.2 MB and 2.35 MB of replica against a tuned
+  `maxResidentBytes` of 264 KB. Bound handles are pinned and never evicted (DESIGN §d.1 "bound", "goes over budget
+  when none is clean"). Invariant 6 allows the budget plus the largest resident doc, so the second bound note fails
+  it.
+- **Not data loss.** Both handles are clean apart from being bound: builders empty, nothing in the outbox.
+- **Why open.** The design allows a bound replica over budget, but the invariant does not exempt bound handles.
+  Either the invariant counts bound handles apart, which relaxes it, or the engine refuses to bind past the budget.
+  For the owner.
 
 ### SOAK-FLOOD-RETIRE-BACKLOG: a flood's dead streams take longer to retire than the heal horizon
 
