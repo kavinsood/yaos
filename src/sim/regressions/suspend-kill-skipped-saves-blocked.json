@@ -1,0 +1,107 @@
+{
+	"seed": 1742817656,
+	"config": {
+		"seed": 1742817656,
+		"devices": 2,
+		"steps": 112,
+		"faults": {
+			"engineCrash": 5.8,
+			"appCrash": 1.791,
+			"commitCrash": 0,
+			"idbWipe": 0,
+			"idbLost": 0,
+			"offline": 1.793,
+			"ioFail": 0,
+			"background": 0,
+			"socketDrop": 1.131,
+			"relayRestart": 0.883,
+			"relayDrain": 0,
+			"httpFail": 0.776,
+			"dailyLimit": 1.01,
+			"epochReset": 0.163,
+			"clockSkew": 1.27,
+			"keyStoreLoss": 0,
+			"keyRoll": 0,
+			"revoke": 0,
+			"epochRestore": 0,
+			"hostileReplay": 0,
+			"hostileDowngrade": 0,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 13.134,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"faultRate": 0.294,
+		"randomTuning": true
+	},
+	"minimizedPlan": [
+		{
+			"i": 0,
+			"gapMs": 705,
+			"fault": {
+				"t": "offline",
+				"dev": 0,
+				"durationMs": 30835
+			}
+		},
+		{
+			"i": 3,
+			"gapMs": 1441,
+			"user": {
+				"t": "open",
+				"dev": 0,
+				"file": 0.2198264382313937
+			}
+		},
+		{
+			"i": 4,
+			"gapMs": 748,
+			"user": {
+				"t": "rename",
+				"dev": 0,
+				"file": 0.9659227430820465,
+				"name": 6
+			}
+		},
+		{
+			"i": 21,
+			"gapMs": 1479,
+			"user": {
+				"t": "diskInsert",
+				"dev": 0,
+				"file": 0.5098841185681522,
+				"pos": 0.5236936383880675,
+				"by": "user"
+			}
+		},
+		{
+			"i": 22,
+			"gapMs": 968,
+			"fault": {
+				"t": "suspendKill",
+				"dev": 0,
+				"event": "pagehide",
+				"budget": 3,
+				"save": "lost",
+				"downMs": 8636,
+				"durationMs": 14548
+			}
+		},
+		{
+			"i": 25,
+			"gapMs": 1096,
+			"fault": {
+				"t": "engineCrash",
+				"dev": 0
+			}
+		}
+	]
+}

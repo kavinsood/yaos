@@ -626,7 +626,13 @@ export class FaultState {
 			if (rec.killedBy !== null) return;
 			rec.killedBy = by;
 			finish();
-			if (this.down.has(i) || d.storage !== storage) return;
+			// The app this event would kill is down already, or its store was replaced (an engine crash restarted the
+			// worker on what had committed): no kill, and the app saves again. Left blocked, every editor stayed dirty
+			// for the rest of the run (soak 1742817656 run 253: an engine crash between the event and the heal).
+			if (this.down.has(i) || d.storage !== storage) {
+				ws.savesBlocked = false;
+				return;
+			}
 			this.crash(i, f.downMs, {});
 		};
 		if (f.save === "lost") ws.savesBlocked = true;
