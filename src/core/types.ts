@@ -467,8 +467,8 @@ export interface SyncedEntry {
  * SyncedEntry.held. `hash` is the held disk content's logical hash: rename inference pairs a missing doc's file by it
  * as by contentHash. `bytes` (present iff the texts are kept) is the UTF-8 size of the held disk text and the merge
  * base it was refused against (S's content; markdown canonical text and base, canvas file text and base merge text).
- * The texts live in the `heldText` store and the synced mirror, never in memory with the record: loaded to publish and
- * to write the mirror. With them, a doc whose file is gone once the gate opens publishes the held edit (merge text
+ * The texts live in the `heldText` store and in a held-text side file of their own, never in memory with the record:
+ * loaded to publish. With them, a doc whose file is gone once the gate opens publishes the held edit (merge text
  * against base into the doc, planner liveMissing) before its file's absence is decided: renamed and edited again
  * unobserved, the file pairs with nothing, and the edit (a deleted canvas record) must not be undone by
  * edit-beats-delete. Kept within HELD_TEXT_MAX_BYTES over all records and HELD_TEXT_MAX_CHARS a text; past it, or with

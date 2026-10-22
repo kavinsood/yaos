@@ -31,7 +31,7 @@ import { openEnvelope, sealFrame } from "../ingest/envelope";
 import { descName, listLocal, partName, readLocal } from "../snapshots/localStore";
 import type { FrameOrigin, HeldTextRecord, MetaInherit, MetaPathMove, OutboxMirrorFrame, OutboxRecord, SyncedMirrorEntry, SyncedRecord } from "../store/schema";
 import type { EngineCtx } from "./context";
-import { heldTextsOf, otherEpochMoves, pathMovesOf, pickOutboxMirror, pickSyncedMirror, recoveredHeld, untrustedSyncPoint } from "./mirrors";
+import { otherEpochMoves, recoverHeldTexts, pathMovesOf, pickOutboxMirror, pickSyncedMirror, recoveredHeld, untrustedSyncPoint } from "./mirrors";
 
 const OUTBOX: readonly SideFileName[] = ["outbox-a.bin", "outbox-b.bin"];
 const SYNCED: readonly SideFileName[] = ["synced-a.bin", "synced-b.bin"];
@@ -78,7 +78,11 @@ export async function inheritFromLineage(c: EngineCtx, inh: MetaInherit, side: (
 		if (!outbox && ob) outbox = { dir, frames: ob.mirror.frames };
 		if (!synced) {
 			const picked = await pickSyncedMirror(await readPair(side(dir), SYNCED), id, c.ports.hash);
-			if (picked) synced = { dir, recs: picked.mirror.entries.map((e) => syncedRecordOf(e, c.now())), held: heldTextsOf(picked.mirror.entries), moves: pathMovesOf(picked.mirror.moves) };
+			if (picked) {
+				// The held edits' texts, from the same dir's held-text files (its store wrote them).
+				const held = await recoverHeldTexts(side(dir), picked.mirror.entries, id, c.ports.hash);
+				synced = { dir, recs: picked.mirror.entries.map((e) => syncedRecordOf(e, c.now(), held.get(e.docId))), held: [...held.values()], moves: pathMovesOf(picked.mirror.moves) };
+			}
 		}
 		// A predecessor lost before it migrated to this epoch: its unpublished renames, as the migration carries them.
 		addMoves(await otherEpochMoves(await readPair(side(dir), SYNCED), id, c.ports.hash));
@@ -96,8 +100,8 @@ export async function inheritFromLineage(c: EngineCtx, inh: MetaInherit, side: (
 }
 
 /** A synced mirror entry as recovery imports it (§i.5 step 3); compose/syncedMirror.ts fromMirrorEntry. */
-function syncedRecordOf(e: { readonly docId: SyncedRecord["docId"]; readonly path: SyncedRecord["path"]; readonly kind: SyncedRecord["kind"]; readonly contentHash: SyncedRecord["contentHash"]; readonly nsTouchSeq: number; readonly blobRev: number; readonly fileGone?: true; readonly renamedTo?: SyncedRecord["renamedTo"]; readonly held?: SyncedMirrorEntry["held"] }, nowMs: number): SyncedRecord {
-	const held = recoveredHeld(e.held);
+function syncedRecordOf(e: { readonly docId: SyncedRecord["docId"]; readonly path: SyncedRecord["path"]; readonly kind: SyncedRecord["kind"]; readonly contentHash: SyncedRecord["contentHash"]; readonly nsTouchSeq: number; readonly blobRev: number; readonly fileGone?: true; readonly renamedTo?: SyncedRecord["renamedTo"]; readonly held?: SyncedMirrorEntry["held"] }, nowMs: number, texts: HeldTextRecord | undefined): SyncedRecord {
+	const held = recoveredHeld(e.held, texts);
 	return {
 		docId: e.docId, path: e.path, pathKey: pathKey(e.path), kind: e.kind, contentHash: e.contentHash, fingerprint: "" as DiskFingerprint,
 		size: -1, mtimeMs: 0, bodyVersion: null, blobRev: e.blobRev, nsTouchSeq: e.nsTouchSeq, hasBase: false, syncedAtMs: nowMs,

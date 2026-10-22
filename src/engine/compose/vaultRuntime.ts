@@ -49,6 +49,7 @@ import { ComposedLog } from "./logPort";
 import { CreatorStatus } from "./creatorStatus";
 import { PassScheduler } from "./passScheduler";
 import { mergeStatus, type DiskSideStatus } from "./statusMerge";
+import { HeldTextMirror } from "./heldMirror";
 import { importSyncedMirror, SyncedMirrorWriter } from "./syncedMirror";
 import { dropPending, type ResolvedIdentity } from "./storeIdentity";
 import * as ops from "./runtimeOps";
@@ -142,6 +143,8 @@ export class VaultRuntime {
 	cfg: CfgSync | null = null;
 	snaps!: SnapshotJob;
 	mirror!: SyncedMirrorWriter;
+	/** Held edits' texts, one side file each (heldMirror.ts). */
+	heldMirror!: HeldTextMirror;
 	readonly port: ComposedLog;
 	readonly sched: PassScheduler;
 	recovered = false;
@@ -337,12 +340,16 @@ export class VaultRuntime {
 		});
 		this.mirror = new SyncedMirrorWriter({
 			side: link.sideFiles, hash: ports.hash, clock: ports.clock, identity: () => identity,
-			entries: () => this.rec.ctx.store.synced.values(), heldTexts: () => this.rec.ctx.store.loadAllHeld(),
-			nsCoversSeq: () => c.ns.coversSeq, moves: () => bases.renames(),
+			entries: () => this.rec.ctx.store.synced.values(), nsCoversSeq: () => c.ns.coversSeq, moves: () => bases.renames(),
 			onError: (e) => this.diag(`synced mirror write failed: ${String(e)}`),
 			before: () => c.mirror.flushed(),
 			onWritten: () => void this.dropLineageDirs(),
 		});
+		this.heldMirror = new HeldTextMirror({
+			side: link.sideFiles, hash: ports.hash, identity: () => identity, onError: (e) => this.diag(`held-text file write failed: ${String(e)}`),
+		});
+		this.rec.ctx.store.onHeld = (put, gone) => this.heldMirror.onHeld(put, gone);
+		void this.heldMirror.sync(this.rec.ctx.store);
 		// The previous epoch's unpublished renames (§c.12 "Renames") are in this DB only: the mirror takes them now, so a
 		// store lost before the moves still has them (sim suite-1 wipe/revoke/roll seed 40).
 		if (bases.renames().length > 0) {
@@ -380,12 +387,13 @@ export class VaultRuntime {
 		const lineage = sweep ? [...(this.o.identity.lineage ?? [])] : [];
 		if (lineage.length === 0) return;
 		this.lineageDropped = true;
+		await this.heldMirror.idle(); // this store's held-text files replace theirs first (sync at start)
 		const link = this.engine.link;
 		let n = 0;
 		for (const dir of lineage) {
 			try {
 				const side = link.sideFilesOf(dir);
-				const names: SideFileName[] = [...MIRROR_FILES, ...(await side.list("snapshots/"))];
+				const names: SideFileName[] = [...MIRROR_FILES, ...(await side.list("snapshots/")), ...(await side.list("held/"))];
 				for (const name of names) {
 					await side.remove(name);
 					n++;
@@ -903,6 +911,7 @@ export class VaultRuntime {
 		await blobs?.catch(() => undefined);
 		for (const off of this.offs) off();
 		await this.mirror?.stop();
+		await this.heldMirror?.idle();
 		await this.log.stop();
 	}
 }

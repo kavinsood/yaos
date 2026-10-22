@@ -605,8 +605,8 @@ export interface SyncedMirrorEntry {
 	readonly fileGone?: true;
 	/** SyncedRecord.renamedTo. */
 	readonly renamedTo?: { readonly to: VaultPath; readonly atMs: number };
-	/** SyncedRecord.held, with its text and base (heldText) when the store keeps them. */
-	readonly held?: { readonly hash: ContentHash; readonly text?: string; readonly base?: string };
+	/** SyncedRecord.held (hash and texts' size; the texts are in its held-text file). */
+	readonly held?: { readonly hash: ContentHash; readonly bytes?: number };
 }
 
 export interface SyncedMirror {

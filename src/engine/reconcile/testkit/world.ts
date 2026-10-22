@@ -6,13 +6,13 @@
  */
 
 import type { BrakeConfig, BrakeReport, DeviceId, DocId, ObservedRename, PathKey, Seq, SyncedEntry, VaultId, VaultPath } from "../../../core/types";
-import { decodeSyncedMirror, encodeSyncedMirror } from "../../../core/codec/mirrors";
-import { fromMirrorEntry, toMirrorEntry } from "../../compose/syncedMirror";
-import { heldTextsOf } from "../../runtime/mirrors";
+import { HeldTextMirror } from "../../compose/heldMirror";
+import { importSyncedMirror, SyncedMirrorWriter } from "../../compose/syncedMirror";
+import { MemSideFiles } from "../../runtime/testHarness";
 import { DEFAULT_BRAKE } from "../../../core/plan/brake";
 import { refHashPort } from "../../../core/hash/testkit/hashRef";
 import type { VaultEvent } from "../../../ports/vault";
-import { DB_SCHEMA_VERSION, STORE, STORE_SPECS } from "../../store/schema";
+import { DB_SCHEMA_VERSION, STORE_SPECS } from "../../store/schema";
 import type { ReconcileSettings } from "../context";
 import type { OldDocDeletes } from "../oldDeletes";
 import type { OwnFoldEvent } from "../deps";
@@ -47,6 +47,7 @@ export interface WorldOptions {
 }
 
 export const DB = "yaos2-test";
+const WORLD_IDENTITY = { vaultId: "v" as VaultId, vaultEpoch: "e", deviceId: "world-device-0001" as DeviceId };
 
 export class World {
 	readonly storage = new FakeStorage();
@@ -65,6 +66,10 @@ export class World {
 	/** ReconcilerDeps.onRebind calls: [from, into]. */
 	readonly rebinds: [DocId, DocId][] = [];
 	private rec: Reconciler | null = null;
+	/** The store dir's side files (the synced mirror, held-text files), kept across crashes and wipes. */
+	readonly side = new MemSideFiles();
+	/** Held-text files, wired to the store at each boot as the vault runtime wires them. */
+	heldMirror: HeldTextMirror | null = null;
 
 	constructor(readonly opts: WorldOptions = {}) {
 		this.vault = new FakeVault(opts.caseInsensitive ?? false, () => this.clock.now());
@@ -103,6 +108,10 @@ export class World {
 		});
 		this.log.onOwnFold = this.opts.deferOwnFold ? async (events) => void this.ownQueue.push(...events) : (events) => rec.applyOwnFold(events);
 		this.rec = rec;
+		const held = new HeldTextMirror({ side: this.side, hash: refHashPort, identity: () => WORLD_IDENTITY });
+		this.heldMirror = held;
+		rec.ctx.store.onHeld = (put, gone) => held.onHeld(put, gone);
+		await held.sync(rec.ctx.store);
 		this.pending.length = 0; // the listing below covers everything that happened before boot
 		await rec.start();
 		const list = await this.vault.list();
@@ -156,25 +165,23 @@ export class World {
 	}
 
 	/**
-	 * IndexedDB lost, side-file mirrors kept (DESIGN §i.5): the synced records go through the synced mirror's codec
-	 * (format and import as recovery does), the DB is deleted, the process dies, and the engine boots on a fresh DB
-	 * holding only the imported records. The log's committed state stays (the relay).
+	 * IndexedDB lost, side-file mirrors kept (DESIGN §i.5): the synced mirror is written to `side` (the held-text files
+	 * are there already, heldMirror), the DB is deleted, the process dies, recovery imports the mirror into a fresh DB
+	 * as the vault runtime does, and the engine boots on it. The log's committed state stays (the relay).
 	 */
 	async wipeAndRebootFromMirror(): Promise<Reconciler> {
-		const identity = { vaultId: "v" as VaultId, vaultEpoch: "e", deviceId: "dev" as DeviceId };
-		const texts = await this.r.ctx.store.loadAllHeld();
-		const entries = [...this.r.ctx.store.synced.values()].map((r) => toMirrorEntry(r, texts.get(r.docId)));
+		const store = this.r.ctx.store;
+		const writer = new SyncedMirrorWriter({
+			side: this.side, hash: refHashPort, clock: this.clock, identity: () => WORLD_IDENTITY, entries: () => store.synced.values(), nsCoversSeq: () => 0 as Seq,
+		});
+		writer.markDirty();
+		await writer.flush();
+		await this.heldMirror?.idle();
 		const pk = this.r.ctx.pk;
-		const bytes = await encodeSyncedMirror({ ...identity, generation: 1, writtenAtMs: 0, nsCoversSeq: 0 as Seq, entries }, refHashPort);
-		const decoded = await decodeSyncedMirror(bytes, refHashPort);
-		if (!decoded.ok) throw new Error(`synced mirror: ${decoded.reason}`);
 		this.storage.crash();
 		await this.storage.deleteDatabase(DB);
 		const db = await this.storage.open<DiskSchema>(DB, DB_SCHEMA_VERSION, STORE_SPECS);
-		await db.tx([STORE.synced, STORE.heldText], "readwrite", async (tx) => {
-			for (const e of decoded.mirror.entries) tx.put(STORE.synced, fromMirrorEntry(e, pk, this.clock.now()));
-			for (const t of heldTextsOf(decoded.mirror.entries)) tx.put(STORE.heldText, t);
-		});
+		await importSyncedMirror({ db, side: this.side, hash: refHashPort, identity: WORLD_IDENTITY, pathKey: pk, nowMs: this.clock.now() });
 		db.close();
 		return this.crashAndReboot();
 	}

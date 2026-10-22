@@ -4,9 +4,9 @@
  * Kept: a markdown / canvas content job whose merge the gate refuses records the disk content on S before the
  * KeyMissingError goes on (`keepHeld`): its hash always, its text with the base it was merged against while the bounds
  * allow (`heldTextsFit`: HELD_TEXT_MAX_CHARS a text, HELD_TEXT_MAX_BYTES over all records). The texts go to the
- * heldText store in the record's transaction, never into memory (the record keeps their size, `held.bytes`); they are
- * read back to publish and to write the synced mirror, which carries them, so an IndexedDB loss with the mirrors kept
- * recovers them.
+ * heldText store in the record's transaction, never into memory (the record keeps their size, `held.bytes`), and the
+ * vault runtime writes them once to a held-text side file (compose/heldMirror.ts, ReconcileStore.onHeld), so an
+ * IndexedDB loss with the side files kept recovers them. They are read back only to publish.
  *
  * Published (`publishHeld`, a reconcileContent op with `held`): planned for a live doc whose file is gone and pairs
  * with nothing (planner liveMissing). The held text merges against its base into the doc as the user's edit, the disk

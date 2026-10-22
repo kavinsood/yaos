@@ -74,6 +74,11 @@ export class ReconcileStore {
 	readonly synced = new Map<DocId, SyncedRecord>();
 	readonly localTree = new Map<PathKey, LocalTreeRecord>();
 	readonly intents = new Map<string, IntentRecord>();
+	/**
+	 * After each commit that kept or cleared held texts: the rows put, and the held edits whose texts left (docId and
+	 * hash). The vault runtime's held-text mirror writes / removes their side files (compose/heldMirror.ts).
+	 */
+	onHeld: ((put: readonly HeldTextRecord[], gone: readonly { readonly docId: DocId; readonly hash: ContentHash }[]) => void) | null = null;
 
 	private constructor(readonly db: StorageDb<DiskSchema>, private readonly hash: HashPort) {}
 
@@ -105,14 +110,6 @@ export class ReconcileStore {
 		return rec && rec.hash === hash.hash ? rec : null;
 	}
 
-	/** loadHeld for every record whose held edit keeps its texts (the synced mirror's write). */
-	async loadAllHeld(): Promise<Map<DocId, HeldTextRecord>> {
-		const ids = [...this.synced.values()].filter((s) => s.held?.bytes !== undefined).map((s) => s.docId);
-		if (ids.length === 0) return new Map();
-		const rows = await this.db.tx([STORE.heldText], "readonly", async (tx) => Promise.all(ids.map((id) => tx.get(STORE.heldText, id))));
-		return new Map(rows.filter((r): r is HeldTextRecord => r !== undefined && this.synced.get(r.docId)?.held?.hash === r.hash).map((r) => [r.docId, r]));
-	}
-
 	/**
 	 * SyncedEntry.held lasts until the next sync point: a record with another content hash than the stored one (the
 	 * held content committed or published, or merged into something else) drops it, as one whose content is the held
@@ -131,10 +128,15 @@ export class ReconcileStore {
 		if (empty) return;
 		if (c.syncedPut?.some((r) => r.held !== undefined)) c = { ...c, syncedPut: c.syncedPut.map((r) => (r.held === undefined ? r : this.heldKept(r))) };
 		// Held texts whose record no longer keeps them go with it (heldKept, a drop, a put without held.bytes).
+		const keptBefore = (id: DocId): ContentHash | null => {
+			const h = this.synced.get(id)?.held;
+			return h?.bytes === undefined ? null : h.hash;
+		};
 		const heldGone = [
-			...(c.syncedDrop ?? []).filter((id) => this.synced.get(id)?.held?.bytes !== undefined),
-			...(c.syncedPut ?? []).filter((r) => r.held?.bytes === undefined && this.synced.get(r.docId)?.held?.bytes !== undefined).map((r) => r.docId),
+			...(c.syncedDrop ?? []).filter((id) => keptBefore(id) !== null),
+			...(c.syncedPut ?? []).filter((r) => keptBefore(r.docId) !== null && (r.held?.bytes === undefined || r.held.hash !== keptBefore(r.docId))).map((r) => r.docId),
 		];
+		const goneHashes = heldGone.map((docId) => ({ docId, hash: keptBefore(docId)! }));
 		await this.db.tx(TX_STORES, "readwrite", async (tx) => {
 			for (const m of c.baseMove ?? []) {
 				const rec = await tx.get(STORE.baseText, m.from);
@@ -145,7 +147,7 @@ export class ReconcileStore {
 			for (const r of c.syncedPut ?? []) tx.put(STORE.synced, r);
 			for (const id of c.baseDrop ?? []) tx.delete(STORE.baseText, id);
 			for (const r of c.basePut ?? []) tx.put(STORE.baseText, r);
-			for (const id of heldGone) tx.delete(STORE.heldText, id);
+			for (const id of heldGone) if (!c.heldPut?.some((r) => r.docId === id)) tx.delete(STORE.heldText, id);
 			for (const r of c.heldPut ?? []) tx.put(STORE.heldText, r);
 			for (const k of c.localDrop ?? []) tx.delete(STORE.localTree, k);
 			for (const r of c.localPut ?? []) tx.put(STORE.localTree, r);
@@ -158,5 +160,6 @@ export class ReconcileStore {
 		for (const r of c.localPut ?? []) this.localTree.set(r.pathKey, r);
 		for (const id of c.intentDrop ?? []) this.intents.delete(id);
 		for (const r of c.intentPut ?? []) this.intents.set(r.id, r);
+		if ((c.heldPut?.length || goneHashes.length > 0) && this.onHeld) this.onHeld(c.heldPut ?? [], goneHashes);
 	}
 }

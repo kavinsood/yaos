@@ -14,6 +14,7 @@ import {
 	pickOutboxMirror, pickSyncedMirror, selectMirrorFrames, toMirrorFrame, UNTRUSTED_CONTENT_HASH, unmirroredDocs, untrustedSyncPoint,
 } from "./mirrors";
 import { encodeNsOps } from "../../core/codec/nsOps";
+import { decodeHeldTextFile, encodeHeldTextFile, heldTextFileName } from "../../core/codec/mirrors";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -101,7 +102,7 @@ const FULL_SYNCED: SyncedMirror = {
 		},
 		{
 			docId: D("doc6"), path: "held.md", kind: "markdown", contentHash: HASH_B, nsTouchSeq: 7, bodyRemoteSeq: 8, blobRev: 0,
-			held: { hash: HASH_A, text: "one\nthree 日本語 🎉\n", base: "" },
+			held: { hash: HASH_A, bytes: 33_554_432 },
 		},
 	],
 	// The previous epoch's renames not published yet (MetaPathMove).
@@ -167,11 +168,11 @@ function syncedBody(m: SyncedMirror, forge: Forge = {}): Uint8Array {
 		const code = KIND_CODES[e.kind];
 		w.varstring(e.docId).varstring(e.path).u8(forge.kindCode ? forge.kindCode(i, code) : code).raw(hexToBytes(e.contentHash));
 		w.varuint(e.nsTouchSeq).varuint(e.bodyRemoteSeq).varuint(e.blobRev);
-		const texts = e.held?.text !== undefined;
-		w.u8(forge.syncedFlags ?? ((e.fileGone ? 1 : 0) | (e.renamedTo ? 2 : 0) | (e.held ? 4 : 0) | (texts ? 8 : 0)));
+		const sized = e.held?.bytes !== undefined;
+		w.u8(forge.syncedFlags ?? ((e.fileGone ? 1 : 0) | (e.renamedTo ? 2 : 0) | (e.held ? 4 : 0) | (sized ? 8 : 0)));
 		if (e.renamedTo) w.varstring(e.renamedTo.to).varuint(e.renamedTo.atMs);
 		if (e.held) w.raw(hexToBytes(e.held.hash));
-		if (texts) w.varstring(e.held.text).varstring(e.held.base!);
+		if (sized) w.varuint(e.held.bytes);
 	});
 	w.varuint(m.moves?.length ?? 0);
 	for (const mv of m.moves ?? []) w.varstring(mv.from).varstring(mv.to).varuint(mv.atMs);
@@ -659,5 +660,26 @@ describe("unmirroredDocs / untrustedSyncPoint (sync points recovery cannot back)
 		assert.deepEqual(untrustedSyncPoint(rec, new Set([d1])), { docId: d1, contentHash: UNTRUSTED_CONTENT_HASH });
 		assert.equal(UNTRUSTED_CONTENT_HASH, H("0".repeat(64)));
 		assert.notEqual(UNTRUSTED_CONTENT_HASH, H(createHash("sha256").update("").digest("hex")));
+	});
+});
+
+describe("held-text files", () => {
+	const file = { ...ID, docId: D("doc6"), hash: HASH_A, text: "one\nthree 日本語 🎉\n", base: "" };
+	it("round-trips, named by doc and hash", async () => {
+		const bytes = await encodeHeldTextFile(file, sha);
+		assert.deepEqual(bytes.subarray(0, 8), new TextEncoder().encode("YAOSHLD1"));
+		const back = await decodeHeldTextFile(bytes, sha);
+		assert.ok(back.ok);
+		assert.deepEqual(back.mirror, file);
+		assert.equal(heldTextFileName(file.docId, file.hash), `held/${file.docId}.${HASH_A}.bin`);
+	});
+	it("rejects any single flipped byte and truncation", async () => {
+		const good = await encodeHeldTextFile(file, sha);
+		for (let i = 0; i < good.length; i++) {
+			const bad = good.slice();
+			bad[i] = (bad[i] as number) ^ 0x80;
+			assert.equal((await decodeHeldTextFile(bad, sha)).ok, false, `flip at ${i}`);
+		}
+		assert.equal((await decodeHeldTextFile(good.subarray(0, good.length - 1), sha)).ok, false);
 	});
 });

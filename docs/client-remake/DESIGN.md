@@ -1612,7 +1612,7 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | No size limit is enforced (a soft limit with stretching and a notice was planned, not built). **Never dropped** |
 | `quarantine` | `[stream, seq]` | `byAt atMs` | `QuarantineRecord` (bytes + hash: ≤ 256 KiB for a deterministic failure, whole for a reader-dependent one so it can be re-gated) | `QUARANTINE_MAX_RECORDS` (500), by count only (no byte bound); oldest evicted (the doc stays frozen) |
 | `synced` | `docId` | — | `SyncedRecord` | 1 per synced doc (a held edit keeps only its hash and its texts' size here) |
-| `heldText` | `docId` | — | `HeldTextRecord` (held edit's text and base, §f.6) | 1 per synced record whose `held.bytes` is set, written and deleted with it; ≤ `HELD_TEXT_MAX_CHARS` (8 Mi) a text, ≤ `HELD_TEXT_MAX_BYTES` (32 MiB, the outbox mirror's scale) UTF-8 over all; past either a held edit keeps its hash only. Never cached in memory: read to publish and to write the synced mirror |
+| `heldText` | `docId` | — | `HeldTextRecord` (held edit's text and base, §f.6) | 1 per synced record whose `held.bytes` is set, written and deleted with it; ≤ `HELD_TEXT_MAX_CHARS` (8 Mi) a text, ≤ `HELD_TEXT_MAX_BYTES` (32 MiB, the outbox mirror's scale) UTF-8 over all; past either a held edit keeps its hash only. Never cached in memory: read to publish (and at start, to write a missing held-text file, §e.4) |
 | `baseText` | `docId` | — | `BaseTextRecord` (deflated, ≤ `MAX_BASE_TEXT_CHARS`) | markdown/canvas synced docs |
 | `localTree` | `pathKey` | — | `LocalTreeRecord` | 1 per vault file |
 | `intents` | `id` | — | `IntentRecord` | In-flight multi-step disk ops (< 1000); deleted on completion |
@@ -1739,8 +1739,8 @@ src/engine/compose/syncedMirror.ts) after the first change; a fixed delay, not r
 8B magic "YAOSSYN1", u8 version, varstring vaultId, varstring vaultEpoch, varstring deviceId,
 varuint generation, varuint writtenAtMs, varuint nsCoversSeq, varuint count,
 count × { varstring docId, varstring path, u8 kindCode, 32B contentHash, varuint nsTouchSeq, varuint bodyRemoteSeq, varuint blobRev,
-          u8 flags (bit0 fileGone, bit1 renamedTo, bit2 held, bit3 held texts; bit3 needs bit2),
-          [bit1] varstring renamedTo.to, varuint renamedTo.atMs, [bit2] 32B held.hash, [bit3] varstring held.text, varstring held.base },
+          u8 flags (bit0 fileGone, bit1 renamedTo, bit2 held, bit3 held.bytes; bit3 needs bit2),
+          [bit1] varstring renamedTo.to, varuint renamedTo.atMs, [bit2] 32B held.hash, [bit3] varuint held.bytes },
 varuint moveCount, moveCount × { varstring from, varstring to, varuint atMs },
 32B sha256
 ```
@@ -1753,14 +1753,31 @@ varuint moveCount, moveCount × { varstring from, varstring to, varuint atMs },
   the edit a content merge the write gate refused left (`held`, §f.6 "Held edits": its hash, and its text and base
   while the store keeps them). They are what the store alone knows of a file this device could not publish yet;
   recovered without them, the moved file read as a new doc and the old one came back at its path, without the held
-  edit (sim suite-1 wipe/revoke/roll seeds 40 and 112). The held texts are read from the `heldText` store for each
-  write (`ReconcileStore.loadAllHeld`), never kept in memory; their bound (`HELD_TEXT_MAX_BYTES`, 32 MiB, as
-  `OUTBOX_MIRROR_MAX_BYTES`) bounds what they add to the mirror. Recovery puts them back into `heldText`.
+  edit (sim suite-1 wipe/revoke/roll seeds 40 and 112). A held edit rides as its hash and its texts' size only: the
+  texts are in its held-text file (below), so a mirror write costs nothing per held text.
 - **Moves**: the previous epoch's renames this store has not published (§c.12 "Renames", `pathMove:` meta
   records). Recovery stores them again; written at once when a runtime starts with any, and when one is retired.
 - **Written at once**, not a debounce later, when a pass changes a record's marks (src/engine/compose/vaultRuntime.ts
   `runPass`, also when the write gate stopped the pass), and when the outbox mirror newly lists a doc as unmirrored
   (`MirrorWriter.onUnmirrored`): that doc's record is then all recovery has of it here.
+
+**Held-text files** (`held/<docId>.<hash>.bin`, src/engine/compose/heldMirror.ts): the text and base of one held
+edit (§f.6 "Held edits"), one file each:
+
+```
+8B magic "YAOSHLD1", u8 version (1), varstring vaultId, varstring vaultEpoch, varstring deviceId,
+varstring docId, 32B hash, varstring text, varstring base, 32B sha256
+```
+
+- **Written once** when the edit is kept (the commit that puts its `heldText` row, `ReconcileStore.onHeld`), and
+  **removed** when it is cleared (published, merged, its record dropped). Never rewritten: the synced mirror's writes
+  touch no held text. Writes run one at a time in commit order.
+- **At start** (`HeldTextMirror.sync`) the dir is brought to the store: files of kept texts that have none are written
+  (inherited from a lineage dir, a crash between a commit and its write), files no record keeps are removed.
+- **Recovery** (§i.5 step 3, predecessor inherit) reads the file each mirrored held edit with a size names, from the
+  dir the synced mirror came from; one missing, undecodable, or naming another store, doc or hash leaves that record
+  the held hash alone. The lineage dirs' held files go with their other files, after this store's are written.
+- **Bound:** `HELD_TEXT_MAX_BYTES` (32 MiB, the outbox mirror's scale) over all files, as for the `heldText` store.
 
 **Snapshots** (`snapshots/`): each snapshot's parts and its descriptor, plus the download cache for one remote
 snapshot (§j.4). A snapshot exists iff its descriptor decodes; parts without one are swept.
@@ -2006,9 +2023,9 @@ All are in `src/core/types.ts`.
   - **Held edits** (`SyncedEntry.held`, src/engine/reconcile/heldJob.ts). The merge job a write gate refuses records
     on S, before the KeyMissingError goes on, the disk content's hash and, within the bounds, its text and the base it
     was merged against (markdown: canonical text and base; canvas: file text and base merge text). The texts go to the
-    `heldText` store in the record's transaction; the record keeps only their UTF-8 size (`held.bytes`), so nothing
-    of them stays in memory: they are read to publish and to write the synced mirror, which carries them (an IDB loss
-    with mirrors kept recovers them, base included, although recovered records have no stored base). Bounds: each
+    `heldText` store in the record's transaction, and to a held-text file of their own (§e.4); the record keeps only
+    their UTF-8 size (`held.bytes`), so nothing of them stays in memory (read to publish). An IDB loss with the side
+    files kept recovers them from the file, base included, although recovered records have no stored base. Bounds: each
     text ≤ `HELD_TEXT_MAX_CHARS` (= `MAX_DOC_TEXT_CHARS`, the largest doc text the engine merges; a markdown text
     above `MERGE_MAX_INPUT_CHARS` publishes as a too-large conflict, its text a conflict copy) and all records' texts
     ≤ `HELD_TEXT_MAX_BYTES` (32 MiB, the outbox mirror's scale).

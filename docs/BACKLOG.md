@@ -149,8 +149,8 @@ Kept here until `sim-port` merges; then git history holds them.
   revoke, deleted a canvas record (merge refused, only its hash kept); its store was wiped (mirrors kept); the canvas
   was renamed and edited again unobserved; c5 paired with nothing and a peer's edit restored c0 with the record B
   deleted. The refused edit's text and base are now kept in IndexedDB (`heldText` store, the record keeping
-  `SyncedEntry.held` hash + size) and in the synced mirror (format 3, DB schema 3; ≤ 8 Mi chars a text, 32 MiB over
-  all, past it the hash alone), and a
+  `SyncedEntry.held` hash + size) and in one held-text side file per held edit, written once (synced mirror format 3
+  carries hash + size only; DB schema 3; ≤ 8 Mi chars a text, 32 MiB over all, past it the hash alone), and a
   doc whose file is gone publishes it (`reconcileContent(held)`) before its absence is decided (DESIGN §f.6 "Held
   edits"). Plan `src/sim/regressions/gated-edit-renamed-and-edited-unobserved.json`, tests in
   `src/engine/reconcile/reconciler.safety.test.ts` and `src/core/plan/planner.test.ts`.

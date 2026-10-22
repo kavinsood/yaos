@@ -102,7 +102,9 @@ export type SideFileName =
 	| "synced-b.bin"
 	/** Snapshot parts and descriptors (engine/snapshots/localStore.ts). */
 	| `snapshots/${string}.part`
-	| `snapshots/${string}.snap`;
+	| `snapshots/${string}.snap`
+	/** Held edits' texts, one file per held edit (engine/compose/heldMirror.ts, DESIGN §e.4). */
+	| `held/${string}.bin`;
 
 /** One store's side files (the engine's view: its own dir, identity-per-store §5.2). */
 export interface SideFilePort {
@@ -110,7 +112,7 @@ export interface SideFilePort {
 	/** Not required to be atomic: readers use A/B generations + checksums. */
 	write(name: SideFileName, bytes: Uint8Array): Promise<void>;
 	remove(name: SideFileName): Promise<void>;
-	list(prefix: "snapshots/"): Promise<readonly SideFileName[]>;
+	list(prefix: "snapshots/" | "held/"): Promise<readonly SideFileName[]>;
 }
 
 /**
@@ -119,7 +121,7 @@ export interface SideFilePort {
  * installs' dirs, and deleting one would delete a live twin's mirror on the twin's machine).
  */
 export type SideFilePath = `${string}/${SideFileName}`;
-export type SideFilePrefix = `${string}/snapshots/`;
+export type SideFilePrefix = `${string}/snapshots/` | `${string}/held/`;
 
 /** The host's side-file store, `<configDir>/plugins/yaos/state/`, addressed by store dir (the engine names it). */
 export interface HostSideFilePort {
