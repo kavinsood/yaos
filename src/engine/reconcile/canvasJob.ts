@@ -29,7 +29,7 @@ import { isShrinkingOverwrite } from "../../core/plan/brake";
 import type { IntentRecord } from "../store/schema";
 import { applyCanvas, baseSeenBy, emptyCanvas, projectCanvasBytes, projectionHash, readCanvas, visibleCanvas } from "./canvasDoc";
 import { isEmptyCanvas, mergeCanvasSides, parseDiskCanvas, parseMergeText, rankDisk, withEpochDeletes, type CanvasMergeOutput } from "./canvasMerge";
-import { epochBaseOf, MAX_CAS_ATTEMPTS, overwriteAllowed, trustedEpochBase, writeConflictCopy, type ReconcileOp } from "./contentSteps";
+import { epochBaseKey, epochBaseOf, MAX_CAS_ATTEMPTS, overwriteAllowed, trustedEpochBase, writeConflictCopy, type ReconcileOp } from "./contentSteps";
 import type { BodyHandle } from "./deps";
 import { framedVersion, writeOk, type Env, type JobOutcome } from "./diskJobs";
 import { MAX_TEXT_FILE_BYTES } from "./localState";
@@ -68,7 +68,7 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 	// §c.12: the old epoch's base at the path (its merge text), trusted while every record line of it is still in the
 	// new epoch's merge text (contentSteps.trustedEpochBase), as for markdown.
 	const epochBase = epochBaseOf(env, op, s);
-	const epochDeleted = epochBase === null ? null : ctx.deps.pathDeleted?.(ctx.pk(op.path)) ?? null;
+	const epochDeleted = epochBase === null ? null : ctx.deps.pathDeleted?.(epochBaseKey(env, op)) ?? null;
 
 	let out: CanvasMergeOutput | null = null;
 	let outHash = diskHash; // out.projection's logical hash

@@ -5,7 +5,7 @@
  * old-epoch base.
  */
 
-import type { ContentHash, DocId, LocalEntry, PlannerOp, SyncedEntry, VaultPath } from "../../core/types";
+import type { ContentHash, DocId, LocalEntry, PathKey, PlannerOp, SyncedEntry, VaultPath } from "../../core/types";
 import { brakeKey, isShrinkingOverwrite } from "../../core/plan/brake";
 import { conflictName } from "../../core/plan/conflictName";
 import type { IntentRecord } from "../store/schema";
@@ -23,7 +23,12 @@ export type ReconcileOp = Extract<PlannerOp, { op: "reconcileContent" }>;
  * or canvas merge text. null = none.
  */
 export function epochBaseOf(env: Env, op: ReconcileOp, s: SyncedEntry | undefined): string | null {
-	return op.pathBase || !s ? env.ctx.deps.pathBase?.(env.ctx.pk(op.path)) ?? null : null;
+	return op.pathBase || !s ? env.ctx.deps.pathBase?.(epochBaseKey(env, op)) ?? null : null;
+}
+
+/** Where the op's §c.12 base is kept: its path, or the path its file was renamed from (op.basePath). */
+export function epochBaseKey(env: Env, op: ReconcileOp): PathKey {
+	return env.ctx.pk(op.basePath ?? op.path);
 }
 
 /**

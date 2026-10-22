@@ -448,6 +448,28 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 			}
 		}
 	}
+	// Observed renames off the path of a remote doc with no synced record here, whose file sat there untracked (the
+	// doc's, as any file at a live remote entry's path is: planRemoteOnly merges it into the doc): the renamed file
+	// is still that doc's. The doc moves with it and merges it there, against the old epoch's base at the path it
+	// left (§c.12: a migration drops the synced records and keeps bases by path). Unpaired, the file became a new doc
+	// and the doc came back at the old path, with what the user had deleted in the file (sim suite-1
+	// wipe/revoke/roll seed 40: a canvas edited while key-missing, renamed after an epoch restore).
+	const movedUntracked = new Map<DocId, LocalEntry>();
+	if (ctx.nsReady && renamedFrom.size > 0) {
+		const used = new Set([...inferred.values()].map((rn) => rn.to.pathKey));
+		const fresh = new Set(freshLocal.map((l) => l.pathKey));
+		for (const from of renamedFrom) {
+			const id = input.remoteByPathKey.get(from);
+			if (id === undefined || input.synced.has(id) || input.local.has(from)) continue;
+			const r = input.remote.get(id);
+			if (!r || r.state !== "live" || r.kind === "blob" || r.pathKey !== from) continue;
+			const away = renamedAway(input.renames, from, pk);
+			const l = away ? input.local.get(pk(away.to)) : undefined;
+			if (!l || l.excluded || l.kind !== r.kind || !fresh.has(l.pathKey) || used.has(l.pathKey) || input.remoteByPathKey.has(l.pathKey)) continue;
+			movedUntracked.set(id, l);
+			used.add(l.pathKey);
+		}
+	}
 
 	// ---- content step for a synced live doc with a local file ------------------
 	interface Step { ops: PlannerOp[]; destructive: DestructiveKind | null; key: string }
@@ -856,7 +878,22 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		const blocked = syncedByKey.has(key) || claimed.has(key);
 		const l = blocked ? undefined : input.local.get(key);
 		if (l?.excluded) return;
+		const moved = movedUntracked.get(docId);
+		if (moved) {
+			claimed.add(moved.pathKey);
+			if (r.body?.frozen) return push([waitOp(docId, "frozen")]);
+			if (moved.hash === null) return push([{ op: "needHash", path: moved.path }]);
+			if (r.pendingLocal) return push([waitOp(docId, "pending-ns")]);
+			if (!r.body || !r.body.caughtUp) return push([waitOp(docId, "body-not-caught-up")]);
+			return push([
+				{ op: "nsRename", docId, path: moved.path },
+				{ op: "reconcileContent", docId, path: moved.path, kind: r.kind as ContentKind, hasBase: false, basePath: r.path },
+			], null, "", moved.path);
+		}
 		if (r.body?.frozen) return push([waitOp(docId, "frozen")]);
+		// The file that sat at the path (the doc's, untracked) just left it by an observed rename: whether it is still
+		// the doc's is inference's, off while ns is not ready. A materialize meanwhile turned the rename into a copy.
+		if (!l && !blocked && !ctx.nsReady && renamedFrom.has(key)) return;
 		// The file at the path is a renamed doc's (observed rename above): materialize once it has moved away.
 		if (observedOnto.has(key)) return;
 		// Another doc's file holds the path and no rename this plan moves it away (renames run before materializes,

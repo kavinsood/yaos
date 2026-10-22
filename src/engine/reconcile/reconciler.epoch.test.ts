@@ -253,3 +253,24 @@ test("epoch migration: own edits only the replica holds, of a note renamed befor
 	assert.equal(w.synced(id)?.path, "r.md");
 	assert.deepEqual(w.conflictCopies(), []);
 });
+
+test("after a migration, an untracked file renamed before its first merge: the doc moves with it and merges against the old path's base", async () => {
+	// Sim suite-1 wipe/revoke/roll seed 40: key-missing right after an epoch restore, the user deleted a record and
+	// renamed the canvas. The renamed file became a new doc, and the doc came back at the old path with the record.
+	const w = new World({ pathBases: new Map([[standInPathKey(P("n.md")), "a\nb\nx\ny\n"]]) });
+	w.vault.userWrite("n.md", "a\nx\ny\n"); // "b" deleted in the old epoch, never sent
+	const id = w.log.remoteCreate(P("n.md"), "a\nb\nx\ny\nc\n");
+	w.log.writeGate = "revoked-epoch";
+	await w.boot();
+	await w.sync(3).catch(() => undefined);
+	w.vault.userRename("n.md", "m.md");
+	await w.sync(3).catch(() => undefined);
+	assert.equal(w.vault.text("n.md"), null, "no copy at the old path while the doc waits");
+	w.log.writeGate = null;
+	await w.sync();
+	assert.equal(w.vault.text("n.md"), null);
+	assert.equal(w.vault.text("m.md"), "a\nx\ny\nc\n", "the delete kept, the new epoch's line merged");
+	assert.equal(w.log.text(id), "a\nx\ny\nc\n");
+	assert.equal(w.log.view().remote.get(id)?.path, "m.md");
+	assert.deepEqual(w.conflictCopies(), []);
+});

@@ -204,6 +204,31 @@ test("observed rename wins over a new file at the source path; the new file is c
 	assert.equal(find(next, "nsCreate").path, "a.md");
 });
 
+test("an untracked file of a remote doc renamed away (observed): the doc moves with it and merges it against the base the old path kept", () => {
+	// Sim suite-1 wipe/revoke/roll seed 40: after an epoch restore (synced records dropped, bases kept by path) a canvas
+	// edited while key-missing was renamed. The renamed file became a new doc, and the doc came back at the old path
+	// with the record the user had deleted.
+	const sc = { remote: [R("d1", "a.md")], local: [L("b.md", h("c9"))], over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] } };
+	const p = run(sc);
+	assert.deepEqual(p.ops, [
+		{ op: "nsRename", docId: "d1", path: "b.md" },
+		{ op: "reconcileContent", docId: "d1", path: "b.md", kind: "markdown", hasBase: false, basePath: "a.md" },
+	]);
+	// not while ns is not ready (no inference), and never without the observed rename
+	assert.deepEqual(run(sc, { nsReady: false }).ops, []);
+	const byHash = run({ ...sc, over: {} });
+	assert.deepEqual(opsOf(byHash).sort(), ["diskMaterialize", "nsCreate", "reconcileContent"].sort());
+	// a file back at the source path is the doc's, merged there; the renamed file is new
+	const back = run({ ...sc, local: [L("a.md", h("c7")), L("b.md", h("c9"))] });
+	assert.ok(!opsOf(back).includes("nsRename"), JSON.stringify(back.ops));
+	// a target at another remote doc's path is that rule's (observed onto), not this one
+	const onto = run({ ...sc, remote: [R("d1", "a.md"), R("d2", "b.md")] });
+	assert.ok(!onto.ops.some((o) => o.op === "nsRename" && o.docId === "d1"), JSON.stringify(onto.ops));
+	// body not caught up: the doc waits, the file is not created meanwhile
+	const behind = run({ ...sc, remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, caughtUp: false } })] });
+	assert.deepEqual(behind.ops, [{ op: "wait", docId: "d1", reason: "body-not-caught-up" }]);
+});
+
 test("a rename onto the same path key (case only, or the same path) does not hold the doc's edits while ns is not ready", () => {
 	// Hot canvas seed 208 (suite 1): B, offline after an IDB loss, saw canvas/c0.canvas renamed to itself. The path
 	// counted as "left by a rename" (the file there may be new), so no pass merged the doc until ns was ready, and a

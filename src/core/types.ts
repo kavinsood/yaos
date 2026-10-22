@@ -527,6 +527,11 @@ export type PlannerOp =
 		 * a path the engine re-occupied with S's bytes): neither its base nor its contentHash is this file's base.
 		 */
 		readonly noBase?: true;
+		/**
+		 * The old epoch's path-keyed base (§c.12) is the one at this path, not at `path`: the file was renamed from
+		 * there before its first merge in the new epoch (an untracked file of a remote doc, moved by an observed rename).
+		 */
+		readonly basePath?: VaultPath;
 	}
 	| { readonly op: "pushBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }
 	| { readonly op: "fetchBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }

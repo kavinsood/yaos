@@ -1,0 +1,139 @@
+{
+	"seed": 40,
+	"config": {
+		"devices": 3,
+		"faults": {
+			"engineCrash": 3,
+			"appCrash": 2,
+			"commitCrash": 2,
+			"idbWipe": 3,
+			"idbLost": 2,
+			"offline": 4,
+			"ioFail": 2,
+			"background": 3,
+			"socketDrop": 4,
+			"relayRestart": 1,
+			"relayDrain": 1,
+			"httpFail": 1,
+			"dailyLimit": 0.5,
+			"epochReset": 0.3,
+			"clockSkew": 1,
+			"keyStoreLoss": 1,
+			"keyRoll": 2,
+			"revoke": 2,
+			"epochRestore": 0.5,
+			"hostileReplay": 2,
+			"hostileDowngrade": 1,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"crypto": "suite1",
+		"faultRate": 0.3,
+		"seed": 40
+	},
+	"minimizedPlan": [
+		{
+			"i": 122,
+			"gapMs": 78,
+			"canvas": {
+				"t": "cExtra",
+				"dev": 1,
+				"file": 0.856370659545064,
+				"target": "node",
+				"pick": 0.952961508417502,
+				"key": 2,
+				"del": false
+			}
+		},
+		{
+			"i": 7,
+			"gapMs": 1429,
+			"fault": {
+				"t": "revoke",
+				"dev": 0,
+				"by": 1,
+				"rekeyMs": 53797,
+				"rkSeed": 1349507856
+			}
+		},
+		{
+			"i": 123,
+			"gapMs": 422,
+			"canvas": {
+				"t": "cResize",
+				"dev": 1,
+				"file": 0.9659566394984722,
+				"node": 0.8658326668664813
+			}
+		},
+		{
+			"i": 12,
+			"gapMs": 553,
+			"fault": {
+				"t": "socketDrop",
+				"dev": 1,
+				"code": 1006
+			}
+		},
+		{
+			"i": 126,
+			"gapMs": 160,
+			"canvas": {
+				"t": "cDeleteEdge",
+				"dev": 0,
+				"file": 0.08088961034081876,
+				"edge": 0.9177170237526298
+			}
+		},
+		{
+			"i": 129,
+			"gapMs": 119,
+			"canvas": {
+				"t": "cMove",
+				"dev": 0,
+				"file": 0.46496335370466113,
+				"node": 0.1225521988235414
+			}
+		},
+		{
+			"i": 18,
+			"gapMs": 747,
+			"user": {
+				"t": "type",
+				"dev": 2,
+				"view": 0.9473844757303596,
+				"pos": 0.6091621178202331,
+				"nl": false
+			}
+		},
+		{
+			"i": 19,
+			"gapMs": 259,
+			"fault": {
+				"t": "epochRestore",
+				"back": 4
+			}
+		},
+		{
+			"i": 142,
+			"gapMs": 124,
+			"canvas": {
+				"t": "cRename",
+				"dev": 0,
+				"file": 0.24449174082838,
+				"name": 5,
+				"folder": true
+			}
+		}
+	]
+}
