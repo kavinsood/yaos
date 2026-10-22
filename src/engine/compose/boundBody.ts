@@ -30,7 +30,7 @@ export interface BoundBodyDeps {
 
 export class BoundBody {
 	private readonly uploads = new Map<number, { parts: string[]; text: string | null }>();
-	readonly stats = { attaches: 0, attachMerges: 0, pushes: 0, saveMarks: 0, candidates: 0, heldCopies: 0 };
+	readonly stats = { attaches: 0, attachMerges: 0, pushes: 0, saveMarks: 0, candidates: 0 };
 
 	constructor(private readonly deps: BoundBodyDeps) {}
 
@@ -158,14 +158,6 @@ export class BoundBody {
 		} finally {
 			b.author = null;
 		}
-	}
-
-	/** A held view went away (stray retarget): its unsaved text goes to a conflict copy of the file it showed. */
-	async heldEdits(m: Msg<"heldEdits">): Promise<void> {
-		const text = this.take(m.text);
-		if (text === null) return;
-		this.stats.heldCopies++;
-		await this.deps.disk.writeConflictCopy(m.path, m.docId, text, "both-edited");
 	}
 
 	/**

@@ -684,9 +684,6 @@ export class ComposedEngine {
 			case "bodySaveMark":
 				this.boundBody.saveMark(m);
 				return;
-			case "heldEdits":
-				await this.boundBody.heldEdits(m);
-				return;
 			case "docCredit":
 				this.bound.credit(m.bytes);
 				return;

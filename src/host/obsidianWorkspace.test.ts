@@ -19,6 +19,7 @@ class FakeMarkdownView implements MarkdownViewLike {
 	editor = new FakeEditor();
 	dirty = false;
 	lastSavedData: string | null = null;
+	data = "";
 	mode = "source";
 	log: string[] = [];
 	siblings: FakeMarkdownView[] = [];
@@ -250,7 +251,7 @@ test("onInternalDataChange names its view as the source of the quick preview its
 	assert.deepEqual(seen, [r1.viewId, null]);
 });
 
-test("held saves across Obsidian's close and file switch: onUnloadFile's save writes nothing, heldText keeps the editor until released", async () => {
+test("held saves across Obsidian's close and file switch: onUnloadFile's save writes nothing and hands its editor text to onSkipped", async () => {
 	for (const leave of ["close", "switch"] as const) {
 		const ws = new FakeWorkspace();
 		const v = new FakeMarkdownView({ path: "z.md" });
@@ -260,29 +261,47 @@ test("held saves across Obsidian's close and file switch: onUnloadFile's save wr
 		const w = new ObsidianWorkspace(ws, fakeEditors([]));
 		const ref = w.listMarkdownViews()[0];
 		assert.ok(ref);
-		assert.equal(ref.holdSaves(true), false);
-		assert.equal(ref.heldText(), null, "nothing skipped yet");
+		const skipped: string[] = [];
+		const keep = (doc: Text) => skipped.push(doc.toString());
+		assert.equal(ref.holdSaves(true, keep), false);
 		v.type("x body\nunsaved");
 		await v.save(); // the 2 s debounced save while held
-		assert.equal(ref.heldText()?.toString(), "x body\nunsaved");
-		ref.bind(noSpec); // a bind starts unheld (the host holds again), the skipped text stays
-		ref.holdSaves(true);
-		assert.equal(ref.heldText()?.toString(), "x body\nunsaved");
+		assert.deepEqual(skipped, ["x body\nunsaved"]);
+		ref.bind(noSpec); // a bind ends the hold and its callback
+		v.type("x body\nunsaved\nbound");
+		await v.save();
+		assert.deepEqual(skipped, ["x body\nunsaved"]);
+		assert.ok(v.log.includes("write:x body\nunsaved\nbound"), "unheld: written");
+		ref.holdSaves(true, keep);
 		v.type("typed\nx body\nunsaved");
 		if (leave === "close") {
 			await v.close();
 			ws.leaves = [];
 		} else await v.openFile("other.md", "other");
 		ws.fire();
-		assert.equal(v.log.some((l) => l.startsWith("write:")), false, `${leave}: onUnloadFile's save wrote nothing`);
-		assert.deepEqual(v.log.filter((l) => l === "unload").length, 1);
-		assert.equal(ref.heldText()?.toString(), "typed\nx body\nunsaved", `${leave}: the editor at that save, after Obsidian cleared it`);
+		assert.equal(v.log.filter((l) => l.startsWith("write:")).length, 1, `${leave}: onUnloadFile's save wrote nothing`);
+		assert.deepEqual(skipped, ["x body\nunsaved", "typed\nx body\nunsaved"], `${leave}: the editor at that save, before Obsidian cleared it`);
 		ref.holdSaves(false);
-		assert.equal(ref.heldText(), null, "released: forgotten");
 	}
 });
 
-test("binding over this adapter: a stray view closed (or switched) while its saves are held writes nothing and its text goes to heldEdits", async () => {
+test("loadFileText: the view shows the text as its file's, clean, as onLoadFile leaves it", () => {
+	const ws = new FakeWorkspace();
+	const v = new FakeMarkdownView({ path: "z.md" });
+	v.type("x body");
+	v.data = "x body";
+	ws.leaves = [{ view: v }];
+	const ref = new ObsidianWorkspace(ws, fakeEditors([])).listMarkdownViews()[0];
+	assert.ok(ref);
+	ref.loadFileText("z body\n");
+	assert.equal(v.editor.doc.toString(), "z body\n");
+	assert.equal(v.lastSavedData, "z body\n");
+	assert.equal(v.data, "z body\n");
+	assert.equal(v.dirty, false);
+	assert.ok(v.log.includes("proto:true:z body\n"));
+});
+
+test("binding over this adapter: a stray view closed (or switched) while its saves are held writes nothing over z.md and main keeps its text in a conflict copy", async () => {
 	for (const [leave, phase] of [["close", "opening"], ["close", "attaching"], ["switch", "attaching"]] as const) {
 		const clock = new VirtualClock();
 		const ws = new FakeWorkspace();
@@ -293,7 +312,16 @@ test("binding over this adapter: a stray view closed (or switched) while its sav
 		const engine = new SimBodyEngine(clock);
 		const x = engine.add("x.md", "x body\n");
 		engine.add("z.md", "z body\n");
-		const bm = new BindingManager({ workspace: new ObsidianWorkspace(ws, fakeEditors([])), vault: { caseInsensitive: false }, clock, link: engine.link, notice: () => undefined });
+		const files = new Map<string, string>([["z.md", "z body\n"]]);
+		const vault = {
+			caseInsensitive: false,
+			write: async (path: string, data: string | Uint8Array, pre: { t: string }) => {
+				if (pre.t === "absent" && files.has(path)) return { ok: false as const, reason: "precondition" as const, message: "exists", current: null };
+				files.set(path, typeof data === "string" ? data : new TextDecoder().decode(data));
+				return { ok: true as const } as never;
+			},
+		};
+		const bm = new BindingManager({ workspace: new ObsidianWorkspace(ws, fakeEditors([])), vault, clock, link: engine.link, notice: () => undefined });
 		engine.bm = bm;
 		bm.start();
 		await clock.advance(50);
@@ -311,6 +339,7 @@ test("binding over this adapter: a stray view closed (or switched) while its sav
 		ws.fire(); // layout-change / file-open: closed or file-changed
 		await clock.advance(5_000);
 		assert.equal(v.log.some((l) => l.startsWith("write:")), false, `${leave} ${phase}: nothing written over z.md`);
-		assert.deepEqual(engine.held, [{ docId: x, path: "z.md", text: "x body\nunsaved" }], `${leave} ${phase}`);
+		assert.deepEqual([...files].filter(([p]) => p.includes("(conflict")), [["z (conflict 2026-01-01 0000).md", "x body\nunsaved"]], `${leave} ${phase}: main kept it`);
+		assert.equal(files.get("z.md"), "z body\n");
 	}
 });

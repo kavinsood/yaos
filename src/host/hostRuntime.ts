@@ -87,6 +87,8 @@ export class HostRuntime {
 			workspace: deps.workspace,
 			vault: deps.vault,
 			clock: deps.clock,
+			conflictLabel: () => deps.identity.deviceLabel,
+			tzOffsetMinutes: () => -new Date().getTimezoneOffset(),
 			notice: (level, code, message) => deps.ui.onNotice(level, code, message),
 			link: {
 				post: (m) => void this.engine.post(m as Parameters<EngineHost["post"]>[0]), // binding posts events only

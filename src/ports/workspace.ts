@@ -67,14 +67,16 @@ export interface EditorViewRef {
 	 * While held, Obsidian's saves of this view write nothing (getViewData answers the text Obsidian last loaded or
 	 * saved, TextFileView.lastSavedData, which its save compares and skips). Releasing returns whether a save was
 	 * skipped meanwhile. Used while the engine merges an external reload the editor does not show yet.
+	 * `onSkipped` gets the editor document of each skipped save, synchronously, before Obsidian goes on (O(1):
+	 * CodeMirror Text is immutable); a close or file switch saves first (onUnloadFile), so it sees that text too.
+	 * Binding the view ends a hold (and its `onSkipped`).
 	 */
-	holdSaves(hold: boolean): boolean;
+	holdSaves(hold: boolean, onSkipped?: (doc: Text) => void): boolean;
 	/**
-	 * The editor document when a save last skipped while held (O(1): CodeMirror Text is immutable), kept across
-	 * binds and the view's close until holdSaves(false); null when none skipped. A close or file switch while held
-	 * reads the edits that save would have written here (Obsidian's onUnloadFile save runs before the view goes).
+	 * Show `text` as the file's content just loaded (TextFileView.onLoadFile: setViewData(text, clear = true),
+	 * lastSavedData = text, not dirty). Unbound views only. O(text): a rare recovery path.
 	 */
-	heldText(): Text | null;
+	loadFileText(text: string): void;
 	/** Force Obsidian's save now (instead of its 2 s debounce). */
 	save(): Promise<void>;
 }

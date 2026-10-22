@@ -305,11 +305,6 @@ export type MainToEngine =
 	 * `seq`, null = no push pending): the engine keeps that text as one the disk may hold (absorbed, §d.3).
 	 */
 	| { readonly t: "bodySaveMark"; readonly docId: DocId; readonly viewId: number; readonly version: number; readonly seq: number | null }
-	/**
-	 * A view closed or switched files while its saves were held after a stray retarget of doc `docId` (§d.2): upload
-	 * `text`, what its last save would have written over `path`, goes to a conflict copy of `path`.
-	 */
-	| { readonly t: "heldEdits"; readonly docId: DocId; readonly path: VaultPath; readonly text: number }
 	/** Body event weight applied on main (returns docCredit window). */
 	| { readonly t: "docCredit"; readonly bytes: number }
 	/** Hash raw bytes the host read (write preconditions, config writes); answered by `hashes`. [T] */

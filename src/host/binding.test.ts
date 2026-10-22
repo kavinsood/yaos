@@ -24,6 +24,11 @@ function setup() {
 	return { clock, vault, ws, engine, bm, notices };
 }
 
+/** Conflict copies in the vault: [path, text]. */
+function copies(vault: SimVault): [string, string][] {
+	return [...vault.snapshot().entries()].filter(([p]) => p.includes("(conflict")).sort();
+}
+
 function file(s: ReturnType<typeof setup>, path: string, text: string): DocId {
 	s.vault.userWrite(path, text);
 	return s.engine.add(path, text);
@@ -439,6 +444,54 @@ test("binding: a view that goes away while a stray retarget holds its saves send
 		else assert.ok(await ws.switchFile(v.viewId, "other.md"));
 		await clock.advance(5_000);
 		assert.equal(vault.textOf("z.md"), "one\ntwo\nz\n", `${leave} ${phase}: the held save never wrote z.md`);
-		assert.deepEqual(engine.held, [{ docId: x, path: "z.md", text: "ONE\ntwo\nx\n" }], `${leave} ${phase}: the text goes to a conflict copy`);
+		assert.deepEqual(copies(vault), [["z (conflict 2026-01-01 0000).md", "ONE\ntwo\nx\n"]], `${leave} ${phase}: main kept the text in a conflict copy`);
 	}
+});
+
+test("binding: held text needs no engine: a stray view whose re-open never answers keeps each held save in a conflict copy", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm, vault } = s;
+	const x = file(s, "x.md", "one\ntwo\nx\n");
+	file(s, "z.md", "one\ntwo\nz\n");
+	bm.start();
+	const v = ws.openFile("x.md");
+	assert.ok(v);
+	await clock.advance(5);
+	v.path = "z.md";
+	engine.delay = () => 1e12; // the engine is gone: openDoc never answers
+	bm.onDocRetarget(x, { t: "renamed", path: "z.md" as never, stray: true });
+	v.edit(0, 3, "ONE");
+	await clock.advance(5_000); // Obsidian's 2 s save, held
+	assert.equal(vault.textOf("z.md"), "one\ntwo\nz\n");
+	assert.deepEqual(copies(vault).map(([, t]) => t), ["ONE\ntwo\nx\n"], "kept at the held save");
+	await v.save(); // saved again without edits: nothing new
+	v.edit(0, 0, "zero\n");
+	await ws.closeView(v.viewId); // the close save, held
+	await clock.advance(5_000);
+	assert.equal(vault.textOf("z.md"), "one\ntwo\nz\n");
+	assert.deepEqual(copies(vault).map(([, t]) => t).sort(), ["ONE\ntwo\nx\n", "zero\nONE\ntwo\nx\n"], "and at the close");
+});
+
+test("binding: the host stopping while a stray view is held keeps its text in a copy and shows the file's text; no save writes over z.md", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm, vault } = s;
+	const x = file(s, "x.md", "one\ntwo\nx\n");
+	file(s, "z.md", "one\ntwo\nz\n");
+	bm.start();
+	const v = ws.openFile("x.md");
+	assert.ok(v);
+	await clock.advance(5);
+	v.path = "z.md";
+	engine.delay = () => 400;
+	bm.onDocRetarget(x, { t: "renamed", path: "z.md" as never, stray: true });
+	v.edit(0, 3, "ONE"); // not saved yet (2 s debounce)
+	bm.stop();
+	await clock.advance(5_000);
+	assert.deepEqual(copies(vault).map(([, t]) => t), ["ONE\ntwo\nx\n"], "kept");
+	assert.equal(v.getText(), "one\ntwo\nz\n", "the view shows its file");
+	assert.equal(v.isDirty(), false);
+	await v.save();
+	v.edit(0, 0, "later\n"); // typing after the plugin stopped: an ordinary edit of z.md
+	await clock.advance(5_000);
+	assert.equal(vault.textOf("z.md"), "later\none\ntwo\nz\n");
 });
