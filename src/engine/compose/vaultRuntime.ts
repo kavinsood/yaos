@@ -337,7 +337,8 @@ export class VaultRuntime {
 		});
 		this.mirror = new SyncedMirrorWriter({
 			side: link.sideFiles, hash: ports.hash, clock: ports.clock, identity: () => identity,
-			entries: () => this.rec.ctx.store.synced.values(), nsCoversSeq: () => c.ns.coversSeq, moves: () => bases.renames(),
+			entries: () => this.rec.ctx.store.synced.values(), heldTexts: () => this.rec.ctx.store.loadAllHeld(),
+			nsCoversSeq: () => c.ns.coversSeq, moves: () => bases.renames(),
 			onError: (e) => this.diag(`synced mirror write failed: ${String(e)}`),
 			before: () => c.mirror.flushed(),
 			onWritten: () => void this.dropLineageDirs(),
@@ -680,7 +681,7 @@ export class VaultRuntime {
 	private keptSignature(): string {
 		const parts: string[] = [];
 		for (const s of this.rec.ctx.store.synced.values()) {
-			if (s.fileGone || s.renamedTo || s.held) parts.push(`${s.docId}|${s.fileGone ? 1 : 0}|${s.renamedTo?.to ?? ""}|${s.held?.hash ?? ""}|${s.held?.text !== undefined ? 1 : 0}`);
+			if (s.fileGone || s.renamedTo || s.held) parts.push(`${s.docId}|${s.fileGone ? 1 : 0}|${s.renamedTo?.to ?? ""}|${s.held?.hash ?? ""}|${s.held?.bytes ?? ""}`);
 		}
 		return parts.sort().join("\n");
 	}

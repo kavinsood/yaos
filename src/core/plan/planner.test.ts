@@ -438,7 +438,7 @@ test("rename inference pairs a missing doc's file by the content a refused commi
 test("a missing doc's held edit with its text is published first; the file's absence is decided the next pass", () => {
 	// Sim suite-1 wipe/revoke/roll seed 112: renamed and edited again unobserved, the file pairs with nothing. Deciding
 	// its absence first (a peer's edit: edit beats delete) put the doc back without the user's held edit.
-	const kept = { hash: h("c1"), text: "t", base: "b" };
+	const kept = { hash: h("c1"), bytes: 2 };
 	const p = run({ remote: [R("d1", "a.canvas")], synced: [S("d1", "a.canvas", { held: kept })], local: [L("c5.canvas", h("c9"))] });
 	assert.deepEqual(find(p, "reconcileContent"), { op: "reconcileContent", docId: "d1", path: "a.canvas", kind: "canvas", hasBase: true, held: true });
 	assert.ok(!opsOf(p).includes("nsDelete") && !opsOf(p).includes("diskMaterialize"), JSON.stringify(p.ops));

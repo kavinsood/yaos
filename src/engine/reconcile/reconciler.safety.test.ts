@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { VaultPath } from "../../core/types";
-import { World } from "./testkit/world";
+import { DB, World } from "./testkit/world";
 import { KeyMissingError } from "../keyring/writeGate";
-import { HELD_TEXT_MAX_CHARS } from "../../core/limits";
+import { HELD_TEXT_MAX_BYTES, HELD_TEXT_MAX_CHARS } from "../../core/limits";
 
 const P = (s: string): VaultPath => s;
 
@@ -332,10 +332,13 @@ async function heldThenRenamedAndEdited(path: string, text: string, edit: string
 	w.log.writeGate = "revoked-epoch";
 	w.vault.userWrite(path, edit);
 	await assert.rejects(w.sync(3), KeyMissingError);
-	const kept = w.synced(id)!.held;
+	const held = w.synced(id)!.held;
+	const kept = await w.r.ctx.store.loadHeld(id);
+	assert.ok(held?.bytes !== undefined && kept !== null, "kept with its texts, in the heldText store");
 	assert.equal(w.synced(id)!.contentHash, base, "S stays the merge base");
 	await w.wipeAndRebootFromMirror();
-	assert.deepEqual(w.synced(id)!.held, kept, "the held edit, text and base, came back from the synced mirror");
+	assert.deepEqual(w.synced(id)!.held, held, "the held edit came back from the synced mirror");
+	assert.deepEqual(await w.r.ctx.store.loadHeld(id), kept, "with its text and base");
 	assert.equal(w.synced(id)!.hasBase, false, "no stored base after the wipe: the held edit carries its own");
 	await assert.rejects(w.sync(3), KeyMissingError); // still key-missing: nothing is decided about the gone file
 	w.vault.userRename(path, moved);
@@ -359,6 +362,7 @@ test("held edit (markdown): the refused edit's text and base are kept, survive a
 	assert.equal(w.vault.text("b.md"), "one\nthree\nfour\nfive\n");
 	assert.deepEqual(w.conflictCopies(), []);
 	assert.equal(w.synced(id)!.held, undefined, "cleared by the publish");
+	assert.deepEqual(w.storage.dump(DB, "heldText"), [], "its texts with it");
 });
 
 test("held edit (markdown): published with no peer edit, the gone file is the user's delete; nothing is put back", async () => {
@@ -377,7 +381,7 @@ test("held edit (canvas): a record deleted while key-missing stays deleted after
 	const node = (id: string, text: string): Record<string, unknown> => ({ id, type: "text", text, x: 0, y: 0, width: 100, height: 50 });
 	const board = (...ids: string[]): string => JSON.stringify({ nodes: ids.map((i) => node(i, i.toUpperCase())), edges: [] }, null, "\t");
 	const { w, id, kept } = await heldThenRenamedAndEdited("c0.canvas", board("a", "b", "c"), board("a", "c"), "c5.canvas", board("a", "c", "d"));
-	assert.ok(kept?.text !== undefined && kept.base !== undefined, "canvas: the file text and the base merge text are kept");
+	assert.ok(kept !== null && kept.text.includes("\"c\"") && !kept.text.includes("\"b\""), "canvas: the file text (and the base merge text) are kept");
 	w.log.writeGate = null;
 	w.log.remoteEditCanvas(id, (d) => {
 		const m = d.getMap<unknown>("nodes").get("a") as { get(k: string): { insert(i: number, s: string): void; length: number } };
@@ -392,29 +396,48 @@ test("held edit (canvas): a record deleted while key-missing stays deleted after
 	assert.deepEqual(w.conflictCopies(), []);
 });
 
-test("held edit: the texts are kept within HELD_TEXT_MAX_CHARS over all records; past it the hash alone, the file untouched", async () => {
+test("held edit: the texts are kept within HELD_TEXT_MAX_BYTES over all records and HELD_TEXT_MAX_CHARS a text; past them the hash alone", async () => {
 	const w = new World();
 	await w.boot();
-	// a's text + base fill the bound but for a char: with b's small held edit kept first, a's no longer fits.
-	const big = "x".repeat(Math.floor((HELD_TEXT_MAX_CHARS - 5) / 2) - 1) + "\n";
+	// a's text + base (3 UTF-8 bytes a char, within the per-text bound) fit the total bound alone, but not after b's
+	// small held edit (12 bytes), kept first.
+	const n = Math.floor((HELD_TEXT_MAX_BYTES - 7) / 6);
+	const big = "中".repeat(n) + "\n";
+	assert.ok(6 * n + 7 <= HELD_TEXT_MAX_BYTES && 6 * n + 7 + 12 > HELD_TEXT_MAX_BYTES);
+	assert.ok(big.length <= HELD_TEXT_MAX_CHARS);
 	const a = w.log.remoteCreate(P("a.md"), big);
 	const b = w.log.remoteCreate(P("b.md"), "one\ntwo\n");
 	await w.sync();
 	w.log.writeGate = "revoked-epoch";
 	w.vault.userWrite("b.md", "one\n");
 	await assert.rejects(w.sync(3), KeyMissingError);
-	assert.deepEqual(w.synced(b)!.held?.text, "one\n", "within the bound: kept with its text");
+	assert.equal((await w.r.ctx.store.loadHeld(b))?.text, "one\n", "within the bounds: kept with its text");
 	w.vault.userWrite("a.md", big + "tail\n");
 	await assert.rejects(w.sync(3), KeyMissingError);
 	const ha = w.synced(a)!.held;
-	assert.ok(ha !== undefined && ha.text === undefined && ha.base === undefined, "past the bound: the hash alone");
+	assert.ok(ha !== undefined && ha.bytes === undefined, "past the total bound: the hash alone");
+	assert.equal(await w.r.ctx.store.loadHeld(a), null);
 	assert.equal(w.vault.text("a.md"), big + "tail\n", "nothing is lost: the file holds the edit");
+	assert.ok(!JSON.stringify(w.synced(b)).includes("one\\n"), "the texts are not on the in-memory record");
 	w.log.writeGate = null;
 	await w.sync();
 	assert.equal(w.log.text(a), big + "tail\n");
 	assert.equal(w.log.text(b), "one\n", "published by the ordinary merge once the gate opened");
 	assert.equal(w.synced(a)!.held, undefined);
 	assert.equal(w.synced(b)!.held, undefined);
+	assert.deepEqual(w.storage.dump(DB, "heldText"), [], "the texts went with the held edits");
+});
+
+test("held edit: a text past HELD_TEXT_MAX_CHARS keeps the hash alone", async () => {
+	const w = new World();
+	await w.boot();
+	const id = w.log.remoteCreate(P("a.md"), "x\n");
+	await w.sync();
+	w.log.writeGate = "revoked-epoch";
+	w.vault.userWrite("a.md", "y".repeat(HELD_TEXT_MAX_CHARS) + "\n");
+	await assert.rejects(w.sync(3), KeyMissingError);
+	const held = w.synced(id)!.held;
+	assert.ok(held !== undefined && held.bytes === undefined, "the hash alone");
 });
 
 test("write gate shut (key-missing): a pass the gate stops at another doc's ns op still marks a file gone from its record", async () => {

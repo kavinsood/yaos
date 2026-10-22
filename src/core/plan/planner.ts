@@ -714,7 +714,7 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		// user's edit of the file before it went (renamed and edited again unobserved, deleted). The next pass decides
 		// the file's absence against the doc that holds it. Otherwise edit beats delete (a peer's edit) brought back what
 		// the held edit removed (sim suite-1 wipe/revoke/roll seed 112). Not for a rebound loser's record (prefix).
-		if (s.held?.text !== undefined && s.kind !== "blob" && docId === origId) {
+		if (s.held?.bytes !== undefined && s.kind !== "blob" && docId === origId) {
 			return push([...prefix, { op: "reconcileContent", docId, path: s.path, kind: s.kind, hasBase: s.hasBase, held: true }]);
 		}
 		const Rc = s.kind === "blob" ? (r.blob?.rev ?? 0) !== s.blobRev : !versionEq(r.body!.version, s.bodyVersion);

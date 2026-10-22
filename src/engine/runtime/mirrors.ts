@@ -25,9 +25,9 @@ import type { ContentHash, DocId, PathKey, StreamName } from "../../core/types";
 import { pathKey } from "../../core/paths/pathKey";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import type { HashPort } from "../../ports/crypto";
-import { CodecError, utf8Encode } from "../../core/codec/lib0";
+import { CodecError, utf8ByteLength, utf8Encode } from "../../core/codec/lib0";
 import * as codec from "../../core/codec/mirrors";
-import type { MetaPathMove, OutboxMirror, OutboxMirrorFrame, OutboxRecord, SyncedMirror, SyncedMirrorEntry } from "../store/schema";
+import type { HeldTextRecord, MetaPathMove, OutboxMirror, OutboxMirrorFrame, OutboxRecord, SyncedMirror, SyncedMirrorEntry, SyncedRecord } from "../store/schema";
 
 export type MirrorIdentity = codec.MirrorIdentity;
 
@@ -312,6 +312,19 @@ export function unmirroredDocs(records: readonly OutboxRecord[], frames: readonl
 export const UNTRUSTED_CONTENT_HASH = "0".repeat(64) as ContentHash;
 
 /** A recovered synced record (`contentHash` from the mirror), with the hash dropped when `untrusted` names its doc. */
+/** A mirrored held edit as the recovered record keeps it: its hash, and its texts' size when they came along. */
+export function recoveredHeld(h: SyncedMirrorEntry["held"]): SyncedRecord["held"] {
+	if (!h) return undefined;
+	return h.text !== undefined && h.base !== undefined ? { hash: h.hash, bytes: utf8ByteLength(h.text) + utf8ByteLength(h.base) } : { hash: h.hash };
+}
+
+/** The heldText rows a mirror's entries carry: recovery stores them with the records (recoveredHeld). */
+export function heldTextsOf(entries: readonly SyncedMirrorEntry[]): HeldTextRecord[] {
+	const out: HeldTextRecord[] = [];
+	for (const e of entries) if (e.held?.text !== undefined && e.held.base !== undefined) out.push({ docId: e.docId, hash: e.held.hash, text: e.held.text, base: e.held.base });
+	return out;
+}
+
 export function untrustedSyncPoint<T extends { readonly docId: DocId; readonly contentHash: ContentHash }>(rec: T, untrusted: ReadonlySet<DocId>): T {
 	return untrusted.has(rec.docId) ? { ...rec, contentHash: UNTRUSTED_CONTENT_HASH } : rec;
 }

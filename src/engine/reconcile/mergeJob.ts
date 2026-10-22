@@ -38,7 +38,7 @@ import { epochBaseOf, MAX_CAS_ATTEMPTS, overwriteAllowed, trustedEpochBase, writ
 import type { BodyHandle } from "./deps";
 import { writeOk, type Env, type JobOutcome } from "./diskJobs";
 import { MAX_TEXT_FILE_BYTES } from "./localState";
-import { heldEditOf, keepHeld, publishHeld } from "./heldJob";
+import { heldTextsFit, keepHeld, publishHeld } from "./heldJob";
 import { KeyMissingError } from "../keyring/writeGate";
 import { applyOldDeletes } from "./oldDeletes";
 import { makeBase } from "./store";
@@ -139,7 +139,7 @@ export async function reconcileContent(env: Env, op: ReconcileOp): Promise<JobOu
 		v1 = await h.commitEdits();
 	} catch (e) {
 		// The write gate refused the edit (key missing): keep it on S, with its text (heldJob.ts).
-		if (e instanceof KeyMissingError && diskHash !== s?.contentHash) await keepHeld(env, docId, heldEditOf(env, docId, diskHash, D, triedBase));
+		if (e instanceof KeyMissingError && diskHash !== s?.contentHash) await keepHeld(env, docId, diskHash, heldTextsFit(env, docId, D, triedBase));
 		throw e;
 	}
 	// Editor keystrokes applied between the CAS and the frame close are covered by v1.localOrder but are not in M:

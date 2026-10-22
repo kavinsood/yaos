@@ -8,6 +8,7 @@
 import type { BrakeConfig, BrakeReport, DeviceId, DocId, ObservedRename, PathKey, Seq, SyncedEntry, VaultId, VaultPath } from "../../../core/types";
 import { decodeSyncedMirror, encodeSyncedMirror } from "../../../core/codec/mirrors";
 import { fromMirrorEntry, toMirrorEntry } from "../../compose/syncedMirror";
+import { heldTextsOf } from "../../runtime/mirrors";
 import { DEFAULT_BRAKE } from "../../../core/plan/brake";
 import { refHashPort } from "../../../core/hash/testkit/hashRef";
 import type { VaultEvent } from "../../../ports/vault";
@@ -161,7 +162,8 @@ export class World {
 	 */
 	async wipeAndRebootFromMirror(): Promise<Reconciler> {
 		const identity = { vaultId: "v" as VaultId, vaultEpoch: "e", deviceId: "dev" as DeviceId };
-		const entries = [...this.r.ctx.store.synced.values()].map(toMirrorEntry);
+		const texts = await this.r.ctx.store.loadAllHeld();
+		const entries = [...this.r.ctx.store.synced.values()].map((r) => toMirrorEntry(r, texts.get(r.docId)));
 		const pk = this.r.ctx.pk;
 		const bytes = await encodeSyncedMirror({ ...identity, generation: 1, writtenAtMs: 0, nsCoversSeq: 0 as Seq, entries }, refHashPort);
 		const decoded = await decodeSyncedMirror(bytes, refHashPort);
@@ -169,8 +171,9 @@ export class World {
 		this.storage.crash();
 		await this.storage.deleteDatabase(DB);
 		const db = await this.storage.open<DiskSchema>(DB, DB_SCHEMA_VERSION, STORE_SPECS);
-		await db.tx([STORE.synced], "readwrite", async (tx) => {
+		await db.tx([STORE.synced, STORE.heldText], "readwrite", async (tx) => {
 			for (const e of decoded.mirror.entries) tx.put(STORE.synced, fromMirrorEntry(e, pk, this.clock.now()));
+			for (const t of heldTextsOf(decoded.mirror.entries)) tx.put(STORE.heldText, t);
 		});
 		db.close();
 		return this.crashAndReboot();

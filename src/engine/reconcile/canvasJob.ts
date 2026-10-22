@@ -33,7 +33,7 @@ import { epochBaseKey, epochBaseOf, MAX_CAS_ATTEMPTS, overwriteAllowed, trustedE
 import type { BodyHandle } from "./deps";
 import { framedVersion, writeOk, type Env, type JobOutcome } from "./diskJobs";
 import { MAX_TEXT_FILE_BYTES } from "./localState";
-import { heldEditOf, keepHeld } from "./heldJob";
+import { heldTextsFit, keepHeld } from "./heldJob";
 import { KeyMissingError } from "../keyring/writeGate";
 import { utf8Decode } from "../../core/codec/lib0";
 import { applyOldDeletes } from "./oldDeletes";
@@ -111,7 +111,7 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 	} catch (e) {
 		// The write gate refused the edit (key missing): keep it on S, with the file text and its base (heldJob.ts).
 		if (e instanceof KeyMissingError && diskHash !== s?.contentHash) {
-			await keepHeld(env, docId, heldEditOf(env, docId, diskHash, utf8Decode(rd.bytes), triedBase && canvasToMergeText(triedBase)));
+			await keepHeld(env, docId, diskHash, heldTextsFit(env, docId, utf8Decode(rd.bytes), triedBase && canvasToMergeText(triedBase)));
 		}
 		throw e;
 	}

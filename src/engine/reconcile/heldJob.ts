@@ -2,9 +2,11 @@
  * Held edits (DESIGN §f.6 "Held edits", SyncedEntry.held): an edit the write gate refused (key missing).
  *
  * Kept: a markdown / canvas content job whose merge the gate refuses records the disk content on S before the
- * KeyMissingError goes on (`keepHeld`): its hash always, its text with the base it was merged against while
- * HELD_TEXT_MAX_CHARS allows (`heldEditOf`). The store and the synced mirror carry both, so an IndexedDB loss with
- * the mirrors kept recovers them.
+ * KeyMissingError goes on (`keepHeld`): its hash always, its text with the base it was merged against while the bounds
+ * allow (`heldTextsFit`: HELD_TEXT_MAX_CHARS a text, HELD_TEXT_MAX_BYTES over all records). The texts go to the
+ * heldText store in the record's transaction, never into memory (the record keeps their size, `held.bytes`); they are
+ * read back to publish and to write the synced mirror, which carries them, so an IndexedDB loss with the mirrors kept
+ * recovers them.
  *
  * Published (`publishHeld`, a reconcileContent op with `held`): planned for a live doc whose file is gone and pairs
  * with nothing (planner liveMissing). The held text merges against its base into the doc as the user's edit, the disk
@@ -12,14 +14,14 @@
  * text afterwards S takes the version; otherwise (a peer's edit) bodyVersion null, so the remote side reads as changed.
  * The next pass decides the file's absence against that doc: a delete, or edit beats delete with the held edit in.
  *
- * Past the bound, or with no base (mirror recovery before a merge stored one), the hash alone: rename inference still
+ * Past the bounds, or with no base (mirror recovery before a merge stored one), the hash alone: rename inference still
  * pairs the unchanged file by it, and nothing is lost, the file holds the text; only a file renamed and edited again
  * unobserved then reads as a delete + a create (the user's removals in the doc may come back, never a lost text).
  */
 
-import type { ContentHash, DocId, HeldEdit, LocalEntry, SyncedEntry } from "../../core/types";
-import { HELD_TEXT_MAX_CHARS, MAX_BASE_TEXT_CHARS } from "../../core/limits";
-import { utf8Encode } from "../../core/codec/lib0";
+import type { ContentHash, DocId, LocalEntry, SyncedEntry } from "../../core/types";
+import { HELD_TEXT_MAX_BYTES, HELD_TEXT_MAX_CHARS } from "../../core/limits";
+import { utf8ByteLength, utf8Encode } from "../../core/codec/lib0";
 import { canvasToMergeText } from "../../core/hash/canvasCanonical";
 import { merge } from "../../core/merge/merge";
 import { applyEditsTo, minimalDiff } from "../../core/merge/minimalDiff";
@@ -31,26 +33,31 @@ import type { BodyHandle } from "./deps";
 import type { Env, JobOutcome } from "./diskJobs";
 import { hashBase, makeBase } from "./store";
 
-/** Chars a held edit's texts take against HELD_TEXT_MAX_CHARS. */
-function heldChars(h: HeldEdit | undefined): number {
-	return h?.text === undefined ? 0 : h.text.length + (h.base?.length ?? 0);
+export interface HeldTexts {
+	readonly text: string;
+	readonly base: string;
 }
 
-/** The held edit to keep for `docId`: with its texts while the bound allows (theirs plus every other record's). */
-export function heldEditOf(env: Env, docId: DocId, hash: ContentHash, text: string, base: string | null): HeldEdit {
-	if (base === null || text.length > MAX_BASE_TEXT_CHARS || base.length > MAX_BASE_TEXT_CHARS) return { hash };
+/**
+ * The texts to keep with `docId`'s held edit, or null (the hash alone): each within HELD_TEXT_MAX_CHARS, and their
+ * UTF-8 bytes with every other record's kept ones within HELD_TEXT_MAX_BYTES (the records' `held.bytes`, no IDB read).
+ */
+export function heldTextsFit(env: Env, docId: DocId, text: string, base: string | null): (HeldTexts & { bytes: number }) | null {
+	if (base === null || text.length > HELD_TEXT_MAX_CHARS || base.length > HELD_TEXT_MAX_CHARS) return null;
+	const bytes = utf8ByteLength(text) + utf8ByteLength(base);
 	let used = 0;
-	for (const s of env.ctx.store.synced.values()) if (s.docId !== docId) used += heldChars(s.held);
-	return used + text.length + base.length <= HELD_TEXT_MAX_CHARS ? { hash, text, base } : { hash };
+	for (const s of env.ctx.store.synced.values()) if (s.docId !== docId) used += s.held?.bytes ?? 0;
+	return used + bytes <= HELD_TEXT_MAX_BYTES ? { text, base, bytes } : null;
 }
 
-/** Record `held` on the doc's synced record (no-op when S already is that content, or already holds it as well). */
-export async function keepHeld(env: Env, docId: DocId, held: HeldEdit): Promise<void> {
+/** Record the held edit on the doc's synced record, its texts in heldText (no-op when S is that content, or holds it). */
+export async function keepHeld(env: Env, docId: DocId, hash: ContentHash, texts: (HeldTexts & { bytes: number }) | null): Promise<void> {
 	const { ctx } = env;
 	const s = ctx.store.synced.get(docId);
-	if (!s || held.hash === s.contentHash) return;
-	if (s.held?.hash === held.hash && (s.held.text !== undefined || held.text === undefined)) return;
-	await ctx.commit({ syncedPut: [{ ...s, held }] });
+	if (!s || hash === s.contentHash) return;
+	if (s.held?.hash === hash && (s.held.bytes !== undefined || texts === null)) return;
+	if (!texts) return ctx.commit({ syncedPut: [{ ...s, held: { hash } }] });
+	await ctx.commit({ syncedPut: [{ ...s, held: { hash, bytes: texts.bytes } }], heldPut: [{ docId, hash, text: texts.text, base: texts.base }] });
 }
 
 /** S without its held edit (kept on: the marks, the path). */
@@ -62,9 +69,14 @@ function released(s: SyncedEntry): Omit<SyncedEntry, "held"> {
 export async function publishHeld(env: Env, op: ReconcileOp, h: BodyHandle): Promise<JobOutcome> {
 	const { ctx } = env;
 	const s = ctx.synced(op.docId);
-	const held = s?.held;
-	if (!s || held?.text === undefined || held.base === undefined) return "ok"; // published (or dropped) since the plan
-	return op.kind === "canvas" ? publishCanvas(env, op, h, s, held.hash, held.text, held.base) : publishMarkdown(env, op, h, s, held.hash, held.text, held.base);
+	if (s?.held?.bytes === undefined) return "ok"; // published (or dropped) since the plan
+	const t = await ctx.store.loadHeld(op.docId);
+	if (!t) {
+		// Its texts are not this record's (a rebind carried the mark over): the hash alone.
+		await ctx.commit({ syncedPut: [ctx.record({ ...s, held: { hash: s.held.hash } })] });
+		return "ok";
+	}
+	return op.kind === "canvas" ? publishCanvas(env, op, h, s, t.hash, t.text, t.base) : publishMarkdown(env, op, h, s, t.hash, t.text, t.base);
 }
 
 async function publishMarkdown(env: Env, op: ReconcileOp, h: BodyHandle, s: SyncedEntry, hash: ContentHash, text: string, base: string): Promise<JobOutcome> {
@@ -118,7 +130,7 @@ async function publishCanvas(env: Env, op: ReconcileOp, h: BodyHandle, s: Synced
 	const base0 = parseMergeText(baseText);
 	if (!disk.ok || !base0) {
 		// Valid when kept; unreadable now (a codec change): the hash alone, as past the bound.
-		await ctx.commit({ syncedPut: [ctx.record({ ...released(s), held: { hash } })] });
+		await ctx.commit({ syncedPut: [ctx.record({ ...s, held: { hash } })] });
 		return "ok";
 	}
 	let out: CanvasMergeOutput | null = null;

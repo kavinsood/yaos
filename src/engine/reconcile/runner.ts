@@ -129,7 +129,7 @@ async function keepObservedRenames(env: Env, ns: readonly NsOp[], ops: readonly 
  */
 async function keepHeldContent(env: Env, docId: DocId, path: VaultPath): Promise<void> {
 	const held = env.ctx.localAt(path)?.hash ?? null;
-	if (held !== null) await keepHeld(env, docId, { hash: held });
+	if (held !== null) await keepHeld(env, docId, held, null);
 }
 
 export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunReport> {

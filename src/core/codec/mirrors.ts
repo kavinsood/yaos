@@ -7,7 +7,7 @@
  * src/engine/store/schema.ts (assignable both ways).
  */
 
-import type { ClientFrameId, ContentHash, DeviceId, DocId, DocKind, HeldEdit, Seq, StreamName, VaultEpoch, VaultId, VaultPath } from "../types";
+import type { ClientFrameId, ContentHash, DeviceId, DocId, DocKind, Seq, StreamName, VaultEpoch, VaultId, VaultPath } from "../types";
 import type { HashPort } from "../../ports/crypto";
 import { CodecError, Reader, Writer, bytesEqual } from "./lib0";
 import { bytesToHash, hashToBytes } from "./ids";
@@ -87,8 +87,15 @@ export interface SyncedMirrorEntryData {
 	readonly fileGone?: true;
 	/** SyncedEntry.renamedTo (atMs floored to an integer). */
 	readonly renamedTo?: { readonly to: VaultPath; readonly atMs: number };
-	/** SyncedEntry.held (its text and base, when kept, both or neither). */
-	readonly held?: HeldEdit;
+	/** SyncedEntry.held, with its text and base (heldText store) when kept. */
+	readonly held?: MirrorHeldEdit;
+}
+
+/** A held edit as mirrored: its hash, and its text and base (both or neither). */
+export interface MirrorHeldEdit {
+	readonly hash: ContentHash;
+	readonly text?: string;
+	readonly base?: string;
 }
 
 export interface SyncedMirrorData extends MirrorIdentity {
@@ -260,7 +267,7 @@ export function decodeSyncedMirror(bytes: Uint8Array, hash: Sha): Promise<Mirror
 				const to = r.varstring();
 				renamedTo = { to, atMs: r.varuint() };
 			}
-			let held: HeldEdit | undefined;
+			let held: MirrorHeldEdit | undefined;
 			if (flags & 4) {
 				const hash = bytesToHash(r.copy(32));
 				if (flags & 8) {

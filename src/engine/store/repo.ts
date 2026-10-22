@@ -20,7 +20,7 @@ import { LOCAL_FLAG_UNOPENED } from "../sync/foldRuntime";
 import {
 	DB_SCHEMA_VERSION, INDEX, STORE, STORE_SPECS, dbName, tailRange,
 	type MetaCursor, type MetaIdentity, type MetaDocDeletes, type MetaKeyring, type MetaKeyringRecords, type MetaOutboxOrder, type MetaPathBase, type MetaPathMove, type MetaDaily, type MetaInherit, type OutboxRecord, type OutboxState, type QuarantineRecord,
-	type SnapshotRecord, type StreamRecord, type SyncedRecord, type TailRecord, type YaosSchema,
+	type HeldTextRecord, type SnapshotRecord, type StreamRecord, type SyncedRecord, type TailRecord, type YaosSchema,
 } from "./schema";
 
 export type Mut<T> = { -readonly [K in keyof T]: T[K] };
@@ -814,13 +814,13 @@ export class Repo {
 	 * a crash before it commits runs the whole import again and one after it never does. Returns the synced records
 	 * stored (0 when the store had some).
 	 */
-	tInherit(records: readonly OutboxRecord[], synced: readonly SyncedRecord[]): Promise<number> {
-		return this.serial("tInherit", () => this.importTx(records, synced, true));
+	tInherit(records: readonly OutboxRecord[], synced: readonly SyncedRecord[], held: readonly HeldTextRecord[] = []): Promise<number> {
+		return this.serial("tInherit", () => this.importTx(records, synced, true, held));
 	}
 
-	private async importTx(records: readonly OutboxRecord[], synced: readonly SyncedRecord[] | null, inherit: boolean): Promise<number> {
+	private async importTx(records: readonly OutboxRecord[], synced: readonly SyncedRecord[] | null, inherit: boolean, held: readonly HeldTextRecord[] = []): Promise<number> {
 		const touched = new Map<StreamName, StreamRecord>();
-		const stores = synced ? [STORE.outbox, STORE.meta, STORE.streams, STORE.synced] as const : [STORE.outbox, STORE.meta, STORE.streams] as const;
+		const stores = synced ? [STORE.outbox, STORE.meta, STORE.streams, STORE.synced, STORE.heldText] as const : [STORE.outbox, STORE.meta, STORE.streams] as const;
 		const out = await this.db.tx([...stores], "readwrite", async (tx) => {
 			let max = 0;
 			for (const r of records) {
@@ -839,6 +839,7 @@ export class Repo {
 			let syncedN = 0;
 			if (synced && synced.length > 0 && (await tx.getAll(STORE.synced)).length === 0) {
 				for (const r of synced) tx.put(STORE.synced, r);
+				for (const t of held) tx.put(STORE.heldText, t);
 				syncedN = synced.length;
 			}
 			const ident = await tx.get(STORE.meta, "identity") as MetaIdentity | undefined;

@@ -1290,8 +1290,8 @@ answer is `"stale"`, `"hold"` or null (always null under suite 0):
   When the re-key QR or RK arrives (§14.2 step 3), the held and unopened rows are re-gated: stale ones are
   dismissed and rows under r open.
 - **Edits the shut gate refuses** (key missing) stay out of the log: the merge job keeps the disk content on the
-  synced record (`SyncedEntry.held`: hash, and text + base within `HELD_TEXT_MAX_CHARS`), mirrored with it (DESIGN
-  §e.4). Once the gate opens a doc whose file is gone by then publishes the held text first (DESIGN §f.6 "Held
+  synced record (`SyncedEntry.held`: its hash, and its text + base in the `heldText` store within
+  `HELD_TEXT_MAX_BYTES`), mirrored with it (DESIGN §e.4). Once the gate opens a doc whose file is gone by then publishes the held text first (DESIGN §f.6 "Held
   edits"), so a rename and an edit nobody saw, an IDB loss in between included, cannot turn the user's edit (a deleted
   canvas record) into one a peer's edit undoes.
 - A stale ns or cfg row is stored with `LOCAL_FLAG_STALE_EPOCH` and empty content and folds as `"stale-epoch"`;

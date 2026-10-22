@@ -97,19 +97,22 @@ test("recovery: a record's decided delete, kept rename and held edit (hash, text
 	// file this device could not publish came back as a plain sync point; the moved file read as a new doc and the
 	// old one was put back at its path.
 	const marked: SyncedRecord = {
-		...rec, fileGone: true, renamedTo: { to: "b/renamed.md" as VaultPath, atMs: 1_759_600_000_123 }, held: { hash: "cd".repeat(32) as ContentHash, text: "one\nthree\n", base: "one\ntwo\nthree\n" },
+		...rec, fileGone: true, renamedTo: { to: "b/renamed.md" as VaultPath, atMs: 1_759_600_000_123 }, held: { hash: "cd".repeat(32) as ContentHash, bytes: 24 },
 	};
+	const texts = { docId: rec.docId, hash: "cd".repeat(32) as ContentHash, text: "one\nthree\n", base: "one\ntwo\nthree\n" };
 	const identity = { vaultId: "v", vaultEpoch: "e", deviceId: "dev" } as MirrorIdentity;
 	const hash = createWebHash();
 	const side = new MemSideFiles();
-	const w = new SyncedMirrorWriter({ side, hash, clock: createWebClock(), identity: () => identity, entries: () => [marked], nsCoversSeq: () => 2 as Seq, debounceMs: 60_000 });
+	const w = new SyncedMirrorWriter({ side, hash, clock: createWebClock(), identity: () => identity, entries: () => [marked], heldTexts: async () => new Map([[rec.docId, texts]]), nsCoversSeq: () => 2 as Seq, debounceMs: 60_000 });
 	w.markDirty();
 	await w.flush();
 	const storage = new MemStoragePort();
 	const db = await storage.open<DiskSchema>("fresh", DB_SCHEMA_VERSION, STORE_SPECS);
 	assert.equal(await importSyncedMirror({ db, side, hash, identity, pathKey: (p) => p as PathKey, nowMs: 1 }), 1);
 	const [row] = await db.tx([STORE.synced], "readonly", (tx) => tx.getAll(STORE.synced));
+	const held = await db.tx([STORE.heldText], "readonly", (tx) => tx.getAll(STORE.heldText));
 	db.close();
+	assert.deepEqual(held, [texts], "the held texts are back in the heldText store");
 	assert.deepEqual({ gone: row?.fileGone, to: row?.renamedTo, held: row?.held }, { gone: true, to: marked.renamedTo, held: marked.held });
 	assert.equal(row?.contentHash, rec.contentHash);
 	assert.equal(row?.bodyVersion, null, "still no CRDT sync point (§i.5 step 3)");
