@@ -392,6 +392,26 @@ test("a file another doc's observed rename brought onto a fileGone path is that 
 	assert.ok(!next.ops.some((o) => "docId" in o && o.docId === "d1" && o.op !== "wait"), JSON.stringify(next.ops));
 });
 
+test("a doc whose file the user renamed away does not take a new file at the path a peer moved it to", () => {
+	// Soak 1307815726 #30: offline, C renamed boards/c5 -> canvas/c5 (kept on S: fileGone, renamedTo) while a peer moved
+	// the doc to canvas/c0, then C created a new canvas/c0. The file at the remote path was read as the doc's own (the
+	// doc moved there): the new canvas was merged into the doc over a peer's records, and canvas/c5 became a new doc.
+	const gone = { ...S("d1", "b.canvas"), fileGone: true as const, renamedTo: { to: "c.canvas", atMs: 7 } };
+	const sc = { remote: [R("d1", "a.canvas")], synced: [gone], local: [L("a.canvas", h("c9")), L("c.canvas", h("c0"))] };
+	for (const nsReady of [false, true]) {
+		const p = run(sc, { nsReady });
+		assert.ok(!p.ops.some((o) => o.op === "reconcileContent" && o.path === "a.canvas"), JSON.stringify(p.ops));
+		assert.ok(!p.ops.some((o) => o.op === "syncedPut" && o.entry.docId === "d1" && o.entry.path === "a.canvas"), JSON.stringify(p.ops));
+	}
+	// ns ready: the kept rename moves the doc to the renamed file; the new file at the doc's remote path is not the doc's
+	const ready = run(sc);
+	assert.deepEqual(find(ready, "nsRename"), { op: "nsRename", docId: "d1", path: "c.canvas" });
+	// no rename known (a decided delete only): the file at the remote path is the doc's, as an offline rename onto it
+	// the planner could not see (sim heavy seed 22)
+	const plain = run({ ...sc, synced: [{ ...S("d1", "b.canvas"), fileGone: true as const }], local: [L("a.canvas", h("c0"))] });
+	assert.ok(!opsOf(plain).includes("nsCreate"), JSON.stringify(plain.ops));
+});
+
 test("a file renamed onto a fileGone path with the gone doc's bytes is a new file, and the fresh-id budget counts it", () => {
 	// The file is new (goneHere -> planNewLocal takes a fresh docId) although it matches the synced record at its path
 	// by hash. A budget that counted only files differing from their record by hash handed this plan no id: the file

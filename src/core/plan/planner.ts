@@ -324,14 +324,24 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		const o = arrivedFrom.get(key);
 		return o !== undefined && o !== s.pathKey;
 	};
+	/** The user's rename of S's file (observed, or kept on S) took it somewhere other than `key`. */
+	const renamedElsewhere = (s: SyncedEntry, key: PathKey): boolean => {
+		const away = renamedAway(input.renames, s.pathKey, pk);
+		return away !== null && pk(away.to) !== key;
+	};
 	const localFor = (s: SyncedEntry, r: RemoteEntry | undefined): { l: LocalEntry | undefined; atRemote: boolean } => {
 		// A decided delete (fileGone) covers the file at S's path only. A file at the doc's remote path is its
 		// own: the doc moved there (an own rename inference could not catch offline, sim heavy seed 22). Unless
 		// the user renamed it there from elsewhere: then it is that file, and the doc's own file is wherever its
 		// rename took it (sim DEV3 F seed 452: the doc's file renamed n6 -> r4 offline, another note n4 -> r2,
 		// the doc moved to r2 by a peer; r2's note merged into the doc as a conflict and r4 became a duplicate).
+		// Nor when the user's rename of S's file is known (observed, or kept on S as renamedTo): the file is where the
+		// rename took it, and one at the remote path is another, a note created there (soak 1307815726 #30: offline,
+		// C renamed the canvas away while a peer moved the doc to c0, then created a new c0; the new canvas was merged
+		// into the doc over a peer's edits, and the renamed file became a doc of its own).
 		const l = s.fileGone ? undefined : input.local.get(s.pathKey);
-		const movable = r !== undefined && r.state === "live" && r.pathKey !== s.pathKey && !syncedByKey.has(r.pathKey) && !arrivedElsewhere(r.pathKey, s);
+		const movable = r !== undefined && r.state === "live" && r.pathKey !== s.pathKey && !syncedByKey.has(r.pathKey) && !arrivedElsewhere(r.pathKey, s)
+			&& !renamedElsewhere(s, r.pathKey);
 		const atR = movable ? input.local.get(r.pathKey) : undefined;
 		if (l && atR && ownBytesAt(s, r!, l, atR)) return { l: atR, atRemote: true };
 		if (l) return { l, atRemote: false };
