@@ -185,7 +185,7 @@ export function syncedFileKey(s: SyncedEntry, renames: readonly ObservedRename[]
 }
 
 /** The end of the observed rename chain starting at `key` (its last event), if any. */
-function renamedAway(renames: readonly ObservedRename[], key: PathKey, pk: PathKeyFn): { to: VaultPath; atMs: number } | null {
+export function renamedAway(renames: readonly ObservedRename[], key: PathKey, pk: PathKeyFn): { to: VaultPath; atMs: number } | null {
 	let at = key;
 	let last: ObservedRename | null = null;
 	for (const e of [...renames].sort((x, y) => x.atMs - y.atMs)) {

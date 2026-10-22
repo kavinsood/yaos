@@ -1,0 +1,113 @@
+{
+	"seed": 112,
+	"config": {
+		"devices": 3,
+		"faults": {
+			"engineCrash": 3,
+			"appCrash": 2,
+			"commitCrash": 2,
+			"idbWipe": 3,
+			"idbLost": 2,
+			"offline": 4,
+			"ioFail": 2,
+			"background": 3,
+			"socketDrop": 4,
+			"relayRestart": 1,
+			"relayDrain": 1,
+			"httpFail": 1,
+			"dailyLimit": 0.5,
+			"epochReset": 0.3,
+			"clockSkew": 1,
+			"keyStoreLoss": 1,
+			"keyRoll": 2,
+			"revoke": 2,
+			"epochRestore": 0.5,
+			"hostileReplay": 2,
+			"hostileDowngrade": 1,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"crypto": "suite1",
+		"faultRate": 0.3,
+		"seed": 112
+	},
+	"minimizedPlan": [
+		{
+			"i": 3,
+			"gapMs": 593,
+			"fault": {
+				"t": "revoke",
+				"dev": 0,
+				"by": 2,
+				"rekeyMs": 48746,
+				"rkSeed": 431046478
+			}
+		},
+		{
+			"i": 125,
+			"gapMs": 198,
+			"canvas": {
+				"t": "cDeleteNode",
+				"dev": 1,
+				"file": 0.2904924100730568,
+				"node": 0.15938139124773443
+			}
+		},
+		{
+			"i": 160,
+			"gapMs": 407,
+			"canvas": {
+				"t": "cRename",
+				"dev": 1,
+				"file": 0.24438007804565132,
+				"name": 5,
+				"folder": false
+			}
+		},
+		{
+			"i": 109,
+			"gapMs": 936,
+			"fault": {
+				"t": "relayDrain"
+			}
+		},
+		{
+			"i": 110,
+			"gapMs": 591,
+			"fault": {
+				"t": "engineCrash",
+				"dev": 1
+			}
+		},
+		{
+			"i": 111,
+			"gapMs": 1170,
+			"user": {
+				"t": "close",
+				"dev": 2,
+				"view": 0.13879114529117942
+			}
+		},
+		{
+			"i": 172,
+			"gapMs": 42,
+			"canvas": {
+				"t": "cAddNode",
+				"dev": 0,
+				"file": 0.5313703552819788,
+				"kind": "text",
+				"seed": 1010271433
+			}
+		}
+	]
+}

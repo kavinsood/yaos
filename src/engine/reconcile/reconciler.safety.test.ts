@@ -292,3 +292,27 @@ test("write gate shut (key-missing): a bound replica's unframed typing is never 
 	assert.equal(w.vault.text("a.md"), "one\n", "the doc's text, which every device has");
 	assert.equal(w.log.text(id), "one\n");
 });
+
+test("write gate shut (key-missing): an observed rename the gate refused survives an engine restart, kept on the synced record", async () => {
+	// Sim suite-1 wipe/revoke/roll seed 112: key-missing after a revoke, the user deleted a canvas record and renamed the
+	// file; the engine crashed. The restart had no rename to pair the edited file with: a new doc, and the doc came
+	// back at the old path with the record.
+	const w = new World();
+	await w.boot();
+	const id = w.log.remoteCreate(P("a.md"), "one\ntwo\nthree\nfour\n");
+	await w.sync();
+	w.log.writeGate = "revoked-epoch";
+	w.vault.userWrite("a.md", "one\nthree\nfour\n");
+	w.vault.userRename("a.md", "b.md");
+	await assert.rejects(w.sync(3), KeyMissingError);
+	assert.deepEqual({ gone: w.synced(id)?.fileGone, to: w.synced(id)?.renamedTo?.to }, { gone: true, to: "b.md" });
+	await w.crashAndReboot();
+	w.log.writeGate = null;
+	await w.sync();
+	assert.equal(w.vault.text("a.md"), null, "the doc is not back at the old path");
+	assert.equal(w.vault.text("b.md"), "one\nthree\nfour\n");
+	assert.equal(w.log.view().remote.get(id)?.path, "b.md");
+	assert.equal(w.log.text(id), "one\nthree\nfour\n", "the delete merged against the synced base");
+	assert.deepEqual(w.conflictCopies(), []);
+	assert.equal([...w.log.view().remote.values()].filter((r) => r.state === "live").length, 1, "no new doc");
+});

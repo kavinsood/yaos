@@ -28,7 +28,8 @@
 
 import type { DocId, NsOp, PlannerOp, VaultPath } from "../../core/types";
 import { ancestorsOf } from "../../core/plan/pathRules";
-import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
+import { EMPTY_CONTENT_HASH, renamedAway } from "../../core/plan/planner";
+import { KeyMissingError } from "../keyring/writeGate";
 import type { SyncedRecord } from "../store/schema";
 import { conflictCopy, fetchBlob, pushBlob } from "./blobJobs";
 import { diskMaterializeCanvas } from "./canvasJob";
@@ -86,6 +87,27 @@ async function runOne(env: Env, op: PlannerOp): Promise<JobOutcome> {
 		case "syncedDrop": return syncedDrop(env, op);
 		default: return "ok";
 	}
+}
+
+/**
+ * The write gate refused the plan's ns ops: an observed rename one of them publishes is kept on the doc's synced
+ * record (fileGone, renamedTo), as liveMissing keeps one observed before ns was ready. Observed renames live in
+ * memory only: an engine restart while the gate stays shut took this one, and with the file edited since its last
+ * sync no hash pairs it again, so the renamed file became a new doc and the doc came back at its old path with what
+ * the user had deleted in the file (sim suite-1 wipe/revoke/roll seed 112, minimized: key-missing after a revoke).
+ */
+async function keepObservedRenames(env: Env, ns: readonly NsOp[]): Promise<void> {
+	const { ctx } = env;
+	const keep: SyncedRecord[] = [];
+	for (const op of ns) {
+		if (op.t !== "rename") continue;
+		const s = ctx.store.synced.get(op.docId);
+		if (!s || s.fileGone) continue;
+		const away = renamedAway(ctx.renames, s.pathKey, ctx.pk);
+		if (!away || ctx.pk(away.to) !== ctx.pk(op.path)) continue;
+		keep.push({ ...s, fileGone: true, renamedTo: away });
+	}
+	if (keep.length > 0) await ctx.commit({ syncedPut: keep });
 }
 
 export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunReport> {
@@ -159,7 +181,14 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 	// The gate first: a born-empty record committed for a create submitNs then refuses (key-missing) is S for a doc no
 	// ns op names. The pass after reads it as a pruned doc's record at the file's path, which hides the file from
 	// rename inference: a frozen doc's renamed file became a delete + a create (sim suite-1 wipe/revoke/roll seed 40).
-	if (ns.length > 0) ctx.log.assertWritable?.();
+	if (ns.length > 0) {
+		try {
+			ctx.log.assertWritable?.();
+		} catch (e) {
+			if (e instanceof KeyMissingError) await keepObservedRenames(env, ns);
+			throw e;
+		}
+	}
 	if (born.length > 0) await ctx.commit({ syncedPut: born });
 	const live = new Set<DocId>();
 	if (ctx.liveCreates) for (const o of ns) if (o.t === "create" && o.kind !== "blob" && o.contentHash !== EMPTY_CONTENT_HASH) live.add(o.docId);
