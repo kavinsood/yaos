@@ -47,6 +47,7 @@ export { MAX_CAS_ATTEMPTS } from "./contentSteps";
 export function applyMinimalDiff(h: BodyHandle, ytext: Y.Text, from: string, to: string): number {
 	const edits = minimalDiff(from, to);
 	if (edits.length === 0) return 0;
+	h.assertWritable();
 	h.doc.transact(() => applyEditsTo(ytext, from, edits), h.mergeOrigin);
 	return edits.length;
 }

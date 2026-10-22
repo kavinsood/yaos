@@ -877,16 +877,25 @@ export class Repo {
 	 * everything". The planner's absent / merged rows end with syncedDrop / rebind, and the drop follows. The
 	 * vault cursor is untouched: every seq of the stream stays accounted, and a later row recreates the record
 	 * (tLive / tFeedPage) as for any new stream.
+	 *
+	 * `held`: the held frames of a merged alias (nsRuntime.reconcileHeld keeps them: they may be the only copy of own
+	 * edits past the create, I1). They go in the same transaction, once the disk side no longer tracks the doc (the
+	 * planner wrote the loser's text to its file before the rebind); any other own frame of the stream refuses.
 	 */
-	tDropStream(stream: StreamName, expect: Pick<StreamRecord, "remoteHeadSeq" | "remoteCheckpointCoversSeq">): Promise<boolean> {
+	tDropStream(stream: StreamName, expect: Pick<StreamRecord, "remoteHeadSeq" | "remoteCheckpointCoversSeq">, held: readonly ClientFrameId[] = []): Promise<boolean> {
 		return this.serial("tDropStream", async () => {
 			let dropDuty = false;
 			const docId = streamDocId(stream);
 			const ok = await this.db.tx([STORE.streams, STORE.snapshots, STORE.tail, STORE.quarantine, STORE.outbox, STORE.meta, STORE.synced, STORE.intents], "readwrite", async (tx) => {
 				const r = await tx.get(STORE.streams, stream);
 				if (r && (r.remoteHeadSeq !== expect.remoteHeadSeq || r.remoteCheckpointCoversSeq !== expect.remoteCheckpointCoversSeq)) return false;
-				if (await tx.countByIndex(STORE.outbox, INDEX.outboxByStream, streamOrderRange(stream)) > 0) return false;
 				if (docId && (await tx.get(STORE.synced, docId) || (await tx.getAll(STORE.intents)).some((i) => i.docId === docId))) return false;
+				if (await tx.countByIndex(STORE.outbox, INDEX.outboxByStream, streamOrderRange(stream)) > held.length) return false;
+				for (const id of held) {
+					const o = await tx.get(STORE.outbox, id);
+					if (!o || o.stream !== stream || o.state !== "held") return false;
+				}
+				for (const id of held) tx.delete(STORE.outbox, id);
 				tx.delete(STORE.streams, stream);
 				tx.delete(STORE.snapshots, stream);
 				tx.deleteRange(STORE.tail, tailRange(stream));

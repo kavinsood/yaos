@@ -670,6 +670,70 @@ test("epoch reset after an offline edit on a stale stream whose editor died unsa
 	}
 });
 
+test("epoch reset after an offline edit and rename of the open note, the app dead before the save: the edit survives the migration", async () => {
+	// Sim relay seed 134. B typed into x.md offline and renamed it; the app died before the editor's save, so the edit
+	// was in B's storage only, and the observed rename in its memory. The restart's first pass (ns not ready: no
+	// rename inference) marked x.md's file gone. The migration merged the docs with own unsent edits into their
+	// files at their synced paths only (§c.12 step 5), found none for x.md, and dropped the outbox: gone.
+	const { clock, net, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "one\ntwo\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("x.md"), "one\ntwo\n");
+	b.setOnline(false);
+	const v = b.workspace.openFile("x.md");
+	assert.ok(v);
+	await clock.advance(1_000);
+	assert.ok(v.isBound(), "bound offline");
+	v.edit(4, 0, "typed\n");
+	await clock.advance(500); // committed to storage; the editor's 2 s save has not run
+	assert.ok(b.vault.userRename("x.md", "y.md"));
+	assert.equal(b.vault.textOf("y.md"), "one\ntwo\n");
+	b.crashApp(); // before a pass recorded the rename
+	net.relay.resetEpoch("sim-epoch-2" as VaultEpoch);
+	await clock.advance(1_000);
+	void b.restartApp();
+	await clock.advance(5_000);
+	b.setOnline(true);
+	await clock.advance(60_000);
+	assert.equal(b.vrt?.vaultEpoch, "sim-epoch-2", "B migrated");
+	for (const d of [a, b]) assert.equal(d.vault.textOf("y.md"), "one\ntyped\ntwo\n", `${d.name} keeps B's edit at the renamed path`);
+});
+
+test("an identical duplicate create merged away while its note was typed into and the app died before the save: the edit survives", async () => {
+	// Sim suite-1 seed 1 (after an epoch reset every device re-creates its files: identical creates merge, §c.5). B's
+	// create of x.md held its body frames (onboarding) and B typed into the open note; the app died before the
+	// editor's save. The create then folded merged into A's, and the held frames of a merged doc were deleted: the
+	// rebind moved B's record to A's doc at its create, the disk still held the create text, and the edit was gone
+	// with its only copy (I1).
+	const { clock, net, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "one\ntwo\n");
+	b.vault.userWrite("x.md", "one\ntwo\n");
+	net.relay.pauseCommits(); // both creates in flight: A's commits first, B's folds merged into it
+	await boot(clock, [a]);
+	await clock.advance(2_000);
+	await boot(clock, [b]);
+	await clock.advance(5_000);
+	const v = b.workspace.openFile("x.md");
+	assert.ok(v);
+	await clock.advance(1_000);
+	assert.ok(v.isBound(), "bound");
+	v.edit(4, 0, "typed\n");
+	await clock.advance(300); // committed to storage (held behind the create); the editor's 2 s save has not run
+	assert.equal(b.vault.textOf("x.md"), "one\ntwo\n");
+	assert.ok(b.vrt!.log.c.outbox.all().some((r) => r.state === "held"), "the edit is held behind B's create");
+	net.relay.resumeCommits();
+	await clock.advance(1_000); // both creates folded, B's merged
+	b.crashApp();
+	await clock.advance(1_000);
+	void b.restartApp();
+	await clock.advance(60_000);
+	for (const d of [a, b]) assert.deepEqual([...d.vault.snapshot().entries()], [["x.md", "one\ntyped\ntwo\n"]], `${d.name}`);
+	for (const d of [a, b]) assert.equal(d.vrt?.log.c.outbox.size, 0, `${d.name}: the merged doc's frames went with its stream`);
+});
+
 test("offline delete, then a new note at the same path: a new doc, not a save over the old one", async () => {
 	// Sim heavy seed 92. A's delete waited (own frames unacked, offline), and the new file at the path merged into
 	// the old doc as a save: it followed the peer's rename of the old note, and the peer's edits to the old text
@@ -803,4 +867,36 @@ test("a transient write failure of a downloaded attachment retries at once (no a
 	await clock.advance(10_000);
 	await same(a, b, "img/p.png", want);
 	assert.equal(net.blobs.calls.get, 2, "the failed write's download, and one more");
+});
+
+test("a live row lost on an open socket (nothing follows it): the first idle probe is a VAULT_PING and the gap feed reads the row within ~idleMs + gapMs", async () => {
+	// Soak seed 935329097. Keepalive mode checks the head every 10th idle probe (~10 min); the first probe after
+	// stream data is a VAULT_PING (wsRelay IdleProbes). Production maintenance and gap timers.
+	const { clock, net, devs } = world({ tuning: { maintenanceMs: 1_000, maintenanceIdleMaxMs: 30_000, gapMs: 5_000 } });
+	const [a, b] = pair(devs);
+	a.vault.userWrite("notes/x.md", "one\n");
+	await boot(clock, devs);
+	await clock.advance(20_000);
+	assert.equal(b.vault.textOf("notes/x.md"), "one\n");
+	await clock.advance(5 * 60_000); // idle: maintenance backed off, keepalives only
+	const cursor = () => b.vrt?.log.c.repo.cursor.vaultSeq ?? -1;
+	const commit = async (what: () => void, label: string) => {
+		const head0 = net.relay.head();
+		what();
+		assert.ok(await clock.runUntil(() => net.relay.head() > head0 && (a.vrt?.log.isIdle() ?? false), 60_000), label);
+	};
+	// ns rows only: COMMITTED to B, no PROVISIONAL that would settle by other means.
+	await commit(() => a.vault.userRename("notes/x.md", "notes/y.md"), "A's first rename committed");
+	assert.ok(await clock.runUntil(() => cursor() >= net.relay.head(), 10_000), "B read it live");
+	net.relay.loseSends(b.deviceId, 1_000); // every later COMMITTED / COMMIT_NOTICE to B
+	await commit(() => a.vault.userRename("notes/y.md", "notes/z.md"), "A's second rename committed");
+	const t0 = clock.monotonic();
+	await clock.advance(5_000);
+	assert.ok(cursor() < net.relay.head(), `B's cursor ${cursor()} behind head ${net.relay.head()}: nothing showed the lost row`);
+	assert.equal(net.relay.headCheckOwed(b.deviceId), true, "a row arrived since the last pong: the next idle probe is a VAULT_PING");
+	await clock.runUntil(() => cursor() >= net.relay.head(), 15 * 60_000);
+	const took = clock.monotonic() - t0;
+	assert.equal(cursor(), net.relay.head(), "B caught up");
+	assert.ok(await clock.runUntil(() => b.vault.textOf("notes/z.md") === "one\n", 10_000), "B renamed the file");
+	assert.ok(took <= 60_000 + 5_000 + 5_000, `caught up ${took} ms after A's last row (idle probe 60 s after B's last message, gap 5 s)`);
 });

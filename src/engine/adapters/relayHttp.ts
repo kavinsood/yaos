@@ -84,12 +84,22 @@ export interface RelayHttp {
 	fetchGrant(vaultId: string): Promise<GrantFetchOutcome>;
 	/** POST /vault/:id/auth/ticket {purpose:"streams"}. Never throws; "unavailable" once `signal` aborts (connect's deadline). */
 	ticket(vaultId: string, signal?: AbortSignal): Promise<TicketResult>;
-	feed(vaultId: string, afterSeq: number, limit: number | null, signal?: AbortSignal): Promise<FeedPage>;
-	read(vaultId: string, stream: string, afterSeq: number, preferCheckpoint: boolean, maxBytes: number | null, signal?: AbortSignal): Promise<ReadPage>;
+	/**
+	 * feed / read / readBatch: `vaultEpoch` is the session's (VAULT_READY). A reply of another epoch (the vault was reset
+	 * or restored while the request was in flight) rejects RelayHttpError code "epoch_mismatch": its seqs and rows are
+	 * not this epoch's and must never reach this epoch's store (relay-wire §1 "seqs are only comparable within one epoch").
+	 */
+	feed(vaultId: string, vaultEpoch: string, afterSeq: number, limit: number | null, signal?: AbortSignal): Promise<FeedPage>;
+	read(vaultId: string, vaultEpoch: string, stream: string, afterSeq: number, preferCheckpoint: boolean, maxBytes: number | null, signal?: AbortSignal): Promise<ReadPage>;
 	/** Batched read (relay-wire §7.1): pages for a non-empty prefix of `reqs` (the URL is capped at READ_BATCH_MAX_QUERY_CHARS). */
-	readBatch(vaultId: string, reqs: readonly ReadRequest[], maxBytes: number | null, signal?: AbortSignal): Promise<ReadPage[]>;
+	readBatch(vaultId: string, vaultEpoch: string, reqs: readonly ReadRequest[], maxBytes: number | null, signal?: AbortSignal): Promise<ReadPage[]>;
+	/**
+	 * `vaultEpoch`: the epoch whose rows the bytes merge (the session's VAULT_READY): the relay refuses the put once its
+	 * epoch is another (409 epoch_mismatch -> refused "epoch-mismatch", relay-wire §8), so a put in flight across a
+	 * reset or restore never lands in the new epoch.
+	 */
 	putCheckpoint(
-		vaultId: string, stream: string, coversSeq: number, expectedPrevCoversSeq: number, bytes: Uint8Array, signal?: AbortSignal,
+		vaultId: string, vaultEpoch: string, stream: string, coversSeq: number, expectedPrevCoversSeq: number, bytes: Uint8Array, signal?: AbortSignal,
 	): Promise<PutCheckpointResult>;
 }
 
@@ -297,6 +307,11 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 		return new RelayHttpError(route, status, "malformed_response", null);
 	}
 
+	/** A 200 reply of another vault epoch than the caller's session. */
+	function epochMismatch(route: string): RelayHttpError {
+		return new RelayHttpError(route, 200, "epoch_mismatch", null);
+	}
+
 	return {
 		async registerDevice(vaultId, grantSecret, body) {
 			const reply = await bounded("auth/device", RELAY_REPLY_BYTES, undefined, (s) => call(vaultPath(vaultId, "/auth/device"), {
@@ -355,7 +370,7 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 			return { ok: false, reason, retryAfterMs };
 		},
 
-		async feed(vaultId, afterSeq, limit, signal) {
+		async feed(vaultId, vaultEpoch, afterSeq, limit, signal) {
 			const q = `after=${afterSeq}${limit !== null ? `&limit=${limit}` : ""}`;
 			const bound = RELAY_REPLY_BYTES + Math.min(limit ?? RELAY_FEED_MAX_ENTRIES, RELAY_FEED_MAX_ENTRIES) * RELAY_FEED_ENTRY_BYTES;
 			const reply = await watch("feed", bound, signal, (s, p) => call(vaultPath(vaultId, `/streams/feed?${q}`), { method: "GET" }, s, p));
@@ -369,6 +384,7 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 			if (head === null || !Array.isArray(changes) || (nextAfterRaw !== null && nextAfterRaw !== undefined && nextAfter === null)) {
 				throw malformed("feed", reply.status);
 			}
+			if (body["vaultEpoch"] !== vaultEpoch) throw epochMismatch("feed");
 			const entries: { stream: StreamName; lastSeq: number }[] = [];
 			for (const change of changes) {
 				if (!isRecord(change)) throw malformed("feed", reply.status);
@@ -380,7 +396,7 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 			return { entries, throughSeq: nextAfter ?? head, headSeq: head, more: nextAfter !== null };
 		},
 
-		async read(vaultId, stream, afterSeq, preferCheckpoint, maxBytes, signal) {
+		async read(vaultId, vaultEpoch, stream, afterSeq, preferCheckpoint, maxBytes, signal) {
 			const budget = readBudget(maxBytes);
 			const q = `stream=${encodeURIComponent(stream)}&after=${afterSeq}&maxBytes=${budget}`
 				+ (preferCheckpoint ? "&checkpoint=1" : "");
@@ -388,10 +404,11 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 			if (reply === null || reply.status !== 200) throw fail("read", reply);
 			const wire = reply.bytes === null ? null : decodeReadReply(reply.bytes);
 			if (wire === null || wire.pages.length !== 1 || wire.pages[0]!.stream !== stream) throw malformed("read", reply.status);
+			if (wire.vaultEpoch !== vaultEpoch) throw epochMismatch("read");
 			return pageFromWire(wire.pages[0]!, afterSeq);
 		},
 
-		async readBatch(vaultId, reqs, maxBytes, signal) {
+		async readBatch(vaultId, vaultEpoch, reqs, maxBytes, signal) {
 			const budget = readBudget(maxBytes);
 			let q = `maxBytes=${budget}`;
 			let sent = 0;
@@ -407,14 +424,16 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 			if (reply === null || reply.status !== 200) throw fail("read", reply);
 			const wire = reply.bytes === null ? null : decodeReadReply(reply.bytes);
 			if (wire === null || wire.pages.length === 0 || wire.pages.length > sent) throw malformed("read", reply.status);
+			if (wire.vaultEpoch !== vaultEpoch) throw epochMismatch("read");
 			return wire.pages.map((page, i) => {
 				if (page.stream !== reqs[i]!.stream) throw malformed("read", reply.status);
 				return pageFromWire(page, reqs[i]!.afterSeq);
 			});
 		},
 
-		async putCheckpoint(vaultId, stream, coversSeq, expectedPrevCoversSeq, bytes, signal) {
-			const q = `stream=${encodeURIComponent(stream)}&coversSeq=${coversSeq}&expectedCoversSeq=${expectedPrevCoversSeq}`;
+		async putCheckpoint(vaultId, vaultEpoch, stream, coversSeq, expectedPrevCoversSeq, bytes, signal) {
+			const q = `stream=${encodeURIComponent(stream)}&coversSeq=${coversSeq}&expectedCoversSeq=${expectedPrevCoversSeq}`
+				+ `&vaultEpoch=${encodeURIComponent(vaultEpoch)}`;
 			const reply = await bounded("checkpoint", RELAY_REPLY_BYTES + bytes.byteLength, signal, (s) => call(vaultPath(vaultId, `/streams/checkpoint?${q}`), {
 				method: "PUT",
 				body: bytes.slice(),
@@ -429,6 +448,7 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 				if (currentCoversSeq === null) throw malformed("checkpoint", status);
 				return { t: "conflict", currentCoversSeq };
 			}
+			if (status === 409 && code === "epoch_mismatch") return { t: "refused", reason: "epoch-mismatch", retryAfterMs: null };
 			if (status === 409 && code === "checkpoint_ahead_of_stream") return { t: "refused", reason: "ahead-of-stream", retryAfterMs: null };
 			if (status === 400 && code === "checkpoint_not_advancing") return { t: "refused", reason: "not-advancing", retryAfterMs: null };
 			if (status === 404) return { t: "refused", reason: "stream-not-found", retryAfterMs: null };

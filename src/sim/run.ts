@@ -488,6 +488,17 @@ function adoptables(d: SimDevice): number {
 	return n;
 }
 
+/**
+ * A device behind the relay head whose open socket will still send an idle VAULT_PING: a live message the relay lost
+ * to it (lostSend) shows only through that pong's head, ~idleMs after its last received message when stream data
+ * arrived since the last pong (wsRelay IdleProbes), else at the next KEEPALIVE_PING_EVERY-th probe. The heal waits for
+ * it (within its horizon); a device behind with no head check to come is stuck (invariant 5).
+ */
+function headCheckPending(d: SimDevice, net: SimNet): boolean {
+	const c = d.vrt?.log.c;
+	return c !== undefined && c.repo.cursor.vaultSeq < net.relay.head() && net.relay.headCheckComing(d.deviceId);
+}
+
 export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Promise<SimReport> {
 	const c = full(cfg);
 	const plan = explicitPlan ?? generatePlan(cfg);
@@ -633,7 +644,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			brakeUser.poll();
 			sampleBounds();
 			// Blob store calls outside the blob queue (a snapshot upload's) count too: a stalled one ends by its idle window.
-			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && adoptables(d) === 0 && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && !(d.vrt?.creators.busy() ?? false) && (d.vrt?.log.c.retire.pending ?? 0) === 0 && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty())) && !brakeUser.pending() && !(faults.hostile?.busy() ?? false);
+			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && adoptables(d) === 0 && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && !(d.vrt?.creators.busy() ?? false) && (d.vrt?.log.c.retire.pending ?? 0) === 0 && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty())) && !brakeUser.pending() && !(faults.hostile?.busy() ?? false) && !devs.some((d) => headCheckPending(d, net));
 			const fp = print();
 			stable = idle && fp === last ? stable + 1 : 0;
 			last = fp;
@@ -666,6 +677,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 				if (d.vault.pendingEvents() > 0) why.push(`${d.name} vault events`);
 				if (d.workspace.views_().some((v) => v.isDirty())) why.push(`${d.name} dirty view`);
 				if (d.vrt?.brake) why.push(`${d.name} brake ${d.vrt.brake.reason} unanswered`);
+				if (headCheckPending(d, net)) why.push(`${d.name} behind the relay, its idle head check still to come`);
 			});
 			if (print() !== last) why.push(`activity ${activity(devs, net)}`);
 			violations.push({ inv: "clean", detail: `no quiescence within ${c.healHorizonMs}ms: ${why.join(", ") || "flapping"}` });

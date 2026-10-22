@@ -91,6 +91,7 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 		}
 		// Synchronous section: CAS, apply, capture the version.
 		if (crdtToken(h) !== token) continue;
+		h.assertWritable();
 		applyCanvas(h.doc, h.mergeOrigin, m.target);
 		v0 = h.version();
 		out = m;

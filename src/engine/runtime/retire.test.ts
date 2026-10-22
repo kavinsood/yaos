@@ -16,7 +16,8 @@ import { gate } from "../ingest/gate";
 import { sealCheckpoint } from "../ingest/envelope";
 import type { LogEngine } from "./engine";
 import type { EngineTuning } from "./options";
-import { converged, createDoc, deleteDoc, editDoc, startTestEngine, until } from "./testHarness";
+import { converged, createDoc, deleteDoc, editDoc, sleep, startTestEngine, until } from "./testHarness";
+import { STORE } from "../store/schema";
 
 const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, hardRows: 1e9, hardBytes: 1e15, settleMs: 1e9, fallbackMs: 300, nsRows: 1e9, nsBytes: 1e12 };
 /** Prune when a second tombstone appears, down to one (the oldest goes). */
@@ -231,6 +232,42 @@ test("checkpoint duty runs for a deleted (not pruned) doc's stream: the settle r
 		await until(() => retiredOnRelay(relay, stream), 5_000, "checkpointed at lastSeq");
 		assert.equal(await encodingOf(a, relay, stream), CheckpointEncoding.yjsStateV1, "a normal checkpoint: the body stays for a restore");
 		for (const e of es) assert.ok((await holds(e, stream)).includes("stream"), "deleted docs keep their records");
+	} finally {
+		for (const e of es) await e.stop();
+	}
+});
+
+test("a merged create's held frames stay in the outbox until its stream is dropped (I1), then go with it", async () => {
+	// Sim suite-1 seed 1: an edit typed into the loser after its create is held with the create's frames, and they can
+	// be its only copy (the editor's save lost with the app). Deleted at the merge fold, the edit was gone before the
+	// disk side could write it to the file; kept, Repo.tDropStream deletes them once nothing tracks the doc.
+	const relay = new SimRelay();
+	const es = await engines(relay, ["a", "b"], { ...TUNING, checkpoint: { ...NO_CKPT, fallbackMs: 1e9 } });
+	const [a, b] = es as [LogEngine, LogEngine];
+	try {
+		a.disconnect();
+		const loser = await createDoc(a, "same.md", "same;");
+		await editDoc(a, loser, (t) => t.insert(0, "typed;"));
+		const stream = md(loser);
+		const held = a.c.outbox.ofStream(stream);
+		assert.ok(held.length >= 2 && held.every((r) => r.state === "held"), "the create's frames and the edit are held");
+		await createDoc(b, "same.md", "same;", "markdown", true);
+		await converged([b]);
+		const rec0 = a.c.repo.stream(stream) ?? { remoteHeadSeq: 0, remoteCheckpointCoversSeq: 0 };
+		assert.equal(await a.c.repo.tDropStream(stream, rec0), false, "held frames not named: refused");
+		// The disk side still tracks the loser (its synced record: the planner writes its text to the file first).
+		const tracked = { docId: loser, path: "same.md", pathKey: "same.md", kind: "markdown", contentHash: "0".repeat(64), fingerprint: "0".repeat(64), size: 5, mtimeMs: 0, bodyVersion: null, blobRev: 0, nsTouchSeq: 0, hasBase: false };
+		await a.c.repo.db.tx([STORE.synced], "readwrite", async (tx) => { tx.put(STORE.synced, tracked as never); });
+		await a.reconnect();
+		await until(() => a.c.ns.entry(loser)?.state === "merged", 5_000, "merged");
+		await sleep(1_000); // maintenance ticks: the retire finds the dead stream and may not drop it
+		assert.deepEqual(a.c.outbox.ofStream(stream).map((r) => r.clientFrameId), held.map((r) => r.clientFrameId), "kept at the merge");
+		await a.c.repo.db.tx([STORE.synced], "readwrite", async (tx) => { tx.delete(STORE.synced, loser); });
+		await until(() => a.c.outbox.size === 0, 10_000, "dropped");
+		assert.equal(a.c.outbox.size, 0, "dropped with the loser's stream once nothing tracks it");
+		assert.equal((await a.c.repo.outboxAll()).length, 0);
+		assert.deepEqual(await holds(a, stream), []);
+		assert.deepEqual(relay.rows(stream, { includeGc: true }), [], "held frames are never sent");
 	} finally {
 		for (const e of es) await e.stop();
 	}

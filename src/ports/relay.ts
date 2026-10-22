@@ -38,7 +38,9 @@
  *     afterSeq; rows then start after checkpoint.coversSeq. Reads and feeds do
  *     not flush the group-commit buffer: they may lag live delivery.
  *  R6 putCheckpoint is a CAS on the stream's current checkpoint coversSeq; it
- *     travels over HTTP (<= maxCheckpointBytes), not the socket.
+ *     travels over HTTP (<= maxCheckpointBytes), not the socket, and is bound
+ *     to the session's vaultEpoch: the relay refuses it ("epoch-mismatch")
+ *     once its epoch is another, so it never lands in a reset / restored epoch.
  *  R7 A COMMIT_NOTICE for a store-deduped resend may carry an OLDER seq: the
  *     adapter still emits "committed"; the engine treats seq <= the stream's
  *     appliedSeq as a settle, not progress.
@@ -141,7 +143,8 @@ export type PutCheckpointResult =
 	| { readonly t: "ok" }
 	/** Another device won the CAS. */
 	| { readonly t: "conflict"; readonly currentCoversSeq: Seq }
-	| { readonly t: "refused"; readonly reason: "not-advancing" | "ahead-of-stream" | "stream-not-found" | "too-large" | "daily-limit" | "forbidden"; readonly retryAfterMs: number | null };
+	/** epoch-mismatch: the relay's epoch is no longer the session's (a reset or restore while the put was in flight). */
+	| { readonly t: "refused"; readonly reason: "not-advancing" | "ahead-of-stream" | "stream-not-found" | "too-large" | "daily-limit" | "forbidden" | "epoch-mismatch"; readonly retryAfterMs: number | null };
 
 /**
  * Wire mapping: STREAM_APPEND_REJECTED client_frame_id_conflict -> frame-id-conflict,

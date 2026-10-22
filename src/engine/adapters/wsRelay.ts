@@ -16,8 +16,9 @@
  *   probe is sent; with nothing received within timeoutMs the socket is
  *   closed with LIVENESS_CLOSE_CODE and "closed" is emitted. When the relay
  *   advertises liveness.keepalive the probe is VAULT_KEEPALIVE (answered
- *   without waking the relay's DO), except every KEEPALIVE_PING_EVERY-th, a
- *   VAULT_PING whose pong also carries the head (the idle gap check). ping() sends one
+ *   without waking the relay's DO), except every KEEPALIVE_PING_EVERY-th and the
+ *   first after stream data (IdleProbes), a VAULT_PING whose pong also carries the
+ *   head (the idle gap check). ping() sends one
  *   on demand (the device check's round trip) and resolves on its own pong.
  * - Subscriptions (relay-wire §5.6): subscribe() sends STREAM_SUBSCRIBE and keeps the set; STREAM_RESEND (a relay
  *   runtime restart, which may have lost it) sends it again before the event is emitted. STREAM_SKIPPED decodes
@@ -102,6 +103,44 @@ export interface WsRelayOptions {
 export const DEFAULT_LIVENESS = { idleMs: 60_000, timeoutMs: 15_000 } as const;
 /** In keepalive mode, every this many idle probes one is a VAULT_PING (head check every ~10 min at the default idleMs). */
 export const KEEPALIVE_PING_EVERY = 10;
+
+/**
+ * Which idle probe to send (relay-wire §4.2): VAULT_KEEPALIVE (answered by the relay's runtime, no head) or VAULT_PING
+ * (its pong carries the head: the idle gap check). Without keepalive support every probe is a VAULT_PING. With it, a
+ * probe is a VAULT_PING every KEEPALIVE_PING_EVERY-th time, and always the first after stream data (a row, a notice,
+ * a skip, receipts) that no pong has covered yet: a live message the relay lost on an open socket is otherwise
+ * invisible until the next row arrives, so the last rows before a quiet period could stay unread for ~10 min. One
+ * VAULT_PING per quiet period after traffic bounds that to ~idleMs; a vault with no traffic still pings every ~10 min.
+ * Shared with the sim relay's session (sim/a-relay-session.ts), which plays this adapter.
+ */
+export class IdleProbes {
+	private keepalives = 0;
+	private unconfirmed = false;
+
+	constructor(private readonly keepalive: boolean) {}
+
+	/** Stream data arrived (a row, notice, skip or receipts): the relay may have lost a sibling of it. */
+	noteData(): void {
+		this.unconfirmed = true;
+	}
+
+	/** A VAULT_PONG arrived: its head covers everything the relay sent before it. */
+	notePong(): void {
+		this.unconfirmed = false;
+	}
+
+	/** Stream data arrived that no pong has covered: the next idle probe is a VAULT_PING. */
+	get headCheckOwed(): boolean {
+		return this.unconfirmed;
+	}
+
+	/** The idle probe to send now. */
+	next(): "keepalive" | "ping" {
+		const keepalive = this.keepalive && !this.unconfirmed && this.keepalives < KEEPALIVE_PING_EVERY - 1;
+		this.keepalives = keepalive ? this.keepalives + 1 : 0;
+		return keepalive ? "keepalive" : "ping";
+	}
+}
 export const DEFAULT_READY_TIMEOUT_MS = 15_000;
 export const DEFAULT_PROVISIONAL_CACHE_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_PROVISIONAL_CACHE_ENTRIES = 4096;
@@ -248,9 +287,7 @@ class WsRelaySession implements RelaySession {
 	private readonly onListenerError: (error: unknown) => void;
 	private readonly idleMs: number;
 	private readonly timeoutMs: number;
-	private readonly keepalive: boolean;
-	/** Idle probes sent since the last VAULT_PING (keepalive mode). */
-	private keepalives = 0;
+	private readonly idleProbes: IdleProbes;
 
 	private readonly listeners = new Set<(event: RelayEvent) => void>();
 	private pending: RelayEvent[] | null = [];
@@ -288,7 +325,7 @@ class WsRelaySession implements RelaySession {
 		this.rekey = init.rekey;
 		this.idleMs = init.liveness?.idleMs ?? init.ready.liveness?.idleMs ?? DEFAULT_LIVENESS.idleMs;
 		this.timeoutMs = init.liveness?.timeoutMs ?? init.ready.liveness?.timeoutMs ?? DEFAULT_LIVENESS.timeoutMs;
-		this.keepalive = init.ready.liveness?.keepalive === true;
+		this.idleProbes = new IdleProbes(init.ready.liveness?.keepalive === true);
 		this.lastRx = this.clock.monotonic();
 
 		this.ws.onmessage = (ev) => this.onMessage(ev.data);
@@ -329,22 +366,22 @@ class WsRelaySession implements RelaySession {
 	}
 
 	feed(afterSeq: number) {
-		return this.http.feed(this.vaultId, afterSeq, this.limits.feedPageRows, this.gone.signal);
+		return this.http.feed(this.vaultId, this.vaultEpoch, afterSeq, this.limits.feedPageRows, this.gone.signal);
 	}
 
 	read(stream: StreamName, afterSeq: number, preferCheckpoint: boolean) {
-		return this.http.read(this.vaultId, stream, afterSeq, preferCheckpoint, this.limits.readPageBytes, this.gone.signal);
+		return this.http.read(this.vaultId, this.vaultEpoch, stream, afterSeq, preferCheckpoint, this.limits.readPageBytes, this.gone.signal);
 	}
 
 	async readBatch(reqs: readonly ReadRequest[]): Promise<readonly ReadPage[]> {
 		const first = reqs[0];
 		if (first === undefined) throw new RangeError("readBatch: no requests");
 		if (reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
-		return this.http.readBatch(this.vaultId, reqs.slice(0, this.limits.readBatchStreams), this.limits.readPageBytes, this.gone.signal);
+		return this.http.readBatch(this.vaultId, this.vaultEpoch, reqs.slice(0, this.limits.readBatchStreams), this.limits.readPageBytes, this.gone.signal);
 	}
 
 	putCheckpoint(stream: StreamName, coversSeq: number, expectedPrevCoversSeq: number, bytes: Uint8Array) {
-		return this.http.putCheckpoint(this.vaultId, stream, coversSeq, expectedPrevCoversSeq, bytes, this.gone.signal);
+		return this.http.putCheckpoint(this.vaultId, this.vaultEpoch, stream, coversSeq, expectedPrevCoversSeq, bytes, this.gone.signal);
 	}
 
 	onEvent(listener: (event: RelayEvent) => void): Unsubscribe {
@@ -441,10 +478,9 @@ class WsRelaySession implements RelaySession {
 	}
 
 	private livenessPing(): void {
-		const keepalive = this.keepalive && this.keepalives < KEEPALIVE_PING_EVERY - 1;
-		this.keepalives = keepalive ? this.keepalives + 1 : 0;
+		const probe = this.idleProbes.next();
 		try {
-			this.ws.send(keepalive ? KEEPALIVE_REQUEST : encodePing(this.nextProbeId()));
+			this.ws.send(probe === "keepalive" ? KEEPALIVE_REQUEST : encodePing(this.nextProbeId()));
 		} catch {
 			// The timeout below closes the socket if it is dead.
 		}
@@ -476,7 +512,9 @@ class WsRelaySession implements RelaySession {
 		const bytes = messageBytes(data);
 		if (bytes === null) return;
 		const frame = decodeServerFrame(bytes);
-		if (frame !== null) this.onFrame(frame);
+		if (frame === null) return;
+		this.idleProbes.noteData();
+		this.onFrame(frame);
 	}
 
 	private onFrame(frame: WireServerFrame): void {
@@ -506,6 +544,7 @@ class WsRelaySession implements RelaySession {
 	private onControl(control: WireControl): void {
 		switch (control.type) {
 			case "STREAM_RECEIPTS":
+				this.idleProbes.noteData();
 				for (const r of control.receipts) {
 					// This socket may hold a PROVISIONAL of its own frame (own-device rows are pushed to every socket of
 					// the device); one that resent the frame while it was pending gets this receipt and no
@@ -552,6 +591,7 @@ class WsRelaySession implements RelaySession {
 				this.emit({ t: "resendUnreceipted", headSeq: control.head });
 				return;
 			case "VAULT_PONG": {
+				this.idleProbes.notePong();
 				const probe = control.probeId === null ? undefined : this.probes.get(control.probeId);
 				if (probe && control.probeId !== null) {
 					this.probes.delete(control.probeId);

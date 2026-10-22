@@ -286,7 +286,7 @@ A close for a malformed APPEND is a client bug. Do not resend that frame.
 | Message | Effect |
 |---|---|
 | `{"type":"VAULT_PING","probeId":"<1–128 printable chars>"}` | Answered with VAULT_PONG. Send it after `liveness.idleMs` of silence. If no pong arrives within `timeoutMs`, reconnect. |
-| `__YPS:{"type":"VAULT_KEEPALIVE"}` (exactly this text) | Answered with exactly `__YPS:{"type":"VAULT_ALIVE"}`. Only when VAULT_READY has `liveness.keepalive: true`. The runtime answers it itself (`setWebSocketAutoResponse`, server/src/vault/vault.ts), so it does not wake a hibernated vault DO; the relay answers it in code too. The idle probe of choice: the client sends it after `liveness.idleMs` of silence instead of VAULT_PING, except every 10th idle probe, a VAULT_PING (its pong carries `head`, the idle gap check; src/engine/adapters/wsRelay.ts `KEEPALIVE_PING_EVERY`). An older relay never advertises it and gets VAULT_PING. |
+| `__YPS:{"type":"VAULT_KEEPALIVE"}` (exactly this text) | Answered with exactly `__YPS:{"type":"VAULT_ALIVE"}`. Only when VAULT_READY has `liveness.keepalive: true`. The runtime answers it itself (`setWebSocketAutoResponse`, server/src/vault/vault.ts), so it does not wake a hibernated vault DO; the relay answers it in code too. The idle probe of choice: the client sends it after `liveness.idleMs` of silence instead of VAULT_PING, except every 10th idle probe and the first after stream data (rows, notices, skips, receipts) no pong has covered yet, a VAULT_PING (its pong carries `head`, the idle gap check; src/engine/adapters/wsRelay.ts `IdleProbes`, `KEEPALIVE_PING_EVERY`). The second rule bounds how long a live message the relay lost on an open socket stays unnoticed when nothing follows it: ~idleMs instead of ~10 idle windows; a vault with no traffic still pings every 10th probe only. An older relay never advertises it and gets VAULT_PING. |
 | `{"type":"STREAM_SUBSCRIBE","streams":["b:…","c:…",…]}` | Replaces this socket's subscription set (§5.6). No ack; `STREAM_SUBSCRIBE_REJECTED` on invalid input. |
 | `{"type":"VAULT_REKEYED","removals":<n>}` | This device's revoke record won (e2ee-design §14.2) after it had seen `n` blocking removals (§3.2 `rekey`). The relay takes `n` only when `rekeyed < n ≤ removals` (1 row, `vault_meta.rekeyed`) and then sends every socket `VAULT_REKEY`; anything else is ignored silently (a late or repeated ack, a count the vault never had, not a positive integer). The socket's device is checked first (D7), so a removed device cannot ack. The client resends it on each new session until a `rekey` shows it taken. |
 
@@ -544,10 +544,15 @@ page × pageCount:
 
 ## 8. Checkpoint (CAS put + GC)
 
-`PUT /vault/:vaultId/streams/checkpoint?stream=<name>&coversSeq=<N>&expectedCoversSeq=<M>` (Bearer). The body is raw `application/octet-stream`, 0 – 4 MiB.
+`PUT /vault/:vaultId/streams/checkpoint?stream=<name>&coversSeq=<N>&expectedCoversSeq=<M>&vaultEpoch=<E>` (Bearer). The body is raw `application/octet-stream`, 0 – 4 MiB.
 
-**The client's promise.** The bytes represent the merge of every row of `stream` with `seq ≤ N`. The server
-cannot check this.
+**The client's promise.** The bytes represent the merge of every row of `stream` with `seq ≤ N` in epoch `E` (the
+session's `VAULT_READY.vaultEpoch`). The server cannot check the merge, but it checks the epoch.
+
+**Epoch rule.** In the writing turn (after the body read and the device check), an `E` other than the vault's current
+epoch is refused `409 epoch_mismatch` `{vaultEpoch}` and nothing is written: a put in flight across a reset or a
+restore (D8b) must not land in the new epoch, whose rows its bytes do not merge (every reader would adopt it and fold
+a dead log). A put without `vaultEpoch` (older clients) is not checked.
 
 **CAS rule.** The put succeeds iff the current `checkpointSeq == M`, `N > M`, and `N ≤ lastSeq`.
 
@@ -555,6 +560,7 @@ cannot check this.
 |---|---|
 | `200` | `{stream, coversSeq, gcSeq, deletedSegments}` |
 | `409 checkpoint_conflict` | `{current:{coversSeq}}`. Another device won. Re-read and rebuild, or keep theirs. |
+| `409 epoch_mismatch` | `{vaultEpoch}`. The vault is in another epoch; the session is over (its socket closes 1001). |
 | `400 checkpoint_not_advancing` | `N ≤ M` |
 | `409 checkpoint_ahead_of_stream` | `{lastSeq}` |
 | `404 stream_not_found` | The stream has no rows. |
@@ -581,7 +587,9 @@ cannot check this.
 2. Get a ticket, connect, and wait for `VAULT_READY`. Note `vaultEpoch` and `head = H`. Buffer live frames from
    here on. Send `STREAM_SUBSCRIBE` with the streams you need live (§5.6), and resend it after every
    `STREAM_RESEND`.
-3. If `vaultEpoch` differs from the stored one, drop all cursors.
+3. If `vaultEpoch` differs from the stored one, drop all cursors. Every later feed / read reply carries `vaultEpoch`
+   too: discard one that differs from the session's (the vault was reset or restored while it was in flight; its seqs
+   and rows are another epoch's), and name the session's epoch in every checkpoint put (§8).
 4. Feed from the stored vault cursor `C` up to `nextAfter = null`. For every stream you track whose
    `lastSeq > its cursor`, page `read` from that stream's cursor. Always track `ns`.
 5. Apply the buffered live frames, skipping seqs ≤ the stream cursor you already hold. Then set `C = max(H, feed head)`.

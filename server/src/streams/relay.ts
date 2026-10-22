@@ -1197,8 +1197,10 @@ export class StreamRelayService {
 	}
 
 	/**
-	 * PUT /streams/checkpoint?stream=X&coversSeq=N&expectedCoversSeq=M, body = opaque checkpoint bytes. `admitted`
-	 * runs after the body read, in the writing turn: a device revoked during the read gets 401, nothing written (D7).
+	 * PUT /streams/checkpoint?stream=X&coversSeq=N&expectedCoversSeq=M[&vaultEpoch=E], body = opaque checkpoint bytes.
+	 * `admitted` runs after the body read, in the writing turn: a device revoked during the read gets 401, nothing
+	 * written (D7). An `E` other than the current epoch gets 409 epoch_mismatch, nothing written; a client that
+	 * names no epoch (older builds) is not checked.
 	 */
 	async putCheckpoint(request: Request, url: URL, admitted: () => boolean = () => true): Promise<Response> {
 		const stream = url.searchParams.get("stream");
@@ -1214,6 +1216,12 @@ export class StreamRelayService {
 			return json({ error: kind }, kind === "body_too_large" ? 413 : 400);
 		}
 		if (!admitted()) return json({ error: "unauthorized" }, 401);
+		// The epoch the client built the checkpoint in, checked in the writing turn: a put that was in flight across a
+		// reset or restore must not land in the new epoch, whose rows its bytes do not merge (relay-wire §8).
+		const vaultEpoch = url.searchParams.get("vaultEpoch");
+		if (vaultEpoch !== null && vaultEpoch !== this.options.vaultGeneration()) {
+			return json({ error: "epoch_mismatch", vaultEpoch: this.options.vaultGeneration() }, 409);
+		}
 		return this.dailyLimitAware(() => {
 			const result = this.options.store().putCheckpoint(stream, coversSeq, expected, bytes);
 			if (!result.ok) {

@@ -12,8 +12,10 @@ import type { Unsubscribe } from "../ports/common";
 import type { AppendFrame, FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RekeySignal, RelayEvent, RelayLimits, RelaySession } from "../ports/relay";
 import { decodeServerFrame, encodeAppend, encodePing, encodeRekeyed, encodeServerFrame, encodeSubscribe } from "../engine/adapters/relayFrames";
 import { READ_BATCH_MAX_QUERY_CHARS } from "../engine/adapters/relayHttp";
+import { IdleProbes, LIVENESS_CLOSE_CODE, LIVENESS_TIMEOUT_ERROR } from "../engine/adapters/wsRelay";
+import type { TimerHandle } from "../ports/clock";
 import { TimedQueue } from "./a-relay-link";
-import { heldKey, type DownMsg, type LinkSpec, type UpMsg } from "./a-relay-util";
+import { heldKey, type DownMsg, type LinkSpec, type SimLiveness, type UpMsg } from "./a-relay-util";
 
 /** A server binary frame on the downlink, encoded with the wire codec (relayFrames) and decoded on receipt, like wsRelay. */
 type WireDown = DownMsg | { readonly k: "binary"; readonly wire: Uint8Array };
@@ -64,6 +66,12 @@ export class SimRelaySession implements RelaySession {
 	private readonly down: TimedQueue<WireDown>;
 	/** Every RelayEvent produced, in order (introspection; includes buffered ones). */
 	readonly log: RelayEvent[] = [];
+	/** wsRelay liveness (idle probe, its timeout); null: none (unit tests that run the clock until idle). */
+	private readonly idleProbes: IdleProbes | null;
+	private lastRx: number;
+	private idleTimer: TimerHandle | null = null;
+	private timeoutTimer: TimerHandle | null = null;
+	private idleProbeIds = 0;
 
 	constructor(
 		private readonly host: SessionHost,
@@ -77,12 +85,27 @@ export class SimRelaySession implements RelaySession {
 		public link: LinkSpec,
 		/** VAULT_READY.rekey. */
 		readonly rekey: RekeySignal,
+		/** VAULT_READY.liveness as wsRelay reads it; null: no idle probes. */
+		private readonly liveness: SimLiveness | null = null,
 	) {
 		this.up = new TimedQueue(host.clock, (msg) => {
 			if (msg.k === "append") this.inFlightBytes -= msg.bytes;
 			host.arrive(this, msg);
 		});
 		this.down = new TimedQueue(host.clock, (msg) => this.receive(msg));
+		this.idleProbes = liveness ? new IdleProbes(liveness.keepalive) : null;
+		this.lastRx = host.clock.monotonic();
+		if (liveness) this.scheduleIdle(liveness.idleMs);
+	}
+
+	/** Stream data arrived that no pong has covered: this socket's next idle probe is a VAULT_PING (wsRelay IdleProbes). */
+	get headCheckOwed(): boolean {
+		return !this.ended && (this.idleProbes?.headCheckOwed ?? false);
+	}
+
+	/** Open with liveness: an idle VAULT_PING will come (the next probe if owed, else every KEEPALIVE_PING_EVERY-th). */
+	get headCheckComing(): boolean {
+		return !this.ended && this.idleProbes !== null;
 	}
 
 	/** The client saw "closed" (or closed itself). */
@@ -215,12 +238,66 @@ export class SimRelaySession implements RelaySession {
 	close(code: number, _reason: string): void {
 		if (this.ended) return;
 		this.ended = true;
+		this.clearLiveness();
 		this.failProbes();
 		this.held.clear();
 		this.down.clear();
 		if (this.everListened) this.queue = [];
 		this.emit({ t: "closed", code, errorCode: null, wasClean: true });
 		this.up.push(this.delay(this.link.uplinkMs), { k: "close", code });
+	}
+
+	// ---- adapter: liveness (wsRelay scheduleIdle / livenessPing / noteReceived) -----
+
+	private clearLiveness(): void {
+		if (this.idleTimer !== null) this.host.clock.clearTimer(this.idleTimer);
+		if (this.timeoutTimer !== null) this.host.clock.clearTimer(this.timeoutTimer);
+		this.idleTimer = null;
+		this.timeoutTimer = null;
+	}
+
+	private scheduleIdle(delayMs: number): void {
+		const liveness = this.liveness;
+		if (!liveness) return;
+		if (this.idleTimer !== null) this.host.clock.clearTimer(this.idleTimer);
+		this.idleTimer = this.host.clock.setTimer(Math.max(0, delayMs), () => {
+			this.idleTimer = null;
+			if (this.ended || this.timeoutTimer !== null) return;
+			const silent = this.host.clock.monotonic() - this.lastRx;
+			if (silent < liveness.idleMs) return this.scheduleIdle(liveness.idleMs - silent);
+			this.idleProbe(liveness);
+		});
+	}
+
+	/** VAULT_KEEPALIVE (answered by the runtime) or VAULT_PING (its pong carries the head); no answer in timeoutMs closes. */
+	private idleProbe(liveness: SimLiveness): void {
+		if (this.idleProbes?.next() === "keepalive") this.up.push(this.delay(this.link.uplinkMs), { k: "keepalive" });
+		else {
+			const probeId = `idle-${++this.idleProbeIds}`;
+			this.up.push(this.delay(this.link.uplinkMs), { k: "ping", probeId, bytes: encodePing(probeId).length });
+		}
+		this.timeoutTimer = this.host.clock.setTimer(liveness.timeoutMs, () => {
+			this.timeoutTimer = null;
+			if (this.ended) return;
+			this.ended = true;
+			this.clearLiveness();
+			this.failProbes();
+			this.held.clear();
+			this.down.clear();
+			if (this.everListened) this.queue = [];
+			this.emit({ t: "closed", code: LIVENESS_CLOSE_CODE, errorCode: LIVENESS_TIMEOUT_ERROR, wasClean: false });
+			this.up.push(this.delay(this.link.uplinkMs), { k: "close", code: LIVENESS_CLOSE_CODE });
+		});
+	}
+
+	private noteReceived(): void {
+		if (!this.liveness) return;
+		this.lastRx = this.host.clock.monotonic();
+		if (this.timeoutTimer !== null) {
+			this.host.clock.clearTimer(this.timeoutTimer);
+			this.timeoutTimer = null;
+			this.scheduleIdle(this.liveness.idleMs);
+		}
 	}
 
 	// ---- server side ----------------------------------------------------------
@@ -264,9 +341,14 @@ export class SimRelaySession implements RelaySession {
 
 	private receive(raw: WireDown): void {
 		if (this.ended) return;
+		this.noteReceived();
 		const msg = raw.k === "binary" ? fromWire(raw.wire) : raw;
 		if (msg === null) return; // wsRelay ignores a frame it cannot decode
+		if (raw.k === "binary" || msg.k === "receipts") this.idleProbes?.noteData();
+		else if (msg.k === "pong") this.idleProbes?.notePong();
 		switch (msg.k) {
+			case "alive":
+				return; // VAULT_ALIVE: liveness only, no event
 			case "provisional":
 				this.held.set(heldKey(msg.stream, msg.deviceId, msg.clientFrameId), msg.payload);
 				this.emit({ t: "provisional", stream: msg.stream, deviceId: msg.deviceId, clientFrameId: msg.clientFrameId, payload: msg.payload.slice() });
@@ -336,6 +418,7 @@ export class SimRelaySession implements RelaySession {
 				return;
 			case "close":
 				this.ended = true;
+				this.clearLiveness();
 				this.failProbes();
 				this.held.clear();
 				this.up.clear();
@@ -345,7 +428,8 @@ export class SimRelaySession implements RelaySession {
 			case "event":
 				if (msg.event.t === "closed") {
 					this.ended = true;
-				this.failProbes();
+					this.clearLiveness();
+					this.failProbes();
 					this.held.clear();
 					this.up.clear();
 					this.inFlightBytes = 0;

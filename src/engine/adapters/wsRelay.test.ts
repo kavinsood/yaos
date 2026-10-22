@@ -688,6 +688,26 @@ describe("wsRelay liveness", () => {
 		assert.deepEqual(events.at(-1), { t: "closed", code: LIVENESS_CLOSE_CODE, errorCode: "liveness_timeout", wasClean: false });
 	});
 
+	it("keepalive mode: the first idle probe after stream data is a VAULT_PING (a live message lost on an open socket shows within ~idleMs, not ~10 min)", async () => {
+		const { socket, session, clock } = await open({}, { ...READY, liveness: { version: 1, idleMs: 60000, timeoutMs: 15000, keepalive: true } });
+		const events = collect(session);
+		const keepalives = () => socket.sentControls().filter((c) => c["type"] === "VAULT_KEEPALIVE").length;
+		clock.advance(60_000);
+		assert.deepEqual([keepalives(), pings(socket).length], [1, 0], "no data yet: a keepalive");
+		socket.control({ type: "VAULT_ALIVE" });
+		socket.binary({ kind: "committed", seq: 43, stream: "ns", deviceId: "devB", clientFrameId: "f1", payload: bytes(1) });
+		clock.advance(60_000);
+		assert.deepEqual([keepalives(), pings(socket).length], [1, 1], "a row arrived since: the idle probe checks the head");
+		socket.control({ type: "VAULT_PONG", probeId: String(pings(socket)[0]!["probeId"]), head: 45 });
+		assert.deepEqual(events.at(-1), { t: "head", headSeq: 45 }, "the head shows the rows the relay lost (44, 45)");
+		clock.advance(60_000);
+		assert.deepEqual([keepalives(), pings(socket).length], [2, 1], "covered by the pong: keepalives again");
+		socket.control({ type: "VAULT_ALIVE" });
+		socket.control({ type: "STREAM_RECEIPTS", head: 46, receipts: [{ stream: "ns", clientFrameId: "own", seq: 46, deduped: false }] });
+		clock.advance(60_000);
+		assert.deepEqual([keepalives(), pings(socket).length], [2, 2], "receipts are stream data too");
+	});
+
 	it("ping() resolves on its own pong with the head; another probe's pong does not; a close rejects it", async () => {
 		const { socket, session } = await open();
 		const events = collect(session);

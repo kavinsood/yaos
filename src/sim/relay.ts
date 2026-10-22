@@ -39,6 +39,7 @@ import {
 	validStreamName,
 	type LinkSpec,
 	type SimConnectFailureReason,
+	type SimLiveness,
 	type SimRelayOptions,
 	type SimRow,
 	type SimSessionInfo,
@@ -101,6 +102,7 @@ export class SimRelay implements RelayPort {
 	private nextSessionId = 1;
 	private readonly readPageRows: number;
 	private readonly maxSockets: number;
+	private readonly liveness: SimLiveness | null;
 	/** Catch-up read requests (single and batched): total, on the wire now, most on the wire at once. */
 	readRequests = 0;
 	/** Checkpoint puts, GCs and checkpoint-carrying read pages (sim coverage stats). */
@@ -119,6 +121,7 @@ export class SimRelay implements RelayPort {
 		this.limits = Object.freeze({ ...DEFAULT_SIM_RELAY_LIMITS, ...options.limits });
 		this.readPageRows = options.readPageRows ?? Number.POSITIVE_INFINITY;
 		this.maxSockets = options.maxSockets ?? SIM_MAX_SOCKETS;
+		this.liveness = options.liveness ?? null;
 		this.readOnly = new Set(options.readOnlyDevices ?? []);
 		this.defaultLink = { ...options.link };
 		this.store = new RelayStore({
@@ -137,9 +140,9 @@ export class SimRelay implements RelayPort {
 		this.host = {
 			clock: this.clock,
 			arrive: (session, msg) => this.engine.arrive(session, msg),
-			feed: (session, afterSeq) => this.http(session, () => this.feedPage(afterSeq, session.deviceId)),
-			read: (session, stream, afterSeq, prefer) => this.readRequest(session, () => this.viaWire([{ stream, afterSeq, preferCheckpoint: prefer }], [this.readPage(stream, afterSeq, prefer, undefined, session.deviceId)])[0]!),
-			readBatch: (session, reqs) => this.readRequest(session, () => this.viaWire(reqs, this.readBatchPages(reqs, session.deviceId))),
+			feed: (session, afterSeq) => this.http(session, () => this.sameEpoch(session, () => this.feedPage(afterSeq, session.deviceId))),
+			read: (session, stream, afterSeq, prefer) => this.readRequest(session, () => this.sameEpoch(session, () => this.viaWire([{ stream, afterSeq, preferCheckpoint: prefer }], [this.readPage(stream, afterSeq, prefer, undefined, session.deviceId)])[0]!)),
+			readBatch: (session, reqs) => this.readRequest(session, () => this.sameEpoch(session, () => this.viaWire(reqs, this.readBatchPages(reqs, session.deviceId)))),
 			putCheckpoint: (session, stream, coversSeq, expected, bytes) => this.http(session, () => this.checkpointPut(session, stream, coversSeq, expected, bytes)),
 			jitter: (session) => this.jitter(session.link),
 			listenerError: (error) => this.onListenerError(error),
@@ -164,7 +167,7 @@ export class SimRelay implements RelayPort {
 				if (this.engine.streamSockets().length >= this.maxSockets) return resolve({ ok: false, reason: "unavailable", retryAfterMs: 1000 });
 				const session = new SimRelaySession(
 					this.host, this.nextSessionId++, this.engine.nextOrdinal(), params.deviceId, this.epoch,
-					this.store.head(), !this.readOnly.has(params.deviceId), this.limits, link, { ...this.rekey },
+					this.store.head(), !this.readOnly.has(params.deviceId), this.limits, link, { ...this.rekey }, this.liveness,
 				);
 				this.engine.accept(session);
 				this.tracked.push(session);
@@ -177,6 +180,16 @@ export class SimRelay implements RelayPort {
 	// ---- HTTP ---------------------------------------------------------------------
 
 	/** Request travels httpMs (+jitter), is answered from the state at arrival, the response travels back. */
+	/**
+	 * A feed / read reply carries the relay's epoch; the client adapter (relayHttp) rejects one of another epoch than
+	 * its session's (code "epoch_mismatch"), so a reply computed after a reset or restore never reaches the old epoch's store.
+	 */
+	private sameEpoch<T>(session: SimRelaySession, compute: () => T): T {
+		const value = compute();
+		if (session.vaultEpoch !== this.epoch) throw new SimRelayError("epoch_mismatch");
+		return value;
+	}
+
 	private readRequest<T>(session: SimRelaySession, compute: () => T): Promise<T> {
 		this.readRequests++;
 		this.maxReadsOnWire = Math.max(this.maxReadsOnWire, ++this.readsOnWire);
@@ -281,6 +294,9 @@ export class SimRelay implements RelayPort {
 		if (!Number.isSafeInteger(coversSeq) || coversSeq < 1) throw new SimRelayError("invalid_covers_seq");
 		if (!validSeq(expected)) throw new SimRelayError("invalid_expected_covers_seq");
 		if (bytes.byteLength > this.limits.maxCheckpointBytes) return { t: "refused", reason: "too-large", retryAfterMs: null };
+		// Server putCheckpoint: the client names its session's epoch (relayHttp vaultEpoch=); a put that was in flight
+		// across a reset or restore is refused in the writing turn (409 epoch_mismatch), nothing written.
+		if (session.vaultEpoch !== this.epoch) return { t: "refused", reason: "epoch-mismatch", retryAfterMs: null };
 		// The server has no up-front latch check here: its store write fails (503 cf_daily_limit) while the Cloudflare
 		// limit holds. A latched sim (failNextCommit daily-limit) stands for that limit, so the latch refuses too.
 		if (!this.engine.dailyActive() && this.engine.envDailyActive()) this.engine.latchDaily(null);
@@ -360,6 +376,19 @@ export class SimRelay implements RelayPort {
 			};
 			this.clock.setTimer(0, check);
 		});
+	}
+
+	/**
+	 * An open socket of `deviceId` got stream data that no pong has covered yet: its adapter's next idle probe is a
+	 * VAULT_PING (wsRelay IdleProbes), which shows the head if the relay lost a live message to it (lostSend).
+	 */
+	headCheckOwed(deviceId: DeviceId): boolean {
+		return this.tracked.some((s) => s.deviceId === deviceId && s.headCheckOwed);
+	}
+
+	/** An open socket of `deviceId` runs the idle liveness: a VAULT_PING, and with it the head, will come. */
+	headCheckComing(deviceId: DeviceId): boolean {
+		return this.tracked.some((s) => s.deviceId === deviceId && s.headCheckComing);
 	}
 
 	quiescent(): boolean {

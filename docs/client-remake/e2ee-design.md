@@ -913,7 +913,11 @@ record: the first valid one, with these rules.
   - roll: it holds K_{e−1} (the winner's key);
   - genesis and revoke: it holds K_e directly (QR), or RK is in hand.
 
-  A record the device cannot evaluate is **pending**, not invalid.
+  A record the device cannot evaluate is **pending**, not invalid. A pending genesis or revoke in `k` holds back the
+  later records of its epoch: it may be the first valid one. Two kept devices can re-key at once (§14.2), each under
+  a new RK of its own; the second cannot open the first's record and must not adopt its own (or any later) record
+  past it, or the vault forks (sim suite-1 E2EE seed 89423454). It waits, `revoked-epoch`, for an out-of-band key
+  (a QR or the winner's RK), which judges every record of the epoch. A pending roll holds nothing back.
 - **Revoke outranks roll for the same epoch, whatever the seq order.** A roll for epoch e is not adopted while any
   record of kind revoke for an epoch ≥ e exists, pending or valid.
   - This stops a revoked device colluding with the server. It holds K_{r−1}, and could otherwise forge a roll for

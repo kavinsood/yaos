@@ -282,13 +282,17 @@ export class Maintenance {
 			if (c.stopped || (puts <= 0 && drops <= 0)) return;
 			const stream = rec.stream;
 			// Own frames on their way (a late edit of a pruned doc): their rows come first, then the stream is retired.
-			if (c.sess.isReading(stream) || rec.stale || c.outbox.ofStream(stream).length > 0) continue;
+			// A merged alias's held frames are never sent: they go with the drop (Repo.tDropStream).
+			const own = c.outbox.ofStream(stream);
+			const held = why === "merged" && own.every((r) => r.state === "held") ? own.map((r) => r.clientFrameId) : null;
+			if (c.sess.isReading(stream) || rec.stale || (own.length > 0 && held === null)) continue;
 			if (rec.remoteCheckpointCoversSeq >= rec.remoteHeadSeq) {
 				if (drops <= 0) continue;
 				const h = c.handles.peek(stream);
 				if ((h && !c.handles.isClean(h)) || c.handles.loadingOf(stream)) continue;
 				drops--;
-				if (!(await c.repo.tDropStream(stream, rec))) continue;
+				if (!(await c.repo.tDropStream(stream, rec, held ?? []))) continue;
+				if (held && held.length > 0) c.applyOutboxResult({ removed: held.flatMap((id) => c.outbox.get(id) ?? []), updated: [] });
 				c.handles.drop(stream);
 				for (const m of [c.ckpt.condSince, c.ckpt.jitter, c.ckpt.lastActivity, c.ckpt.backoffUntil, c.ckpt.tooLarge]) m.delete(stream);
 				st.forget(stream, rec.docId);

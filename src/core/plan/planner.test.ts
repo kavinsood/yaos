@@ -555,6 +555,41 @@ test("row merged, loser edited after its create: the dropped edit is local, no b
 	]);
 });
 
+test("row merged, loser replica past its sync point: its text goes to its file first, the rebind follows (I1)", () => {
+	// Sim suite-1 seed 1: own edits typed into the loser after its create, the editor's save lost with the app. Its
+	// kept frames are the only copy; a rebind now restarts S at the winner's create and the disk never gets them.
+	const sc = (over: Partial<SyncedEntry>, local = L("x.md", h("X"))): Scenario => ({
+		remote: [R("d4", "x.md", { state: "merged", aliasOf: id("d3"), body: { ...R("d4", "x.md").body!, version: V(12) } }), R("d3", "x.md", { createHash: h("X") })],
+		synced: [S("d4", "x.md", { contentHash: h("X"), bodyVersion: V(10), ...over })],
+		local: [local],
+	});
+	assert.deepEqual(run(sc({})).ops, [{ op: "reconcileContent", docId: "d4", path: "x.md", kind: "markdown", hasBase: true }]);
+	// Unhashed file: hash it first, still no rebind.
+	assert.deepEqual(run(sc({}, L("x.md", null))).ops, [{ op: "needHash", path: "x.md" }]);
+	// Once the file holds the replica (S at its version), the rebind as before.
+	assert.deepEqual(opsOf(run(sc({ bodyVersion: V(12) }))), ["rebind", "reconcileContent"]);
+	assert.equal(find(run(sc({ bodyVersion: V(12) })), "reconcileContent").docId, "d3");
+	// Renamed before the app died (the file moved, S still at x.md or already fileGone): its text goes to the moved file.
+	const moved = (over: Partial<SyncedEntry>) => run(sc(over, L("y.md", h("X")))).ops.find((o) => o.op === "reconcileContent");
+	assert.deepEqual(moved({}), { op: "reconcileContent", docId: "d4", path: "y.md", kind: "markdown", hasBase: true });
+	assert.deepEqual(moved({ fileGone: true }), { op: "reconcileContent", docId: "d4", path: "y.md", kind: "markdown", hasBase: true });
+});
+
+test("row merged, winner renamed and another identical doc live at the path: rebind and follow the rename, no collapse", () => {
+	// Soak seed 1394654959: S of an own create merged before it folded has nsTouchSeq 0. Rebound to the winner it is
+	// the winner's record: a rename of the winner is a remote move, not the fold suffixing an own create.
+	const blob = (path: string, over = {}) => R("d0", path, { kind: "blob", createHash: h("b0"), blob: { hash: h("b0"), size: 3, rev: 7 }, ...over } as never);
+	const p = run({
+		remote: [{ ...blob("att/y.png"), docId: id("d3"), lastTouchSeq: 9 }, { ...blob("att/x.png"), docId: id("d4"), state: "merged", aliasOf: id("d3") }, { ...blob("att/x.png"), docId: id("d5"), lastTouchSeq: 11 }],
+		synced: [S("d4", "att/x.png", { kind: "blob", contentHash: h("b0"), nsTouchSeq: 0, blobRev: 7 })],
+		local: [L("att/x.png", h("b0"))],
+	});
+	assert.ok(!opsOf(p).includes("nsDelete"), JSON.stringify(p.ops));
+	assert.deepEqual(opsOf(p).slice(0, 2), ["rebind", "diskRename"]);
+	assert.equal(find(p, "rebind").toDocId, "d3");
+	assert.equal(find(p, "diskRename").to, "att/y.png");
+});
+
 test("row live/present/present: body without content, create not empty = wait body-empty unless S is born empty", () => {
 	const empty = { ...R("d1", "a.md").body!, hasContent: false, version: V(0) };
 	const p = run({ remote: [R("d1", "a.md", { body: empty })], synced: [S("d1", "a.md", { bodyVersion: V(3) })], local: [L("a.md", h("c0"))] });

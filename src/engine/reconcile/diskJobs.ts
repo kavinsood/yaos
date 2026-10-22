@@ -88,7 +88,11 @@ export async function rebind(env: Env, op: Op<"rebind">): Promise<JobOutcome> {
 	const view = ctx.log.view().remote;
 	const winner = view.get(op.toDocId);
 	const from = winner && view.get(op.fromDocId)?.state !== "live" ? restartAtCreate(s, winner.createHash) : s;
-	const moved = ctx.record({ ...from, docId: op.toDocId, path: op.path, pathKey: ctx.pk(op.path) });
+	// S now mirrors the winner as folded: its touch seq, not the loser's (0 for an own create merged before it folded).
+	// With 0 it read as an own create the fold never committed, and a remote rename of the winner as the fold's
+	// suffixing of it: the identical-loser collapse deleted the winner (soak seed 1394654959).
+	const nsTouchSeq = Math.max(from.nsTouchSeq, ctx.touchSeq(op.toDocId));
+	const moved = ctx.record({ ...from, docId: op.toDocId, path: op.path, pathKey: ctx.pk(op.path), nsTouchSeq });
 	await ctx.commit({
 		syncedDrop: [op.fromDocId], syncedPut: [moved],
 		baseMove: from.hasBase ? [{ from: op.fromDocId, to: op.toDocId }] : [], baseDrop: s.hasBase && !from.hasBase ? [op.fromDocId] : [],

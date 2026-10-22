@@ -1,0 +1,256 @@
+{
+	"seed": 935329097,
+	"config": {
+		"seed": 935329097,
+		"devices": 5,
+		"steps": 57,
+		"faults": {
+			"engineCrash": 1.301,
+			"appCrash": 3.789,
+			"commitCrash": 6.941,
+			"idbWipe": 0.514,
+			"idbLost": 0,
+			"offline": 2.487,
+			"ioFail": 0,
+			"background": 1.597,
+			"socketDrop": 4.509,
+			"relayRestart": 1.406,
+			"relayDrain": 1.67,
+			"httpFail": 0.995,
+			"dailyLimit": 0.315,
+			"epochReset": 1.972,
+			"clockSkew": 0.643,
+			"keyStoreLoss": 0,
+			"keyRoll": 0,
+			"revoke": 0,
+			"epochRestore": 0,
+			"hostileReplay": 0,
+			"hostileDowngrade": 0,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 2.053,
+			"lostSend": 2.821,
+			"commitFail": 2.199,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"faultRate": 0.193,
+		"randomTuning": true,
+		"ops": {
+			"type": 30,
+			"paste": 2,
+			"deleteToken": 6,
+			"open": 8,
+			"close": 4,
+			"switch": 3,
+			"mode": 2,
+			"create": 6,
+			"diskInsert": 10,
+			"diskDeleteToken": 3,
+			"rename": 5,
+			"delete": 6,
+			"attach": 0,
+			"attachRename": 0,
+			"attachDelete": 0,
+			"setting": 0,
+			"snapshot": 0,
+			"cleanUp": 0,
+			"importStorm": 0,
+			"massDelete": 0,
+			"folderMove": 0,
+			"massRename": 0,
+			"massOverwrite": 0,
+			"restoreTrash": 6,
+			"recreate": 4,
+			"bigNote": 0,
+			"bigReformat": 0,
+			"bigEdit": 0
+		}
+	},
+	"minimizedPlan": [
+		{
+			"i": 70,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 0,
+				"name": 1,
+				"size": 847
+			}
+		},
+		{
+			"i": 21,
+			"gapMs": 1082,
+			"user": {
+				"t": "type",
+				"dev": 2,
+				"view": 0.9261568505316973,
+				"pos": 0.8273355336859822,
+				"nl": false
+			}
+		},
+		{
+			"i": 71,
+			"gapMs": 432,
+			"canvas": {
+				"t": "cAddNode",
+				"dev": 4,
+				"file": 0.7165621004533023,
+				"kind": "text",
+				"seed": 486723421
+			}
+		},
+		{
+			"i": 75,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 2,
+				"name": 2,
+				"size": 2678
+			}
+		},
+		{
+			"i": 76,
+			"gapMs": 46,
+			"canvas": {
+				"t": "cText",
+				"dev": 1,
+				"file": 0.3980683700647205,
+				"node": 0.5388151602819562,
+				"pos": 0.6072260159999132,
+				"del": false
+			}
+		},
+		{
+			"i": 28,
+			"gapMs": 247,
+			"user": {
+				"t": "type",
+				"dev": 3,
+				"view": 0.8426619181409478,
+				"pos": 0.6621720746625215,
+				"nl": false
+			}
+		},
+		{
+			"i": 29,
+			"gapMs": 1204,
+			"user": {
+				"t": "type",
+				"dev": 3,
+				"view": 0.9074099021963775,
+				"pos": 0.4991462714970112,
+				"nl": true
+			}
+		},
+		{
+			"i": 77,
+			"gapMs": 146,
+			"canvas": {
+				"t": "cExtra",
+				"dev": 2,
+				"file": 0.9816794050857425,
+				"target": "node",
+				"pick": 0.6677605563309044,
+				"key": 0,
+				"del": false
+			}
+		},
+		{
+			"i": 30,
+			"gapMs": 814,
+			"user": {
+				"t": "switch",
+				"dev": 3,
+				"view": 0.6966896315570921,
+				"file": 0.7672920366749167
+			}
+		},
+		{
+			"i": 32,
+			"gapMs": 884,
+			"user": {
+				"t": "restoreTrash",
+				"dev": 1,
+				"pick": 0.889103727415204
+			}
+		},
+		{
+			"i": 33,
+			"gapMs": 823,
+			"user": {
+				"t": "create",
+				"dev": 1,
+				"name": 0
+			}
+		},
+		{
+			"i": 34,
+			"gapMs": 197,
+			"fault": {
+				"t": "lostSend",
+				"dev": 3,
+				"count": 4
+			}
+		},
+		{
+			"i": 55,
+			"gapMs": 463,
+			"user": {
+				"t": "diskInsert",
+				"dev": 0,
+				"file": 0.837765667354688,
+				"pos": 0.3259407887235284,
+				"by": "external"
+			}
+		},
+		{
+			"i": 90,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 2,
+				"name": 1,
+				"size": 3524
+			}
+		},
+		{
+			"i": 56,
+			"gapMs": 1070,
+			"user": {
+				"t": "close",
+				"dev": 1,
+				"view": 0.45650620851665735
+			}
+		}
+	],
+	"violations": [
+		{
+			"inv": "convergence",
+			"detail": "att/a1.png differs: A=\"PNG [C.90]\\n\u0206\u07d2\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u07e4\ufffd\u078a\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u00c0\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u02e9\ufffd\ufffd\ufffd\ufffd\u00d3\ufffd\ufffd\u9804\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u0083\ufffd...\" D=\"PNG [A.70]\\n\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u21eb\ufffd\ufffd\ufffd\ufffd\ufffd\u0637\ufffd\ufffd\ufffd\u064c\ufffd\ufffd\ufffd\ufffd\u7aa2\ufffd\ufffd\ufffd\u02c9\ufffd\u06d4\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u015b\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\uc3b0\ufffd\ufffd\ufffd\ufffd\uda64\udcc5\ufffd\ufffd\ufffd\ufffd\u00bd\ufffd\ufffd\ufffd\ufffd\u0110\ufffd\ufffd\ufffd\u068a\ufffd...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "ns fold bytes differ: oracle,A,B,C,E=3115:a144fa8e D=3092:1e4e531e"
+		},
+		{
+			"inv": "clean",
+			"detail": "D: ns covers 49 of head 52"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "D: 1 streams behind the relay: ns at 49 of 52 (gc 52)"
+		},
+		{
+			"inv": "clean",
+			"detail": "D: vault cursor 51 below relay head 52 (above: 0)"
+		}
+	],
+	"label": "soak seed 935329097, relay faults, 5 devices: D lost the last live rows before a quiet period (lostSend); the sim adapter never probed the idle socket, and production keepalive mode checks the head only every ~10 min"
+}

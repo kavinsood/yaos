@@ -133,13 +133,6 @@ rekeys: the disk edit is lost (`tokens` + `destroyed`). `s1-197-clean.json` (5 s
 `s1-197-nohostile.json`. `1482901505-47-min.json` (hostile device, suite 1, clean-ups, revokes, 5 devices: a token
 typed on D lost) is likely the same.
 
-### SIM-EPOCH-COMMIT-CRASH: an epoch reset, a commit crash and offline lose a typed token
-
-`relay-134.json` (targeted relay faults seed 134, base): epoch reset, a commit crash ("after"), offline: a token typed
-on A is lost. Possibly the same as test:sim-suite1 "4 devices, E2EE faults" seed 1 (`tokens: lost [C.52] (typed on C
-at step 52)`, identical on base; its plan has an epoch reset and commit crashes too, `s1-e2ee4-seed1.json`). The
-known suite-1 failure: `npm run test:sim-suite1` exits 1 on it.
-
 ### SIM-CANVAS-FOLDER-REVIVE: a folder rename revives deleted canvas edges
 
 `20701862-41-min.json` (7 steps, base): A fixes a dangling edge (`cBroken`), then renames the canvas's folder; the
@@ -165,12 +158,6 @@ re-creates after the reset): A's overwrite of 10 notes is lost. In production an
 mass deletes and import storms): imported notes lost, likely PRUNE-RESTORE with more deletes than the 2+ newest
 tombstones `pruneWorld` keeps. Until fixed, the nightly soak can fail on these.
 
-### SIM-E2EE-LOG-BUSY: a suite-1 device's log never goes idle; devices end on different epochs
-
-`e2ee-log-busy-89423454.json` (E2EE faults, 5 devices, suite 1): no quiescence ("A log busy"), devices seal under
-different epochs, wide divergence; the `retired` violations follow from A never catching up. Fails the same on
-`generators`; a second soak seed (1042558905, 3 devices, no generator ops) fails the same on base.
-
 ### SIM-CANVAS-REORDER: a canvas reorder to the front lost
 
 `canvas-reorder-lost-1025898366.json` (E2EE faults, 2 devices, suite 1, delete / restore races; 251 steps): B's
@@ -190,6 +177,57 @@ config is drawn from the master seed) and whether a run or the soak's coverage /
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SIM-GATED-RESIDENCY** (`fix-refold`, soak seed 2006566456, invariant 6 "5 resident docs, budget 3"): an engine
+  bound violation, not a tolerance issue. While C waited revoked-epoch for its QR, each pass's merge jobs applied the
+  disk diff to the replica and then failed in `commitEdits` on the write gate; the edit stayed in the frame builder,
+  the replica was no longer clean and could not be evicted (DESIGN §d.1), so every file merged while key-missing
+  stayed resident (a phone left key-missing under a sync tool would hold one Y.Doc per changed file). Merge jobs
+  (markdown, canvas, the epoch's old deletes) now call `BodyHandle.assertWritable` before their first edit. Plan
+  `src/sim/regressions/gated-merge-pins-replicas.json`, test in `src/engine/reconcile/reconciler.safety.test.ts`.
+- **SIM-LOST-SEND-IDLE** (`fix-refold`, soak seed 935329097, relay faults: D behind the relay at quiescence): the
+  relay lost D's last live rows before a quiet period (lostSend) and nothing later showed the gap. Two halves. (1) Sim
+  fidelity: the sim session (the wsRelay role) ran no idle liveness, so no VAULT_PING ever brought the head; it now
+  runs wsRelay's probes against the production descriptor (60 s, keepalive mode, 15 s timeout; the relay answers
+  VAULT_KEEPALIVE with VAULT_ALIVE uncharged), and the heal waits while a device behind the head still has an idle
+  head check to come. (2) Client: in keepalive mode only every 10th idle probe was a VAULT_PING, so such a device
+  stayed behind ~10 min; the first idle probe after stream data no pong has covered is now a VAULT_PING
+  (`IdleProbes`, relay-wire §4), bounding it to ~idleMs at one extra ping per quiet period after traffic (a vault
+  with no traffic still pings every 10th probe). Residual, by design: a relay that loses every message of a burst
+  while still answering keepalives leaves the device behind until the 10th probe; production sends cannot be lost
+  selectively on a healthy socket (a failed send means a closed one, which the liveness timeout catches). Plan
+  `src/sim/regressions/lost-send-idle-head-check.json`, tests in `src/engine/adapters/wsRelay.test.ts`,
+  `src/sim/relay-faults.test.ts`, `src/sim/composed.test.ts`.
+- **SIM-CKPT-EPOCH** (`fix-refold`, soak seed 1221634030, invariant 4 "ns refold mismatch"): a real fork, not an
+  oracle bug. An ns checkpoint built in a reset epoch was still in flight (HTTP) when the relay was restored to a
+  pre-reset snapshot; `PUT /streams/checkpoint` named no epoch, so the restored epoch took it, and both devices adopted
+  a fold of rows that epoch never had (deleted / merged entries of the dead log) while a refold of its rows differs. The
+  put now carries `vaultEpoch` (relayHttp, from the session's VAULT_READY) and the server refuses another epoch
+  `409 epoch_mismatch` in the writing turn (relay-wire §8); the sim relay does the same; the engine records nothing
+  and backs off. Plan `src/sim/regressions/checkpoint-put-across-epoch-restore.json`, tests in
+  `src/sim/relay-http.test.ts`, `src/engine/adapters/relayHttp.test.ts`, `tests/server/streams-relay.ts`. The same
+  hole on the read side: a feed / read reply computed after a reset or restore was applied to the old epoch's store
+  (relayHttp never compared the reply's `vaultEpoch`); it now rejects `epoch_mismatch` (the read ends "aborted").
+- **SIM-EPOCH-COMMIT-CRASH** (`fix-epoch`): two losses of an edit typed into an open note whose editor died
+  unsaved, so the store held its only copy. (1) The note renamed first (relay seed 134): the restart's first pass
+  (ns not ready) marked the doc's file gone, and the epoch migration's stranded-edit merge (§c.12 step 5) looked at
+  the synced path only before dropping the old outbox; it now finds the file by rename inference as the planner does.
+  (2) The doc an own create still held after an epoch reset (suite-1 "4 devices, E2EE faults" seed 1): the create
+  folded merged and `reconcileHeld` deleted the merged doc's frames (I1); they now stay until the loser's stream drops
+  (`T_drop_stream`, after the rebind), and the planner writes a loser's replica to its file before rebinding (§c.5).
+  Plans `src/sim/regressions/epoch-rename-crash-stranded-edit.json`, `merged-create-held-edit-lost.json`.
+- **SIM-E2EE-LOG-BUSY** (`fix-epoch`): two kept devices re-keyed after a revoke at once, each under a new RK of its
+  own; the second could not open the first's record (another RK), passed over it as garbage and adopted its own: the
+  vault forked on K_2 (rows failing auth across the fork, A's ns frozen checkpoint-disputed, its log never idle,
+  devices sealing under different epochs, edits lost). A pending revoke in `k` now holds back its epoch's later
+  records as a pending genesis did (e2ee-design §11.3): the device waits revoked-epoch for a QR. Plan
+  `src/sim/regressions/concurrent-revoke-keyring-fork.json`, test `src/engine/keyring/concurrentRevoke.test.ts`.
+- **SIM-REBIND-COLLAPSE** (`fix-epoch`, found by an epoch-reset / crash weighted soak, suite 1 seed 1394654959): an
+  own create merged before it folded has `nsTouchSeq` 0, and the merged-row rebind kept that on the winner's synced
+  record. After an epoch reset, B renamed the winner and an identical re-create folded live at the old path. A read its
+  record (the winner, `nsTouchSeq` 0, still at the old path) as an own create the fold had suffixed, and the
+  identical-loser collapse rebound it onto the new doc and deleted the winner, so the attachment was trashed on every
+  device. The rebind (planner and job) now records the winner's `lastTouchSeq`. Plan
+  `src/sim/regressions/merged-rebind-renamed-winner-collapsed.json`.
 - **CLONED-ID, FRAMENO-IDB** (identity-per-store phases 1–4, `client-remake-next`): a deviceId is used by exactly one
   store, ever. The identity lives in the store (`meta.identity`), data.json holds a pairing grant, a clone or a new
   IndexedDB registers a new device, an IndexedDB loss fences its predecessor and re-issues its mirrored frames, a

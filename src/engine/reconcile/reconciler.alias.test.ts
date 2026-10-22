@@ -184,3 +184,31 @@ test("own restore suffixed, S1 lands after a pass already moved the file to the 
 	assert.deepEqual(w.vault.snapshot(), { "a (2).md": "a\nmine\n", "a.md": "x\n" });
 	assert.ok(res.quiet, "no retried disk rename");
 });
+
+test("merged alias rebind: S on the winner is seen committed, so a remote rename of the winner moves the file, never collapses it", async () => {
+	// Soak seed 1394654959 (suite 1, epoch resets): A's re-create of att/a2.png merged and rebound to the winner with
+	// the loser's nsTouchSeq 0. B renamed the winner; another re-create, still live at att/a2.png, folded after. A's
+	// pass read S (winner, nsTouchSeq 0, at a2.png) as an own create the fold suffixed, and the identical-loser
+	// collapse rebound it onto that doc and deleted the winner: the attachment went to the trash everywhere.
+	const w = new World();
+	await w.boot();
+	w.log.holdNs = true;
+	w.log.mergeIdentical = true;
+	const bytes = new Uint8Array([137, 80, 78, 71, 1, 2, 3, 4]);
+	w.vault.userWrite("att/x.png", bytes);
+	await w.sync();
+	const win = w.log.remoteCreate(P("att/x.png"), bytes);
+	await w.log.flushNs();
+	await w.sync();
+	assert.equal(w.synced(win)?.path, "att/x.png");
+	assert.ok((w.synced(win)?.nsTouchSeq ?? 0) > 0, "S on the winner records the winner's fold");
+	w.log.remoteRename(win, P("att/y.png"));
+	const other = w.log.remoteCreate(P("att/x.png"), bytes);
+	await w.sync();
+	await w.log.flushNs();
+	await w.sync();
+	assert.ok(!w.log.submitted.some((o) => o.t === "delete"), `no delete: ${JSON.stringify(w.log.submitted)}`);
+	assert.equal(w.synced(win)?.path, "att/y.png");
+	assert.deepEqual(w.vault.bytesOf("att/y.png"), bytes, "the attachment is at the winner's new path");
+	assert.ok(w.log.entry(other));
+});

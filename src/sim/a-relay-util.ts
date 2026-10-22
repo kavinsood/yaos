@@ -74,6 +74,13 @@ export interface LinkSpec {
 	readonly uplinkBytesPerSec?: number;
 }
 
+/** The liveness a session's adapter runs (VAULT_READY.liveness, wsRelay): the server's SOCKET_LIVENESS_DESCRIPTOR. */
+export interface SimLiveness {
+	readonly idleMs: number;
+	readonly timeoutMs: number;
+	readonly keepalive: boolean;
+}
+
 export interface SimRelayOptions {
 	/** Default: a real-time clock (setTimeout). Simulations pass a VirtualClock. */
 	readonly clock?: ClockPort;
@@ -101,6 +108,12 @@ export interface SimRelayOptions {
 	/** Default link for every socket (override per device with setLink). */
 	readonly link?: LinkSpec;
 	readonly maxSockets?: number;
+	/**
+	 * Each session's adapter runs wsRelay's idle liveness (VAULT_KEEPALIVE / VAULT_PING after idleMs without a received
+	 * message, a close after timeoutMs without an answer). Default none: the timers never stop, so a clock run until idle
+	 * would not end (the sim world turns it on, net.ts).
+	 */
+	readonly liveness?: SimLiveness;
 }
 
 export interface SimRow extends RelayRow {
@@ -141,6 +154,8 @@ export type DownMsg =
 	| { readonly k: "skipped"; readonly rows: readonly { readonly stream: StreamName; readonly seq: Seq }[] }
 	| { readonly k: "subscribeRejected"; readonly code: "invalid" | "too_many" }
 	| { readonly k: "backpressure" }
+	/** VAULT_ALIVE: the runtime's auto-response to VAULT_KEEPALIVE (server vault.ts setWebSocketAutoResponse). */
+	| { readonly k: "alive" }
 	/** probeId: the VAULT_PING answered, null for an unsolicited pong. */
 	| { readonly k: "pong"; readonly head: Seq; readonly probeId: string | null }
 	| { readonly k: "error"; readonly code: string }
@@ -156,6 +171,8 @@ export type UpMsg =
 	| { readonly k: "append"; readonly wire: Uint8Array; readonly bytes: number }
 	/** STREAM_SUBSCRIBE (text frame of `bytes` bytes). */
 	| { readonly k: "subscribe"; readonly streams: readonly string[]; readonly bytes: number }
+	/** VAULT_KEEPALIVE (fixed text): the runtime answers VAULT_ALIVE without the DO, nothing charged. */
+	| { readonly k: "keepalive" }
 	/** VAULT_PING with a probe id (text frame, not rate-charged). */
 	| { readonly k: "ping"; readonly probeId: string; readonly bytes: number }
 	/** VAULT_REKEYED (text frame): this device rolled the vault key after seeing `removals` removals. */

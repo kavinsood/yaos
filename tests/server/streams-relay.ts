@@ -694,7 +694,7 @@ s.test("read batch: first pages of many streams in request order under one byte 
 	});
 });
 
-s.test("checkpoint: CAS ok, conflict, not advancing, ahead of stream; GC of sealed segments; reads after GC carry the checkpoint", async () => {
+s.test("checkpoint: epoch mismatch; CAS ok, conflict, not advancing, ahead of stream; GC of sealed segments; reads after GC carry the checkpoint", async () => {
 	await withStreams(async ({ connect, append, timers, service, store }) => {
 		const a = connect();
 		for (let index = 0; index < 4; index++) { append(a, "b:gc", `g-${index}`, new Uint8Array(40 * 1024).fill(index + 1)); timers.advance(300); }
@@ -707,7 +707,12 @@ s.test("checkpoint: CAS ok, conflict, not advancing, ahead of stream; GC of seal
 				new URL(`https://do/streams/checkpoint?${query}`));
 			return { status: response.status, body: await response.json() as Record<string, unknown> };
 		};
-		const ok = await put("stream=b:gc&coversSeq=4&expectedCoversSeq=0", bytes("checkpoint-at-4"));
+		// The client's epoch is checked in the writing turn: a put built in another epoch (in flight across a reset or
+		// restore) is refused and writes nothing; a matching one, or one naming no epoch (older clients), is taken.
+		const stale = await put("stream=b:gc&coversSeq=4&expectedCoversSeq=0&vaultEpoch=old-epoch", bytes("other-epoch"));
+		assert.deepEqual(stale, { status: 409, body: { error: "epoch_mismatch", vaultEpoch: GENERATION } });
+		assert.equal(store.tableCounts().segments, segmentsBefore, "nothing collected");
+		const ok = await put(`stream=b:gc&coversSeq=4&expectedCoversSeq=0&vaultEpoch=${encodeURIComponent(GENERATION)}`, bytes("checkpoint-at-4"));
 		assert.equal(ok.status, 200);
 		assert.equal(ok.body.coversSeq, 4);
 		assert.ok((ok.body.deletedSegments as number) >= 1, "sealed segments at or below coversSeq are deleted");
