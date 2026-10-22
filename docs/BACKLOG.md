@@ -108,10 +108,23 @@ From [DECISIONS](server-rewrite/DECISIONS.md) §8, still open:
 ## 5. Open sim failures
 
 Each has a minimized plan in `src/sim/open-repros/` (README there: replay with `npm run sim:replay -- <file>`; not
-replayed by the regressions test). All checked still failing on `integrate-3` (2026-10-21); "base" = also failing on
+replayed by the regressions test). All checked still failing on `integrate-3` (2026-10-22); "base" = also failing on
 `client-remake-next` 6a1fb3e5 before the reclaim / generators / governance merges.
 
-None open on `integrate-3` after the fix-refold / fix-prune / fix-s1edit / fix-integrity merges.
+No data-loss failure open on `integrate-3`. One resurrection (no text lost) stays open:
+
+### SIM-S1-HELD-EDIT-UNOBSERVED-RENAME: a key-missing edit, then a rename and an edit nobody saw
+
+- **Repro.** `gated-edit-renamed-and-edited-unobserved.json` (suite-1 wipe/revoke/roll seed 112, 30 steps; base).
+- **What happens.** B, key-missing after a revoke, deletes a canvas record (the merge is refused: kept as
+  `SyncedEntry.heldHash`). Its store is wiped (mirrors kept). While the app is down the canvas is renamed c0 -> c5
+  and edited again. Back up, c5 pairs with nothing (its hash is neither S's nor the held one): delete + create.
+  A peer had edited c0, so edit beats delete restores the doc at c0, with the record B deleted.
+- **Not data loss.** Every text B wrote is in c5 (a doc of its own); c0 holds the peer's edit. The invariant flags
+  the deleted record back in its doc.
+- **Why open.** Pairing the files needs similarity inference, which DESIGN §f.6 rejects (non-deterministic,
+  expensive). The held edit could be published when the gate opens if the store (and the synced mirror) kept its
+  text, not just its hash: a format and design change for the owner to decide.
 
 ## Landed on `sim-port` since 33bdf49b
 
@@ -187,6 +200,58 @@ Kept here until `sim-port` merges; then git history holds them.
   later record of its epoch, the own one included (e2ee-design §11.3); re-sealed ns / cfg
   records take a fresh id, and own receipts are judged by the committed bytes' keyEpoch (§14.2 step 4). Regression
   `s1-mutual-revoke-canvas-create.json`.
+- **SIM-S1-FROZEN-RENAME** (integrate-3, 44a9c511; wipe/revoke/roll sweep, suite 1 seed 40, minimized): a canvas
+  frozen key-missing, edited and renamed, became a new doc at the new path and came back at the old one with a record
+  the user had deleted. The planner's frozen branch now claims the doc's inferred rename target and records a file
+  gone from a complete listing as liveMissing does (fileGone, renamedTo), so the pass that drops the observed renames
+  keeps this one; runPlan asks the write gate before it commits a create's born-empty S. Tests in
+  `planner.test.ts` and `reconciler.safety.test.ts`; plan `frozen-renamed-canvas-split-and-resurrected.json`.
+- **SIM-S1-K-DAILY-IDLE** (integrate-3, c37b6c32; suite 1 seed 102): an own `k` append refused `cf_daily_limit` was
+  resent by the keyring runtime 45 s later, after the engine had reported idle (isIdle counted only the outbox).
+  `KeyringRuntime.busy()` covers own `k` appends on the wire and a pending daily-limit resend. Test in
+  `suite1Engine.test.ts`; plan `keyring-daily-limit-resend-after-quiescence.json`.
+- **SIM-S1-UNFRAMED-MATERIALIZE** (integrate-3, 4c1819ae; suite 1 seed 6, non-convergence): a revoked device's typing
+  (frames refused at the gate) was in the replica when the doc materialized; S recorded that text at the version
+  without it, the restart dropped it from the replica and the file kept it as synced. `framedVersion` frames open
+  edits before a materialize records S, and the job writes nothing while the gate is shut. Test in
+  `reconciler.safety.test.ts`; plan `revoked-typing-materialized-as-synced.json`.
+- **SIM-S1-UNTRACKED-RENAME** (integrate-3, cb98904a + fc56bf53; suite 1 seed 40 after an epoch restore): an
+  untracked file of a remote doc (no S: the restore dropped it) renamed before its first merge became a new doc, and
+  the doc came back at the old path. The planner pairs the rename with the remote doc (`movedUntracked`: nsRename,
+  then a no-base merge against the epoch's path base) and keeps the observed rename while the doc waits
+  (`Plan.keepRenames`). Tests in `planner.test.ts`, `reconciler.epoch.test.ts`; plans
+  `epoch-restore-untracked-canvas-renamed.json`, `epoch-restore-untracked-rename-dropped-while-waiting.json`.
+- **SIM-SUSPEND-KILL-SKIPPED** (integrate-3, a9b8a8a2; soak 2021329329 #253, harness): a suspend-kill skipped because
+  the app was already down left the workspace's saves blocked, so a later edit never reached disk. The fault now
+  unblocks saves when it does not kill. Plan `suspend-kill-skipped-saves-blocked.json`.
+- **SIM-S1-GATED-RENAME** (integrate-3, 8ebbf5fb; suite 1 seed 112): an observed rename whose nsRename the write gate
+  refused lived in memory only; an engine crash lost it and the renamed file became a new doc. The runner keeps it on
+  the synced record (fileGone, renamedTo) before it rethrows. Test in `reconciler.safety.test.ts`; plan
+  `gated-rename-lost-on-engine-crash.json`.
+- **SIM-S1-MIRROR-MARKS** (integrate-3; suite 1 seeds 40 and 112): the marks a record keeps of a file this device
+  could not publish (fileGone, renamedTo) were not in the synced mirror, and the mirror was a 2 s debounce behind:
+  an IDB loss read the moved file as a new doc and put the old one back. Synced mirror format 2 carries fileGone,
+  renamedTo and heldHash; `runPass` writes the mirror at once when a pass (gated or not) changes a record's marks, and
+  the outbox mirror's writer asks for it when a doc's own records leave it (`MirrorWriter.onUnmirrored`: a stale
+  commit's unsealed copy, with no synced record of the doc yet). A pass the gate stops at another doc's ns op still
+  commits the plan's marks (`keepObservedRenames`). Tests in `mirrors.test.ts`, `mirrorIo.test.ts`,
+  `syncedMirrorOrder.test.ts`, `reconciler.safety.test.ts`; plans `unsealed-copy-leaves-outbox-mirror-before-synced-record.json`,
+  `frozen-rename-mark-lost-in-synced-mirror-debounce.json`, `gate-stops-pass-before-gone-mark.json`.
+- **SIM-S1-HELD-EDIT** (integrate-3; suite 1 seed 112): a canvas edit the write gate refused, then a rename while the
+  app was down after an IDB loss: by S's content the renamed file was new, and a peer's edit restored the doc at its
+  old path with the record deleted. The runner keeps the refused content's hash on S (`heldHash`, dropped with the
+  next sync point), mirrored, and rename inference pairs by it. Tests in `planner.test.ts`,
+  `reconciler.safety.test.ts`; plan `gated-edit-renamed-while-down-after-wipe.json`.
+- **SIM-S1-REVOKER-STALE-ROW** (integrate-3; suite 1 seed 40, non-convergence): a revoked device's frame sealed
+  under the old epoch, committed past the revoke, reached the revoker before its own revoke's receipt; judged with no
+  revoke known it was applied, while every other reader ignored it as stale (the revoker's replica and checkpoints
+  kept the edit). The revoker now holds other devices' rows sealed below its revoke until the record shows in `k`
+  (e2ee-design §14.3). Test in `staleEpoch.test.ts`; plan `revoker-applies-stale-row-before-own-receipt.json`.
+- **SOAK-RENAMED-AWAY-TAKES-NEW-FILE** (integrate-3; soak 1307815726 #30, data loss): offline, C renamed a canvas
+  away while a peer moved its doc to c0, then created a new c0. The file at the doc's remote path was read as the
+  doc's own: the new canvas merged into the doc over D's edge and resize (lost), and the renamed canvas became a new
+  doc. The planner takes a file at the remote path only when no known rename took S's file elsewhere. Test in
+  `planner.test.ts`; plan `renamed-away-doc-takes-new-file-at-moved-path.json`.
 - **Canvas concurrent record create** (`fix-integrity`, fix-epoch soak `971197958-35`): after an epoch reset C
   re-created a canvas empty, and A and D each merged their file into it before seeing the other's rows. A record
   new to a replica is a new Y.Map, so the two maps competed and A's survived whole; D's synced base kept D's colour
