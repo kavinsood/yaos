@@ -69,7 +69,7 @@ export const tests: TestDef[] = [
 					&& Number.isFinite(err?.resetAt) && Array.isArray(err?.clientFrameIds) && got.receipts.size === 0,
 				{ code: err?.code ?? null, resetAt: typeof err?.resetAt, receipts: got.receipts.size });
 				t.check("no PROVISIONAL broadcast to peers", !b.frames(fromB).some((f) => f.kind === "provisional"));
-				const ck = await http(ctx, "PUT", checkpointPath(v.path, "b:daily", 1, 0), { token: v.owner.token, body: payloadOf("ck", 16) });
+				const ck = await http(ctx, "PUT", checkpointPath(v.path, "b:daily", 1, 0, v.vaultGeneration), { token: v.owner.token, body: payloadOf("ck", 16) });
 				t.info("checkpoint while latched", brief(ck, { retryAfter: ck.headers.get("retry-after") }));
 			} finally {
 				const off = await http(ctx, "POST", `${v.path}/debug/simulate-daily-limit`, { token: v.owner.token, json: { enabled: false } });

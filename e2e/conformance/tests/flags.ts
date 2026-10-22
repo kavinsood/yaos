@@ -148,7 +148,7 @@ export const tests: TestDef[] = [
 				["pairing-code", () => http(ctx, "POST", `${path}/auth/pairing-code`, { token, json: { purpose: "device" } })],
 				["feed", () => http(ctx, "GET", `${path}/streams/feed?after=0`, { token })],
 				["read", () => readPage(ctx, `${path}/streams/read?stream=ns&after=0`, { token })],
-				["checkpoint", () => http(ctx, "PUT", checkpointPath(path, "ns", 1, 0), { token, body: payloadOf("ck", 16) })],
+				["checkpoint", () => http(ctx, "PUT", checkpointPath(path, "ns", 1, 0, "unknown-vault-epoch"), { token, body: payloadOf("ck", 16) })],
 			];
 			for (const [name, run] of cases) {
 				const response = await run();

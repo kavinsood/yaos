@@ -380,8 +380,8 @@ s.test("H2 GC'd originals: a windowed original at or below gcSeq answers deduped
 		const frame = (index: number): StreamAppendInput => ({ stream: "b:gc", deviceId: "device-a", clientFrameId: `gc-${index}`,
 			payload: new Uint8Array(70 * 1024).fill(index) });
 		for (let index = 1; index <= 3; index++) store.commit([frame(index)]);
-		const response = await service.putCheckpoint(new Request("https://do/streams/checkpoint?stream=b:gc&coversSeq=2&expectedCoversSeq=0",
-			{ method: "PUT", body: bytes("ckpt") }), new URL("https://do/streams/checkpoint?stream=b:gc&coversSeq=2&expectedCoversSeq=0"));
+		const response = await service.putCheckpoint(new Request(`https://do/streams/checkpoint?stream=b:gc&coversSeq=2&expectedCoversSeq=0&vaultEpoch=${GENERATION}`,
+			{ method: "PUT", body: bytes("ckpt") }), new URL(`https://do/streams/checkpoint?stream=b:gc&coversSeq=2&expectedCoversSeq=0&vaultEpoch=${GENERATION}`));
 		assert.equal(response.status, 200);
 		assert.equal(((await response.json()) as { gcSeq: number }).gcSeq, 2);
 		assert.equal(store.commit([frame(1)]).outcomes[0]!.kind, "deduped", "warm index");
@@ -776,7 +776,7 @@ s.test("H6 T-RATE-DEVICE / T-RATE-SOCKET: one bucket per device shared by its so
 s.test("H7 T-RETIRED-GC / T-PARTIAL-GC: a checkpoint at lastSeq drops the open segment too (gcSeq = lastSeq, 1 head row billed)", async () => {
 	await withStreams(async ({ store, service, model }) => {
 		const put = async (stream: string, coversSeq: number, expected: number, body: Uint8Array) => {
-			const url = `https://do/streams/checkpoint?stream=${stream}&coversSeq=${coversSeq}&expectedCoversSeq=${expected}`;
+			const url = `https://do/streams/checkpoint?stream=${stream}&coversSeq=${coversSeq}&expectedCoversSeq=${expected}&vaultEpoch=${GENERATION}`;
 			const response = await service.putCheckpoint(new Request(url, { method: "PUT", body }), new URL(url));
 			return { status: response.status, body: await response.json() as Record<string, unknown> };
 		};

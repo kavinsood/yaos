@@ -552,7 +552,8 @@ session's `VAULT_READY.vaultEpoch`). The server cannot check the merge, but it c
 **Epoch rule.** In the writing turn (after the body read and the device check), an `E` other than the vault's current
 epoch is refused `409 epoch_mismatch` `{vaultEpoch}` and nothing is written: a put in flight across a reset or a
 restore (D8b) must not land in the new epoch, whose rows its bytes do not merge (every reader would adopt it and fold
-a dead log). A put without `vaultEpoch` (older clients) is not checked.
+a dead log). `vaultEpoch` is required: a put without it (or with an empty one) is refused `400 invalid_vault_epoch`
+before the body is read.
 
 **CAS rule.** The put succeeds iff the current `checkpointSeq == M`, `N > M`, and `N ≤ lastSeq`.
 
@@ -564,7 +565,7 @@ a dead log). A put without `vaultEpoch` (older clients) is not checked.
 | `400 checkpoint_not_advancing` | `N ≤ M` |
 | `409 checkpoint_ahead_of_stream` | `{lastSeq}` |
 | `404 stream_not_found` | The stream has no rows. |
-| `400 invalid_stream` / `invalid_covers_seq` (N < 1) / `invalid_expected_covers_seq` | |
+| `400 invalid_stream` / `invalid_covers_seq` (N < 1) / `invalid_expected_covers_seq` / `invalid_vault_epoch` | |
 | `413 body_too_large` / `503 cf_daily_limit` | |
 
 **GC on success.**
@@ -941,8 +942,9 @@ export type CheckpointResponse =
   | { error: "checkpoint_conflict"; current: { coversSeq: number } }                          // 409
   | { error: "checkpoint_ahead_of_stream"; lastSeq: number; current: { coversSeq: number } }  // 409
   | { error: "checkpoint_not_advancing"; current: { coversSeq: number } }                     // 400
+  | { error: "epoch_mismatch"; vaultEpoch: string }                                            // 409
   | { error: "stream_not_found" }                                                             // 404
-  | { error: "invalid_stream" | "invalid_covers_seq" | "invalid_expected_covers_seq" | "body_too_large" }
+  | { error: "invalid_stream" | "invalid_covers_seq" | "invalid_expected_covers_seq" | "invalid_vault_epoch" | "body_too_large" }
   | { error: "cf_daily_limit"; kind: string; resetAt: number; message: string };              // 503
 
 export const STREAM_CLOSE = {

@@ -1197,10 +1197,10 @@ export class StreamRelayService {
 	}
 
 	/**
-	 * PUT /streams/checkpoint?stream=X&coversSeq=N&expectedCoversSeq=M[&vaultEpoch=E], body = opaque checkpoint bytes.
+	 * PUT /streams/checkpoint?stream=X&coversSeq=N&expectedCoversSeq=M&vaultEpoch=E, body = opaque checkpoint bytes.
 	 * `admitted` runs after the body read, in the writing turn: a device revoked during the read gets 401, nothing
-	 * written (D7). An `E` other than the current epoch gets 409 epoch_mismatch, nothing written; a client that
-	 * names no epoch (older builds) is not checked.
+	 * written (D7). `E` is required (400 invalid_vault_epoch when missing or empty): an `E` other than the current
+	 * epoch gets 409 epoch_mismatch in the writing turn, nothing written.
 	 */
 	async putCheckpoint(request: Request, url: URL, admitted: () => boolean = () => true): Promise<Response> {
 		const stream = url.searchParams.get("stream");
@@ -1209,6 +1209,9 @@ export class StreamRelayService {
 		const expected = nonNegativeInteger(url.searchParams.get("expectedCoversSeq"), -1);
 		if (coversSeq === null || coversSeq < 1) return json({ error: "invalid_covers_seq" }, 400);
 		if (expected === null || expected < 0) return json({ error: "invalid_expected_covers_seq" }, 400);
+		// The epoch the client built the checkpoint in (relay-wire §8): required, or a put could land in any epoch.
+		const vaultEpoch = url.searchParams.get("vaultEpoch");
+		if (!vaultEpoch) return json({ error: "invalid_vault_epoch" }, 400);
 		let bytes: Uint8Array;
 		try { bytes = await readBoundedBytes(request, MAX_STREAM_CHECKPOINT_BYTES, { allowEmpty: true }); }
 		catch (error) {
@@ -1216,10 +1219,9 @@ export class StreamRelayService {
 			return json({ error: kind }, kind === "body_too_large" ? 413 : 400);
 		}
 		if (!admitted()) return json({ error: "unauthorized" }, 401);
-		// The epoch the client built the checkpoint in, checked in the writing turn: a put that was in flight across a
-		// reset or restore must not land in the new epoch, whose rows its bytes do not merge (relay-wire §8).
-		const vaultEpoch = url.searchParams.get("vaultEpoch");
-		if (vaultEpoch !== null && vaultEpoch !== this.options.vaultGeneration()) {
+		// Checked in the writing turn: a put that was in flight across a reset or restore must not land in the new
+		// epoch, whose rows its bytes do not merge (relay-wire §8).
+		if (vaultEpoch !== this.options.vaultGeneration()) {
 			return json({ error: "epoch_mismatch", vaultEpoch: this.options.vaultGeneration() }, 409);
 		}
 		return this.dailyLimitAware(() => {

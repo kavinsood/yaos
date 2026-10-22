@@ -561,7 +561,7 @@ s.test("D7 races: a revoke while a handler awaits crypto or a body wins; nothing
 			},
 		}, { highWaterMark: 0 });
 		const checkpoint = await object.host.fetch(new Request(
-			`${INTERNAL}/streams/checkpoint?stream=ns&coversSeq=1&expectedCoversSeq=0`,
+			`${INTERNAL}/streams/checkpoint?stream=ns&coversSeq=1&expectedCoversSeq=0&vaultEpoch=${encodeURIComponent(object.host.load()!.meta.vaultGeneration)}`,
 			{ method: "PUT", headers: bearer(victim), body, duplex: "half" } as RequestInit));
 		assert.equal(checkpoint.status, 401, "revoke during the checkpoint body read");
 		assert.deepEqual([...object.model.totals.byTable], [["vault_meta", 1], ["device", 1], ["retired_device", 1]],

@@ -103,7 +103,7 @@ export const tests: TestDef[] = [{
 		t.check("read paginated by maxBytes (>= 4 pages)", pages >= 4, pages);
 
 		// checkpoint CAS table
-		const q = (stream: string, n: number, m: number) => `${v.path}/streams/checkpoint?stream=${encodeURIComponent(stream)}&coversSeq=${n}&expectedCoversSeq=${m}`;
+		const q = (stream: string, n: number, m: number) => `${v.path}/streams/checkpoint?stream=${encodeURIComponent(stream)}&coversSeq=${n}&expectedCoversSeq=${m}&vaultEpoch=${encodeURIComponent(v.vaultGeneration)}`;
 		const ckpt = payloadOf("checkpoint", 4096);
 		const ok = await http(ctx, "PUT", q(doc, lastSeq, 0), { token: A.token, body: ckpt });
 		t.check("checkpoint 200", ok.status === 200 && ok.value?.coversSeq === lastSeq && typeof ok.value?.gcSeq === "number",

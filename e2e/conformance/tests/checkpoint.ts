@@ -45,7 +45,7 @@ async function epochOk(ctx: Ctx, t: Recorder, epochParam: string) {
 	t.check("feed 200", feed.status === 200 && Array.isArray(feed.value?.changes), brief(feed));
 	const read = await readPage(ctx, `${v.path}/streams/read?stream=${encodeURIComponent(seeded.stream)}&after=0${epochParam}`, { token });
 	t.check("read 200 with rows", read.status === 200 && read.value?.rows?.length === 2, brief(read, { rows: read.value?.rows?.length }));
-	const put = await http(ctx, "PUT", checkpointPath(v.path, seeded.stream, seeded.seqs[1]!, 0, epochParam), { token, body: payloadOf("ck", 64) });
+	const put = await http(ctx, "PUT", checkpointPath(v.path, seeded.stream, seeded.seqs[1]!, 0, await currentEpoch(ctx, v), epochParam), { token, body: payloadOf("ck", 64) });
 	t.check("checkpoint 200", put.status === 200 && put.value?.coversSeq === seeded.seqs[1], brief(put));
 	const state = await checkpointState(ctx, v, seeded.stream);
 	t.check("checkpoint applied", state.checkpointSeq === seeded.seqs[1], state);
@@ -67,7 +67,7 @@ export const tests: TestDef[] = [
 				mismatch(t, `read epoch=${label}`, await readPage(ctx,
 					`${v.path}/streams/read?stream=${encodeURIComponent(rd.stream)}&after=0${q}`, { token }), epoch);
 				const ck = await seedStream(ctx, v, `epc${label[0]}`, 1);
-				const put = await http(ctx, "PUT", checkpointPath(v.path, ck.stream, ck.seqs[0]!, 0, q), { token, body: payloadOf("ck", 64) });
+				const put = await http(ctx, "PUT", checkpointPath(v.path, ck.stream, ck.seqs[0]!, 0, epoch, q), { token, body: payloadOf("ck", 64) });
 				mismatch(t, `checkpoint epoch=${label}`, put, epoch);
 				const state = await checkpointState(ctx, v, ck.stream);
 				t.check(`checkpoint epoch=${label} not applied`, state.checkpointSeq === 0 && state.checkpoint === null, state);
@@ -91,12 +91,34 @@ export const tests: TestDef[] = [
 		},
 	},
 	{
+		id: "T-CKPT-VAULT-EPOCH", group: "decision", area: "relay-wire §8 epoch rule", expectedBefore: "FAIL",
+		async run(ctx, t) {
+			const v = await vault(ctx, "main");
+			const epoch = await currentEpoch(ctx, v);
+			const token = v.owner.token;
+			t.expect("checkpoint vaultEpoch required: missing or empty -> 400 invalid_vault_epoch; another -> 409 epoch_mismatch {vaultEpoch}; neither applied");
+			for (const [label, value] of [["missing", null], ["empty", ""]] as const) {
+				const ck = await seedStream(ctx, v, `cve${label[0]}`, 1);
+				const put = await http(ctx, "PUT", checkpointPath(v.path, ck.stream, ck.seqs[0]!, 0, value), { token, body: payloadOf("ck", 64) });
+				t.check(`vaultEpoch ${label} -> 400 invalid_vault_epoch`, put.status === 400 && put.value?.error === "invalid_vault_epoch", brief(put));
+				const state = await checkpointState(ctx, v, ck.stream);
+				t.check(`vaultEpoch ${label}: not applied`, state.checkpointSeq === 0 && state.checkpoint === null, state);
+			}
+			const ck = await seedStream(ctx, v, "cvew", 1);
+			const put = await http(ctx, "PUT", checkpointPath(v.path, ck.stream, ck.seqs[0]!, 0, `${epoch}x`), { token, body: payloadOf("ck", 64) });
+			t.check("another vaultEpoch -> 409 epoch_mismatch {vaultEpoch: current}", put.status === 409 && put.value?.error === "epoch_mismatch"
+				&& put.value?.vaultEpoch === epoch, brief(put));
+			const state = await checkpointState(ctx, v, ck.stream);
+			t.check("another vaultEpoch: not applied", state.checkpointSeq === 0 && state.checkpoint === null, state);
+		},
+	},
+	{
 		id: "T-CKPT-MULTICHUNK", group: "baseline", area: "baseline", expectedBefore: "PASS",
 		async run(ctx, t) {
 			const v = await vault(ctx, "main");
 			const seeded = await seedStream(ctx, v, "ck", 1);
 			const bytes = payloadOf(`multichunk-${id(4)}`, 2_500_000);
-			const put = await http(ctx, "PUT", checkpointPath(v.path, seeded.stream, seeded.seqs[0]!, 0), { token: v.owner.token, body: bytes,
+			const put = await http(ctx, "PUT", checkpointPath(v.path, seeded.stream, seeded.seqs[0]!, 0, await currentEpoch(ctx, v)), { token: v.owner.token, body: bytes,
 				timeoutMs: 120000 });
 			t.expect("PUT 2.5 MB checkpoint -> 200; read checkpoint=1 returns identical bytes");
 			t.check("PUT 200", put.status === 200 && put.value?.coversSeq === seeded.seqs[0], brief(put));
@@ -113,7 +135,7 @@ export const tests: TestDef[] = [
 			const v = await vault(ctx, "gc", ["A", "B"]);
 			const seeded = await seedStream(ctx, v, "rgc", 3);
 			const lastSeq = seeded.seqs[2]!;
-			const put = await http(ctx, "PUT", checkpointPath(v.path, seeded.stream, lastSeq, 0), { token: v.owner.token, body: payloadOf("rgc-ck", 128) });
+			const put = await http(ctx, "PUT", checkpointPath(v.path, seeded.stream, lastSeq, 0, await currentEpoch(ctx, v)), { token: v.owner.token, body: payloadOf("rgc-ck", 128) });
 			t.expect("checkpoint coversSeq=lastSeq -> gcSeq == lastSeq; read after=0 (no checkpoint=1) -> checkpoint included, rows empty; "
 				+ "next append readable after old lastSeq");
 			t.check("checkpoint 200 with gcSeq == lastSeq", put.status === 200 && put.value?.gcSeq === lastSeq,
@@ -135,7 +157,7 @@ export const tests: TestDef[] = [
 			const v = await vault(ctx, "gc", ["A", "B"]);
 			const seeded = await seedStream(ctx, v, "pgc", 5);
 			const covers = seeded.seqs[2]!;
-			const put = await http(ctx, "PUT", checkpointPath(v.path, seeded.stream, covers, 0), { token: v.owner.token, body: payloadOf("pgc-ck", 128) });
+			const put = await http(ctx, "PUT", checkpointPath(v.path, seeded.stream, covers, 0, await currentEpoch(ctx, v)), { token: v.owner.token, body: payloadOf("pgc-ck", 128) });
 			t.expect("checkpoint coversSeq < lastSeq -> rows above coversSeq stay readable (byte-identical)");
 			t.check("checkpoint 200", put.status === 200 && put.value?.coversSeq === covers, brief(put, { gcSeq: put.value?.gcSeq ?? null }));
 			const above = await readAll(ctx, v.path, device(v, "B").token, seeded.stream, covers);

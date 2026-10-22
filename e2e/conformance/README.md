@@ -39,6 +39,7 @@ node e2e/conformance/run.ts --host https://<worker>.workers.dev --label <label> 
 | T-OVERSIZE-1009 | A frame over 1 MiB + 1 KiB → close 1009 |
 | T-TWO-SOCKETS | Two sockets for the same device both receive peer broadcasts |
 | T-DEDUPE-CONFLICT | The same clientFrameId with different bytes → `STREAM_APPEND_REJECTED client_frame_id_conflict` (seq = the original when present) |
+| T-CKPT-VAULT-EPOCH | Checkpoint `vaultEpoch` required: missing / empty → 400 `invalid_vault_epoch`, another epoch → 409 `epoch_mismatch`; nothing applied |
 | T-CKPT-MULTICHUNK | A 2.5 MB checkpoint round-trips byte-identical |
 | T-PARTIAL-GC | Checkpoint below lastSeq: the rows above stay readable |
 | T-SUBSCRIBE-READY | VAULT_READY `limits.maxSubscriptions = 128` |

@@ -30,6 +30,8 @@ interface HotContext {
 	ticket: string;
 	/** An unused owner code, minted before the loop. */
 	pairingCode: string;
+	/** The vault's current epoch (a checkpoint put names it, relay-wire §8). */
+	vaultEpoch: string;
 }
 
 interface HotPath {
@@ -49,8 +51,8 @@ const HOT_PATHS: HotPath[] = [
 		request: ({ vaultId, device }) => new Request(`${ORIGIN}/vault/${vaultId}/streams/read?stream=ns&after=0`,
 			{ headers: bearer(device) }) },
 	{ name: "checkpoint", status: 200,
-		request: ({ vaultId, device }) => new Request(
-			`${ORIGIN}/vault/${vaultId}/streams/checkpoint?stream=ns&coversSeq=1&expectedCoversSeq=0`, {
+		request: ({ vaultId, device, vaultEpoch }) => new Request(
+			`${ORIGIN}/vault/${vaultId}/streams/checkpoint?stream=ns&coversSeq=1&expectedCoversSeq=0&vaultEpoch=${encodeURIComponent(vaultEpoch)}`, {
 				method: "PUT", headers: { ...bearer(device), "Content-Type": "application/octet-stream" },
 				body: new Uint8Array([1, 2, 3]),
 			}) },
@@ -115,7 +117,8 @@ s.test("T-HOTPATH: the ten device paths reach only their vault DO; zero config-D
 		const { ticket } = await issued.json() as { ticket: string };
 		const minted = await vault.host.mintOwnerCode("owner-bootstrap");
 		assert.ok(minted);
-		const context: HotContext = { vaultId, device: owner, ticket, pairingCode: minted.pairingCode };
+		const context: HotContext = { vaultId, device: owner, ticket, pairingCode: minted.pairingCode,
+			vaultEpoch: vault.host.load()!.meta.vaultGeneration };
 		const config = recordingConfigNamespace({ claimed: true });
 		const bucket = new FakeBucket();
 		const env = { YAOS_VAULT: cluster.namespace(), YAOS_CONFIG: config.namespace, YAOS_BUCKET: bucket.asR2() } as WorkerEnv;

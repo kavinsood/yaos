@@ -32,9 +32,11 @@ function tableCounts(vault: VaultObject): { heads: number; segments: number; che
 	return { heads: count("stream_head"), segments: count("stream_segment"), checkpoints: count("stream_checkpoint") };
 }
 
+/** A checkpoint put naming the vault's current epoch (relay-wire §8: `vaultEpoch` is required). */
 function checkpoint(world: World, vaultId: string, device: DeviceSeed, query: string, body = new Uint8Array([5, 5])):
 	Promise<Response> {
-	return deviceFetch(world, vaultId, device, `streams/checkpoint?${query}`,
+	const vaultEpoch = world.cluster.objects.get(vaultId)!.host.load()!.meta.vaultGeneration;
+	return deviceFetch(world, vaultId, device, `streams/checkpoint?${query}&vaultEpoch=${encodeURIComponent(vaultEpoch)}`,
 		{ method: "PUT", body, headers: { "Content-Type": "application/octet-stream" } });
 }
 

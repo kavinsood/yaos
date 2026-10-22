@@ -702,17 +702,23 @@ s.test("checkpoint: epoch mismatch; CAS ok, conflict, not advancing, ahead of st
 		timers.advance(300);
 		const segmentsBefore = store.tableCounts().segments;
 		assert.ok(segmentsBefore >= 1);
-		const put = async (query: string, body: Uint8Array) => {
+		// `query` without vaultEpoch gets the current one; `raw` sends it as is.
+		const putRaw = async (query: string, body: Uint8Array) => {
 			const response = await service.putCheckpoint(new Request(`https://do/streams/checkpoint?${query}`, { method: "PUT", body }),
 				new URL(`https://do/streams/checkpoint?${query}`));
 			return { status: response.status, body: await response.json() as Record<string, unknown> };
 		};
-		// The client's epoch is checked in the writing turn: a put built in another epoch (in flight across a reset or
-		// restore) is refused and writes nothing; a matching one, or one naming no epoch (older clients), is taken.
-		const stale = await put("stream=b:gc&coversSeq=4&expectedCoversSeq=0&vaultEpoch=old-epoch", bytes("other-epoch"));
+		const put = (query: string, body: Uint8Array) => putRaw(`${query}&vaultEpoch=${encodeURIComponent(GENERATION)}`, body);
+		// The client's epoch is required and checked in the writing turn: a put naming no epoch (or an empty one) is
+		// refused 400, one built in another epoch (in flight across a reset or restore) 409; neither writes anything.
+		for (const q of ["stream=b:gc&coversSeq=4&expectedCoversSeq=0", "stream=b:gc&coversSeq=4&expectedCoversSeq=0&vaultEpoch="]) {
+			assert.deepEqual(await putRaw(q, bytes("no-epoch")), { status: 400, body: { error: "invalid_vault_epoch" } }, q);
+		}
+		const stale = await putRaw("stream=b:gc&coversSeq=4&expectedCoversSeq=0&vaultEpoch=old-epoch", bytes("other-epoch"));
 		assert.deepEqual(stale, { status: 409, body: { error: "epoch_mismatch", vaultEpoch: GENERATION } });
 		assert.equal(store.tableCounts().segments, segmentsBefore, "nothing collected");
-		const ok = await put(`stream=b:gc&coversSeq=4&expectedCoversSeq=0&vaultEpoch=${encodeURIComponent(GENERATION)}`, bytes("checkpoint-at-4"));
+		assert.equal(store.tableCounts().checkpointChunks, 0, "nothing written");
+		const ok = await put("stream=b:gc&coversSeq=4&expectedCoversSeq=0", bytes("checkpoint-at-4"));
 		assert.equal(ok.status, 200);
 		assert.equal(ok.body.coversSeq, 4);
 		assert.ok((ok.body.deletedSegments as number) >= 1, "sealed segments at or below coversSeq are deleted");
@@ -753,7 +759,7 @@ s.test("binary read (relay-wire §7.2): raw rows and checkpoints in the binary b
 		append(a, "b:one", "o-2", "two");
 		append(a, "b:two", "t-1", "three");
 		timers.advance(300);
-		const ckpt = "stream=b:two&coversSeq=3&expectedCoversSeq=0";
+		const ckpt = `stream=b:two&coversSeq=3&expectedCoversSeq=0&vaultEpoch=${GENERATION}`;
 		assert.equal((await service.putCheckpoint(new Request(`https://do/streams/checkpoint?${ckpt}`, { method: "PUT", body: bytes("ck") }),
 			new URL(`https://do/streams/checkpoint?${ckpt}`))).status, 200);
 		const single = await readReply(service.read(new URL("https://do/streams/read?stream=b:one&after=0&maxBytes=1")));

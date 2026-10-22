@@ -143,7 +143,8 @@ Kept here until `sim-port` merges; then git history holds them.
   a fold of rows that epoch never had (deleted / merged entries of the dead log) while a refold of its rows differs. The
   put now carries `vaultEpoch` (relayHttp, from the session's VAULT_READY) and the server refuses another epoch
   `409 epoch_mismatch` in the writing turn (relay-wire §8); the sim relay does the same; the engine records nothing
-  and backs off. Plan `src/sim/regressions/checkpoint-put-across-epoch-restore.json`, tests in
+  and backs off. `vaultEpoch` is required (integrate-3: a put without it is `400 invalid_vault_epoch`, no
+  unchecked path for older clients). Plan `src/sim/regressions/checkpoint-put-across-epoch-restore.json`, tests in
   `src/sim/relay-http.test.ts`, `src/engine/adapters/relayHttp.test.ts`, `tests/server/streams-relay.ts`. The same
   hole on the read side: a feed / read reply computed after a reset or restore was applied to the old epoch's store
   (relayHttp never compared the reply's `vaultEpoch`); it now rejects `epoch_mismatch` (the read ends "aborted").

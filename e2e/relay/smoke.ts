@@ -542,12 +542,12 @@ async function main() {
 	step("checkpoint CAS + GC");
 	const ckpt = payloadOf("checkpoint state vector + merged doc", 4096);
 	const tc = now();
-	const put = await http("PUT", `${vaultPath}/streams/checkpoint?stream=${encodeURIComponent(doc)}&coversSeq=${lastSeq}&expectedCoversSeq=0`,
+	const put = await http("PUT", `${vaultPath}/streams/checkpoint?stream=${encodeURIComponent(doc)}&coversSeq=${lastSeq}&expectedCoversSeq=0&vaultEpoch=${encodeURIComponent(vault.vaultGeneration)}`,
 		{ token: vault.a.deviceToken, body: ckpt });
 	record("checkpoint_put_ms", now() - tc);
 	check("checkpoint PUT ok, GC deleted sealed segment(s)", put.status === 200 && put.value.coversSeq === lastSeq
 		&& put.value.deletedSegments >= 1 && put.value.gcSeq > 0 && put.value.gcSeq <= lastSeq, put.value);
-	const conflict = await http("PUT", `${vaultPath}/streams/checkpoint?stream=${encodeURIComponent(doc)}&coversSeq=${lastSeq}&expectedCoversSeq=0`,
+	const conflict = await http("PUT", `${vaultPath}/streams/checkpoint?stream=${encodeURIComponent(doc)}&coversSeq=${lastSeq}&expectedCoversSeq=0&vaultEpoch=${encodeURIComponent(vault.vaultGeneration)}`,
 		{ token: vault.b.deviceToken, body: ckpt });
 	check("stale CAS -> 409 checkpoint_conflict with current coversSeq", conflict.status === 409
 		&& conflict.value?.error === "checkpoint_conflict" && conflict.value?.current?.coversSeq === lastSeq, conflict);
@@ -569,7 +569,7 @@ async function main() {
 		{ token: vault.b.deviceToken });
 	check("read after=coversSeq skips the checkpoint", incremental.value?.checkpoint === null && incremental.value.rows.length === 1,
 		{ checkpoint: incremental.value?.checkpoint, rows: incremental.value?.rows?.length });
-	const advance = await http("PUT", `${vaultPath}/streams/checkpoint?stream=${encodeURIComponent(doc)}&coversSeq=${tailSeq}&expectedCoversSeq=${lastSeq}`,
+	const advance = await http("PUT", `${vaultPath}/streams/checkpoint?stream=${encodeURIComponent(doc)}&coversSeq=${tailSeq}&expectedCoversSeq=${lastSeq}&vaultEpoch=${encodeURIComponent(vault.vaultGeneration)}`,
 		{ token: vault.a.deviceToken, body: payloadOf("checkpoint 2", 1024) });
 	check("advancing CAS ok", advance.status === 200 && advance.value.coversSeq === tailSeq, advance.value);
 

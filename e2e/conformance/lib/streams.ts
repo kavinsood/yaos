@@ -39,6 +39,8 @@ export async function readAll(ctx: Ctx, path: string, token: string, stream: str
 	return { rows, first, pages };
 }
 
-export function checkpointPath(path: string, stream: string, coversSeq: number, expected: number, extra = ""): string {
-	return `${path}/streams/checkpoint?stream=${encodeURIComponent(stream)}&coversSeq=${coversSeq}&expectedCoversSeq=${expected}${extra}`;
+/** `vaultEpoch`: the epoch the checkpoint was built in (required, relay-wire §8); null sends none (the 400 case). */
+export function checkpointPath(path: string, stream: string, coversSeq: number, expected: number, vaultEpoch: string | null, extra = ""): string {
+	const epoch = vaultEpoch === null ? "" : `&vaultEpoch=${encodeURIComponent(vaultEpoch)}`;
+	return `${path}/streams/checkpoint?stream=${encodeURIComponent(stream)}&coversSeq=${coversSeq}&expectedCoversSeq=${expected}${epoch}${extra}`;
 }

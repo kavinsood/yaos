@@ -293,6 +293,8 @@ export class SimRelay implements RelayPort {
 		if (!validStreamName(stream)) throw new SimRelayError("invalid_stream");
 		if (!Number.isSafeInteger(coversSeq) || coversSeq < 1) throw new SimRelayError("invalid_covers_seq");
 		if (!validSeq(expected)) throw new SimRelayError("invalid_expected_covers_seq");
+		// Server: vaultEpoch is required (400 invalid_vault_epoch before the body read); relayHttp names the session's.
+		if (!session.vaultEpoch) throw new SimRelayError("invalid_vault_epoch");
 		if (bytes.byteLength > this.limits.maxCheckpointBytes) return { t: "refused", reason: "too-large", retryAfterMs: null };
 		// Server putCheckpoint: the client names its session's epoch (relayHttp vaultEpoch=); a put that was in flight
 		// across a reset or restore is refused in the writing turn (409 epoch_mismatch), nothing written.
