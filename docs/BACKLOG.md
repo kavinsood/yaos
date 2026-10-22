@@ -119,6 +119,12 @@ No sim failure open on `integrate-3` (2026-10-22): no data loss and no other; `s
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **MERGE-RESIDENT-LOAD-LIVELOCK** (integrate-3 merge of `client-remake-next`, sim regression
+  `canvas-reorder-rerank-lost-in-record-conflict.json` ran out of memory): the runner's parallel diskMaterialize jobs
+  (perf-boot) met the eviction at every load (`fix-resident`); with more concurrent acquires than `maxResidentDocs`,
+  each load evicted another's clean handle before its caller resumed and `withResident` reloaded it, forever. A
+  handle a `withResident` caller waits on is now not clean (`HandleManager.isClean`), so budget evictions skip it;
+  an explicit drop still forces the reload. Test in `src/engine/runtime/residency.test.ts` (concurrent acquires).
 - **SOAK-BOUND-RESIDENT-BYTES** (`fix-resident`, soak 944223017 #218, invariant 6 "B: 3561321 resident bytes,
   budget 264275"): a check mistake, not an engine one. Two big notes open in editors went past a 264 KB budget; bound
   replicas are pinned and never evicted (DESIGN §d.1), but invariant 6 held them to the budget plus one doc. Owner
