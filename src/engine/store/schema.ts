@@ -21,11 +21,13 @@ import type { EnvelopeKind, CheckpointEncoding } from "../../core/envelope";
  * (schemaVersion) and is deleted and rebuilt from relay + disk + side-file mirrors (DESIGN §i.5).
  * 2: dropped the unused streams byStalePriority / byAccess, synced byPathKey and blobQueue byActiveDue indexes
  * and the fields only they read; dropped the outbox "sent" state, attempts and lastSentAtMs (T_sent).
+ * 3: SyncedRecord.heldHash became `held` (the refused edit's hash and its texts' size) and the heldText store holds
+ * the texts (DESIGN §f.6 "Held edits").
  * Not bumped for a new meta key family whose absence reads as before (blobPut:, pathBase:,
  * keyringRecords, docDeletes:): an older reader never looks the keys up, and a DB without them behaves as it did. A bump would
  * delete and rebuild every DB.
  */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 /**
  * `yaos3`: the store is named by the install key, and its device identity lives in it (identity-per-store §2.4).
  * The `yaos2:<vaultId>:<epoch>:<deviceId>` layout (identity in data.json) is deleted on start (§13).
@@ -413,6 +415,19 @@ export interface BaseTextRecord {
 }
 
 // ---------------------------------------------------------------------------
+// heldText — held edits' texts (SyncedEntry.held, DESIGN §f.6), keyPath "docId"
+// ---------------------------------------------------------------------------
+
+/** The texts of a synced record's held edit: present iff its `held.bytes` is (same T_synced transaction). */
+export interface HeldTextRecord {
+	readonly docId: DocId;
+	/** = SyncedEntry.held.hash. */
+	readonly hash: ContentHash;
+	readonly text: string;
+	readonly base: string;
+}
+
+// ---------------------------------------------------------------------------
 // localTree — stat cache, keyPath "pathKey"
 // ---------------------------------------------------------------------------
 
@@ -486,6 +501,7 @@ export const STORE = {
 	quarantine: "quarantine",
 	synced: "synced",
 	baseText: "baseText",
+	heldText: "heldText",
 	localTree: "localTree",
 	intents: "intents",
 	cfgBase: "cfgBase",
@@ -509,6 +525,7 @@ export interface YaosSchema {
 	readonly [STORE.quarantine]: { readonly record: QuarantineRecord; readonly key: TailKey; readonly indexes: typeof INDEX.quarantineByAt };
 	readonly [STORE.synced]: { readonly record: SyncedRecord; readonly key: DocId; readonly indexes: never };
 	readonly [STORE.baseText]: { readonly record: BaseTextRecord; readonly key: DocId; readonly indexes: never };
+	readonly [STORE.heldText]: { readonly record: HeldTextRecord; readonly key: DocId; readonly indexes: never };
 	readonly [STORE.localTree]: { readonly record: LocalTreeRecord; readonly key: PathKey; readonly indexes: never };
 	readonly [STORE.intents]: { readonly record: IntentRecord; readonly key: string; readonly indexes: never };
 	readonly [STORE.cfgBase]: { readonly record: CfgBaseRecord; readonly key: ConfigRelPath; readonly indexes: never };
@@ -531,6 +548,7 @@ export const STORE_SPECS: Readonly<Record<keyof YaosSchema, StoreSpec>> = {
 	quarantine: { keyPath: ["stream", "seq"], indexes: { [INDEX.quarantineByAt]: { keyPath: "atMs", unique: false } } },
 	synced: { keyPath: "docId", indexes: {} },
 	baseText: { keyPath: "docId", indexes: {} },
+	heldText: { keyPath: "docId", indexes: {} },
 	localTree: { keyPath: "pathKey", indexes: {} },
 	intents: { keyPath: "id", indexes: {} },
 	cfgBase: { keyPath: "file", indexes: {} },
@@ -583,12 +601,12 @@ export interface SyncedMirrorEntry {
 	readonly nsTouchSeq: Seq;
 	readonly bodyRemoteSeq: Seq;
 	readonly blobRev: Seq;
-	/** Mirror format 2: SyncedRecord.fileGone. */
+	/** SyncedRecord.fileGone. */
 	readonly fileGone?: true;
-	/** Mirror format 2: SyncedRecord.renamedTo. */
+	/** SyncedRecord.renamedTo. */
 	readonly renamedTo?: { readonly to: VaultPath; readonly atMs: number };
-	/** Mirror format 2: SyncedRecord.heldHash. */
-	readonly heldHash?: ContentHash;
+	/** SyncedRecord.held (hash and texts' size; the texts are in its held-text file). */
+	readonly held?: { readonly hash: ContentHash; readonly bytes?: number };
 }
 
 export interface SyncedMirror {

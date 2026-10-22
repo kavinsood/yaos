@@ -5,7 +5,10 @@
  * which posts events after the diskOps result).
  */
 
-import type { BrakeConfig, BrakeReport, DocId, ObservedRename, PathKey, SyncedEntry, VaultPath } from "../../../core/types";
+import type { BrakeConfig, BrakeReport, DeviceId, DocId, ObservedRename, PathKey, Seq, SyncedEntry, VaultId, VaultPath } from "../../../core/types";
+import { HeldTextMirror } from "../../compose/heldMirror";
+import { importSyncedMirror, SyncedMirrorWriter } from "../../compose/syncedMirror";
+import { MemSideFiles } from "../../runtime/testHarness";
 import { DEFAULT_BRAKE } from "../../../core/plan/brake";
 import { refHashPort } from "../../../core/hash/testkit/hashRef";
 import type { VaultEvent } from "../../../ports/vault";
@@ -44,6 +47,7 @@ export interface WorldOptions {
 }
 
 export const DB = "yaos2-test";
+const WORLD_IDENTITY = { vaultId: "v" as VaultId, vaultEpoch: "e", deviceId: "world-device-0001" as DeviceId };
 
 export class World {
 	readonly storage = new FakeStorage();
@@ -62,6 +66,10 @@ export class World {
 	/** ReconcilerDeps.onRebind calls: [from, into]. */
 	readonly rebinds: [DocId, DocId][] = [];
 	private rec: Reconciler | null = null;
+	/** The store dir's side files (the synced mirror, held-text files), kept across crashes and wipes. */
+	readonly side = new MemSideFiles();
+	/** Held-text files, wired to the store at each boot as the vault runtime wires them. */
+	heldMirror: HeldTextMirror | null = null;
 
 	constructor(readonly opts: WorldOptions = {}) {
 		this.vault = new FakeVault(opts.caseInsensitive ?? false, () => this.clock.now());
@@ -100,6 +108,10 @@ export class World {
 		});
 		this.log.onOwnFold = this.opts.deferOwnFold ? async (events) => void this.ownQueue.push(...events) : (events) => rec.applyOwnFold(events);
 		this.rec = rec;
+		const held = new HeldTextMirror({ side: this.side, hash: refHashPort, identity: () => WORLD_IDENTITY });
+		this.heldMirror = held;
+		rec.ctx.store.onHeld = (put, gone) => held.onHeld(put, gone);
+		await held.sync(rec.ctx.store);
 		this.pending.length = 0; // the listing below covers everything that happened before boot
 		await rec.start();
 		const list = await this.vault.list();
@@ -150,6 +162,28 @@ export class World {
 		this.ownQueue.length = 0;
 		this.clock.advance(5_000);
 		return this.boot();
+	}
+
+	/**
+	 * IndexedDB lost, side-file mirrors kept (DESIGN §i.5): the synced mirror is written to `side` (the held-text files
+	 * are there already, heldMirror), the DB is deleted, the process dies, recovery imports the mirror into a fresh DB
+	 * as the vault runtime does, and the engine boots on it. The log's committed state stays (the relay).
+	 */
+	async wipeAndRebootFromMirror(): Promise<Reconciler> {
+		const store = this.r.ctx.store;
+		const writer = new SyncedMirrorWriter({
+			side: this.side, hash: refHashPort, clock: this.clock, identity: () => WORLD_IDENTITY, entries: () => store.synced.values(), nsCoversSeq: () => 0 as Seq,
+		});
+		writer.markDirty();
+		await writer.flush();
+		await this.heldMirror?.idle();
+		const pk = this.r.ctx.pk;
+		this.storage.crash();
+		await this.storage.deleteDatabase(DB);
+		const db = await this.storage.open<DiskSchema>(DB, DB_SCHEMA_VERSION, STORE_SPECS);
+		await importSyncedMirror({ db, side: this.side, hash: refHashPort, identity: WORLD_IDENTITY, pathKey: pk, nowMs: this.clock.now() });
+		db.close();
+		return this.crashAndReboot();
 	}
 
 	synced(docId: DocId): SyncedEntry | undefined {

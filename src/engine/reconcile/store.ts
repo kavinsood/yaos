@@ -15,7 +15,7 @@ import { markdownContentHash } from "../../core/hash/markdownLf";
 import { utf8Decode, utf8Encode } from "../../core/codec/lib0";
 import type { HashPort } from "../../ports/crypto";
 import type { StorageDb } from "../../ports/storage";
-import { STORE, type BaseTextRecord, type IntentRecord, type LocalTreeRecord, type SyncedRecord, type YaosSchema } from "../store/schema";
+import { STORE, type BaseTextRecord, type HeldTextRecord, type IntentRecord, type LocalTreeRecord, type SyncedRecord, type YaosSchema } from "../store/schema";
 
 export interface DiskChange {
 	readonly syncedPut?: readonly SyncedRecord[];
@@ -29,6 +29,11 @@ export interface DiskChange {
 	readonly localDrop?: readonly PathKey[];
 	readonly intentPut?: readonly IntentRecord[];
 	readonly intentDrop?: readonly string[];
+	/**
+	 * Held edits' texts (SyncedEntry.held.bytes, heldText store), each with its record in syncedPut. A row whose record
+	 * leaves (dropped, or put without held.bytes) is deleted in the same transaction.
+	 */
+	readonly heldPut?: readonly HeldTextRecord[];
 }
 
 /**
@@ -38,7 +43,7 @@ export interface DiskChange {
  */
 export type DiskSchema = { readonly [K in keyof YaosSchema]: YaosSchema[K] };
 
-const TX_STORES = [STORE.synced, STORE.baseText, STORE.localTree, STORE.intents] as const;
+const TX_STORES = [STORE.synced, STORE.baseText, STORE.heldText, STORE.localTree, STORE.intents] as const;
 
 /** Base record for `text` (`hash` = its markdownContentHash), or null when it is too large to keep (hasBase = false). */
 export function makeBase(docId: DocId, text: string, hash: ContentHash): BaseTextRecord | null {
@@ -69,6 +74,11 @@ export class ReconcileStore {
 	readonly synced = new Map<DocId, SyncedRecord>();
 	readonly localTree = new Map<PathKey, LocalTreeRecord>();
 	readonly intents = new Map<string, IntentRecord>();
+	/**
+	 * After each commit that kept or cleared held texts: the rows put, and the held edits whose texts left (docId and
+	 * hash). The vault runtime's held-text mirror writes / removes their side files (compose/heldMirror.ts).
+	 */
+	onHeld: ((put: readonly HeldTextRecord[], gone: readonly { readonly docId: DocId; readonly hash: ContentHash }[]) => void) | null = null;
 
 	private constructor(readonly db: StorageDb<DiskSchema>, private readonly hash: HashPort) {}
 
@@ -92,23 +102,41 @@ export class ReconcileStore {
 		return rec ? readBase(rec, this.hash) : null;
 	}
 
+	/** The texts of `docId`'s held edit (heldText), if they are kept and still its record's (hash). Read from IDB only. */
+	async loadHeld(docId: DocId): Promise<HeldTextRecord | null> {
+		const hash = this.synced.get(docId)?.held;
+		if (hash?.bytes === undefined) return null;
+		const rec = await this.db.tx([STORE.heldText], "readonly", async (tx) => tx.get(STORE.heldText, docId));
+		return rec && rec.hash === hash.hash ? rec : null;
+	}
+
 	/**
-	 * SyncedEntry.heldHash lasts until the next sync point: a record with another content hash than the stored one (the
-	 * held content committed, or merged into something else) drops it, as one whose content is the held one does.
-	 * Records spread from the old one (`{ ...s, contentHash }`) would carry it on otherwise.
+	 * SyncedEntry.held lasts until the next sync point: a record with another content hash than the stored one (the
+	 * held content committed or published, or merged into something else) drops it, as one whose content is the held
+	 * one does. Records spread from the old one (`{ ...s, contentHash }`) would carry it on otherwise.
 	 */
 	private heldKept(r: SyncedRecord): SyncedRecord {
 		const prior = this.synced.get(r.docId);
-		if (r.heldHash !== r.contentHash && (!prior || prior.contentHash === r.contentHash)) return r;
-		const { heldHash: _held, ...rest } = r;
+		if (r.held!.hash !== r.contentHash && (!prior || prior.contentHash === r.contentHash)) return r;
+		const { held: _held, ...rest } = r;
 		return rest;
 	}
 
 	async commit(c: DiskChange): Promise<void> {
 		const empty = !c.syncedPut?.length && !c.syncedDrop?.length && !c.basePut?.length && !c.baseDrop?.length && !c.baseMove?.length
-			&& !c.localPut?.length && !c.localDrop?.length && !c.intentPut?.length && !c.intentDrop?.length;
+			&& !c.localPut?.length && !c.localDrop?.length && !c.intentPut?.length && !c.intentDrop?.length && !c.heldPut?.length;
 		if (empty) return;
-		if (c.syncedPut?.some((r) => r.heldHash !== undefined)) c = { ...c, syncedPut: c.syncedPut.map((r) => this.heldKept(r)) };
+		if (c.syncedPut?.some((r) => r.held !== undefined)) c = { ...c, syncedPut: c.syncedPut.map((r) => (r.held === undefined ? r : this.heldKept(r))) };
+		// Held texts whose record no longer keeps them go with it (heldKept, a drop, a put without held.bytes).
+		const keptBefore = (id: DocId): ContentHash | null => {
+			const h = this.synced.get(id)?.held;
+			return h?.bytes === undefined ? null : h.hash;
+		};
+		const heldGone = [
+			...(c.syncedDrop ?? []).filter((id) => keptBefore(id) !== null),
+			...(c.syncedPut ?? []).filter((r) => keptBefore(r.docId) !== null && (r.held?.bytes === undefined || r.held.hash !== keptBefore(r.docId))).map((r) => r.docId),
+		];
+		const goneHashes = heldGone.map((docId) => ({ docId, hash: keptBefore(docId)! }));
 		await this.db.tx(TX_STORES, "readwrite", async (tx) => {
 			for (const m of c.baseMove ?? []) {
 				const rec = await tx.get(STORE.baseText, m.from);
@@ -119,6 +147,8 @@ export class ReconcileStore {
 			for (const r of c.syncedPut ?? []) tx.put(STORE.synced, r);
 			for (const id of c.baseDrop ?? []) tx.delete(STORE.baseText, id);
 			for (const r of c.basePut ?? []) tx.put(STORE.baseText, r);
+			for (const id of heldGone) if (!c.heldPut?.some((r) => r.docId === id)) tx.delete(STORE.heldText, id);
+			for (const r of c.heldPut ?? []) tx.put(STORE.heldText, r);
 			for (const k of c.localDrop ?? []) tx.delete(STORE.localTree, k);
 			for (const r of c.localPut ?? []) tx.put(STORE.localTree, r);
 			for (const id of c.intentDrop ?? []) tx.delete(STORE.intents, id);
@@ -130,5 +160,6 @@ export class ReconcileStore {
 		for (const r of c.localPut ?? []) this.localTree.set(r.pathKey, r);
 		for (const id of c.intentDrop ?? []) this.intents.delete(id);
 		for (const r of c.intentPut ?? []) this.intents.set(r.id, r);
+		if ((c.heldPut?.length || goneHashes.length > 0) && this.onHeld) this.onHeld(c.heldPut ?? [], goneHashes);
 	}
 }

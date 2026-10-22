@@ -25,9 +25,10 @@ import type { ContentHash, DocId, PathKey, StreamName } from "../../core/types";
 import { pathKey } from "../../core/paths/pathKey";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import type { HashPort } from "../../ports/crypto";
+import type { SideFilePort } from "../../ports/vault";
 import { CodecError, utf8Encode } from "../../core/codec/lib0";
 import * as codec from "../../core/codec/mirrors";
-import type { MetaPathMove, OutboxMirror, OutboxMirrorFrame, OutboxRecord, SyncedMirror, SyncedMirrorEntry } from "../store/schema";
+import type { HeldTextRecord, MetaPathMove, OutboxMirror, OutboxMirrorFrame, OutboxRecord, SyncedMirror, SyncedMirrorEntry, SyncedRecord } from "../store/schema";
 
 export type MirrorIdentity = codec.MirrorIdentity;
 
@@ -312,6 +313,34 @@ export function unmirroredDocs(records: readonly OutboxRecord[], frames: readonl
 export const UNTRUSTED_CONTENT_HASH = "0".repeat(64) as ContentHash;
 
 /** A recovered synced record (`contentHash` from the mirror), with the hash dropped when `untrusted` names its doc. */
+/**
+ * Recovery (§i.5): the texts of the held edits `entries` name with a size, from their held-text files in `side` (the
+ * store dir the mirror came from, `identity` its store). A file that is missing, does not decode, or names another
+ * store, doc or hash brings nothing back: that record keeps its held hash alone (recoveredHeld).
+ */
+export async function recoverHeldTexts(
+	side: SideFilePort, entries: readonly SyncedMirrorEntry[], identity: MirrorIdentity, hash: HashPort,
+): Promise<Map<DocId, HeldTextRecord>> {
+	const out = new Map<DocId, HeldTextRecord>();
+	for (const e of entries) {
+		if (e.held?.bytes === undefined) continue;
+		const bytes = await side.read(codec.heldTextFileName(e.docId, e.held.hash)).catch(() => null);
+		if (!bytes) continue;
+		const d = await codec.decodeHeldTextFile(bytes, hash);
+		if (!d.ok) continue;
+		const f = d.mirror;
+		if (f.vaultId !== identity.vaultId || f.vaultEpoch !== identity.vaultEpoch || f.deviceId !== identity.deviceId || f.docId !== e.docId || f.hash !== e.held.hash) continue;
+		out.set(e.docId, { docId: e.docId, hash: f.hash, text: f.text, base: f.base });
+	}
+	return out;
+}
+
+/** A mirrored held edit as the recovered record keeps it: with its texts' size only when they came back. */
+export function recoveredHeld(h: SyncedMirrorEntry["held"], texts: HeldTextRecord | undefined): SyncedRecord["held"] {
+	if (!h) return undefined;
+	return texts && h.bytes !== undefined ? { hash: h.hash, bytes: h.bytes } : { hash: h.hash };
+}
+
 export function untrustedSyncPoint<T extends { readonly docId: DocId; readonly contentHash: ContentHash }>(rec: T, untrusted: ReadonlySet<DocId>): T {
 	return untrusted.has(rec.docId) ? { ...rec, contentHash: UNTRUSTED_CONTENT_HASH } : rec;
 }

@@ -49,6 +49,7 @@ import { ComposedLog } from "./logPort";
 import { CreatorStatus } from "./creatorStatus";
 import { PassScheduler } from "./passScheduler";
 import { mergeStatus, type DiskSideStatus } from "./statusMerge";
+import { HeldTextMirror } from "./heldMirror";
 import { importSyncedMirror, SyncedMirrorWriter } from "./syncedMirror";
 import { dropPending, type ResolvedIdentity } from "./storeIdentity";
 import * as ops from "./runtimeOps";
@@ -142,6 +143,8 @@ export class VaultRuntime {
 	cfg: CfgSync | null = null;
 	snaps!: SnapshotJob;
 	mirror!: SyncedMirrorWriter;
+	/** Held edits' texts, one side file each (heldMirror.ts). */
+	heldMirror!: HeldTextMirror;
 	readonly port: ComposedLog;
 	readonly sched: PassScheduler;
 	recovered = false;
@@ -342,6 +345,11 @@ export class VaultRuntime {
 			before: () => c.mirror.flushed(),
 			onWritten: () => void this.dropLineageDirs(),
 		});
+		this.heldMirror = new HeldTextMirror({
+			side: link.sideFiles, hash: ports.hash, identity: () => identity, onError: (e) => this.diag(`held-text file write failed: ${String(e)}`),
+		});
+		this.rec.ctx.store.onHeld = (put, gone) => this.heldMirror.onHeld(put, gone);
+		void this.heldMirror.sync(this.rec.ctx.store);
 		// The previous epoch's unpublished renames (§c.12 "Renames") are in this DB only: the mirror takes them now, so a
 		// store lost before the moves still has them (sim suite-1 wipe/revoke/roll seed 40).
 		if (bases.renames().length > 0) {
@@ -379,12 +387,13 @@ export class VaultRuntime {
 		const lineage = sweep ? [...(this.o.identity.lineage ?? [])] : [];
 		if (lineage.length === 0) return;
 		this.lineageDropped = true;
+		await this.heldMirror.idle(); // this store's held-text files replace theirs first (sync at start)
 		const link = this.engine.link;
 		let n = 0;
 		for (const dir of lineage) {
 			try {
 				const side = link.sideFilesOf(dir);
-				const names: SideFileName[] = [...MIRROR_FILES, ...(await side.list("snapshots/"))];
+				const names: SideFileName[] = [...MIRROR_FILES, ...(await side.list("snapshots/")), ...(await side.list("held/"))];
 				for (const name of names) {
 					await side.remove(name);
 					n++;
@@ -572,7 +581,7 @@ export class VaultRuntime {
 			throw e;
 		} finally {
 			// What a record keeps of a file this device could not publish yet (a decided delete, the user's rename, an
-			// edit the write gate refused: SyncedEntry fileGone, renamedTo, heldHash) lives in the store alone until the
+			// edit the write gate refused: SyncedEntry fileGone, renamedTo, held) lives in the store alone until the
 			// synced mirror has it. It goes there now, not a debounce later: a store lost in between recovered the record
 			// without it, and the moved file read as a new doc beside the old one put back (sim suite-1 wipe/revoke/roll
 			// seed 40). A pass the write gate stopped commits it before it throws (runner keepObservedRenames).
@@ -676,11 +685,11 @@ export class VaultRuntime {
 		return `${n}:${h}`;
 	}
 
-	/** The records' fileGone / renamedTo / heldHash (runPass: the synced mirror takes them at once). */
+	/** The records' fileGone / renamedTo / held (runPass: the synced mirror takes them at once). */
 	private keptSignature(): string {
 		const parts: string[] = [];
 		for (const s of this.rec.ctx.store.synced.values()) {
-			if (s.fileGone || s.renamedTo || s.heldHash !== undefined) parts.push(`${s.docId}|${s.fileGone ? 1 : 0}|${s.renamedTo?.to ?? ""}|${s.heldHash ?? ""}`);
+			if (s.fileGone || s.renamedTo || s.held) parts.push(`${s.docId}|${s.fileGone ? 1 : 0}|${s.renamedTo?.to ?? ""}|${s.held?.hash ?? ""}|${s.held?.bytes ?? ""}`);
 		}
 		return parts.sort().join("\n");
 	}
@@ -902,6 +911,7 @@ export class VaultRuntime {
 		await blobs?.catch(() => undefined);
 		for (const off of this.offs) off();
 		await this.mirror?.stop();
+		await this.heldMirror?.idle();
 		await this.log.stop();
 	}
 }

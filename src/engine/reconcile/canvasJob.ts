@@ -33,6 +33,9 @@ import { epochBaseKey, epochBaseOf, MAX_CAS_ATTEMPTS, overwriteAllowed, trustedE
 import type { BodyHandle } from "./deps";
 import { framedVersion, writeOk, type Env, type JobOutcome } from "./diskJobs";
 import { MAX_TEXT_FILE_BYTES } from "./localState";
+import { heldTextsFit, keepHeld } from "./heldJob";
+import { KeyMissingError } from "../keyring/writeGate";
+import { utf8Decode } from "../../core/codec/lib0";
 import { applyOldDeletes } from "./oldDeletes";
 import { hashBase } from "./store";
 
@@ -73,34 +76,45 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 	let out: CanvasMergeOutput | null = null;
 	let outHash = diskHash; // out.projection's logical hash
 	let v0 = h.version();
-	for (let attempt = 0; ; attempt++) {
-		if (attempt >= MAX_CAS_ATTEMPTS) return "fail"; // remote kept moving: re-plan
-		const crdt = projectCanvasBytes(h.doc);
-		if (!crdt.ok) return invalid(env, docId, op.path, `crdt: ${crdt.reason}`, `crdt:${h.version().remoteSeq}`);
-		const token = canvasToMergeText(crdt.ranked);
-		// No stored base: a side still at the synced content is the base (see mergeJob).
-		const trusted = trustedEpochBase(epochBase, token, "line");
-		const epochRanked = trusted === null ? null : parseMergeText(trusted);
-		const base0 = storedBase ?? (epochRanked && epochDeleted ? withEpochDeletes(epochRanked, crdt.ranked, disk.data, epochDeleted) : epochRanked)
-			?? (isEmptyCanvas(crdt.ranked) ? emptyCanvas() : !s || op.noBase || op.pathBase ? null : diskHash === s.contentHash ? rankDisk(disk.data, null, crdt.ranked) : (await projectionHash(port, crdt)) === s.contentHash ? crdt.ranked : null);
-		// Fields of a record whose map lost a concurrent create are not the replica's: the disk's are this side's change.
-		const base = base0 && baseSeenBy(base0, h.doc);
-		await ctx.deps.clock.yieldNow();
-		const m = mergeCanvasSides({ base, disk: disk.data, crdt, limits: ctx.mergeLimits });
-		const mHash = await projectionHash(port, m.projection);
-		if (mHash !== diskHash && !(await overwriteAllowed(env, docId, op.path, rd.bytes.length, m.projection.bytes.length, async () => `${diskHash}>${mHash}`))) {
-			return "held";
+	let triedBase: CanvasRanked | null = null;
+	let v1: Awaited<ReturnType<BodyHandle["commitEdits"]>>;
+	try {
+		for (let attempt = 0; ; attempt++) {
+			if (attempt >= MAX_CAS_ATTEMPTS) return "fail"; // remote kept moving: re-plan
+			const crdt = projectCanvasBytes(h.doc);
+			if (!crdt.ok) return invalid(env, docId, op.path, `crdt: ${crdt.reason}`, `crdt:${h.version().remoteSeq}`);
+			const token = canvasToMergeText(crdt.ranked);
+			// No stored base: a side still at the synced content is the base (see mergeJob).
+			const trusted = trustedEpochBase(epochBase, token, "line");
+			const epochRanked = trusted === null ? null : parseMergeText(trusted);
+			const base0 = storedBase ?? (epochRanked && epochDeleted ? withEpochDeletes(epochRanked, crdt.ranked, disk.data, epochDeleted) : epochRanked)
+				?? (isEmptyCanvas(crdt.ranked) ? emptyCanvas() : !s || op.noBase || op.pathBase ? null : diskHash === s.contentHash ? rankDisk(disk.data, null, crdt.ranked) : (await projectionHash(port, crdt)) === s.contentHash ? crdt.ranked : null);
+			triedBase = base0;
+			// Fields of a record whose map lost a concurrent create are not the replica's: the disk's are this side's change.
+			const base = base0 && baseSeenBy(base0, h.doc);
+			await ctx.deps.clock.yieldNow();
+			const m = mergeCanvasSides({ base, disk: disk.data, crdt, limits: ctx.mergeLimits });
+			const mHash = await projectionHash(port, m.projection);
+			if (mHash !== diskHash && !(await overwriteAllowed(env, docId, op.path, rd.bytes.length, m.projection.bytes.length, async () => `${diskHash}>${mHash}`))) {
+				return "held";
+			}
+			// Synchronous section: CAS, apply, capture the version.
+			if (crdtToken(h) !== token) continue;
+			h.assertWritable();
+			applyCanvas(h.doc, h.mergeOrigin, m.target);
+			v0 = h.version();
+			out = m;
+			outHash = mHash;
+			break;
 		}
-		// Synchronous section: CAS, apply, capture the version.
-		if (crdtToken(h) !== token) continue;
-		h.assertWritable();
-		applyCanvas(h.doc, h.mergeOrigin, m.target);
-		v0 = h.version();
-		out = m;
-		outHash = mHash;
-		break;
+		v1 = await h.commitEdits();
+	} catch (e) {
+		// The write gate refused the edit (key missing): keep it on S, with the file text and its base (heldJob.ts).
+		if (e instanceof KeyMissingError && diskHash !== s?.contentHash) {
+			await keepHeld(env, docId, diskHash, heldTextsFit(env, docId, utf8Decode(rd.bytes), triedBase && canvasToMergeText(triedBase)));
+		}
+		throw e;
 	}
-	const v1 = await h.commitEdits();
 	const bodyVersion = { remoteSeq: v0.remoteSeq, localOrder: v1.localOrder };
 
 	let intent: IntentRecord | null = null;
@@ -172,36 +186,36 @@ export async function diskMaterializeCanvas(env: Env, op: MaterializeOp): Promis
 	const h = await env.ctx.log.acquireBody(op.docId, "canvas");
 	if (!h) return "fail";
 	try {
-		await applyOldDeletes(env, op.docId, h);
-		return await materializeCanvas(env, op, h);
-	} finally {
-		h.release();
+			await applyOldDeletes(env, op.docId, h);
+			return await materializeCanvas(env, op, h);
+		} finally {
+			h.release();
+		}
 	}
-}
 
-async function materializeCanvas(env: Env, op: MaterializeOp, h: BodyHandle): Promise<JobOutcome> {
-	const { ctx } = env;
-	const version = await framedVersion(h);
-	if (!version) return "fail";
-	const p = projectCanvasBytes(h.doc);
-	if (!p.ok) return invalid(env, op.docId, op.path, `crdt: ${p.reason}`, `crdt:${version.remoteSeq}`);
-	// Hashed before the write: nothing awaits between the write and the T_synced commit that records it.
-	const hash = await projectionHash(ctx.deps.hash, p);
-	const base = await hashBase(ctx.deps.hash, op.docId, canvasToMergeText(p.ranked));
-	const res = await ctx.exec({ t: "write", area: "vault", path: op.path, data: { t: "text", text: p.text }, precondition: { t: "absent" }, docId: op.docId, purpose: "materialize" });
-	const out = writeOk(res);
-	if (!out) {
-		env.scan.markDirty(op.path, null);
-		return "fail";
+	async function materializeCanvas(env: Env, op: MaterializeOp, h: BodyHandle): Promise<JobOutcome> {
+		const { ctx } = env;
+		const version = await framedVersion(h);
+		if (!version) return "fail";
+		const p = projectCanvasBytes(h.doc);
+		if (!p.ok) return invalid(env, op.docId, op.path, `crdt: ${p.reason}`, `crdt:${version.remoteSeq}`);
+		// Hashed before the write: nothing awaits between the write and the T_synced commit that records it.
+		const hash = await projectionHash(ctx.deps.hash, p);
+		const base = await hashBase(ctx.deps.hash, op.docId, canvasToMergeText(p.ranked));
+		const res = await ctx.exec({ t: "write", area: "vault", path: op.path, data: { t: "text", text: p.text }, precondition: { t: "absent" }, docId: op.docId, purpose: "materialize" });
+		const out = writeOk(res);
+		if (!out) {
+			env.scan.markDirty(op.path, null);
+			return "fail";
+		}
+		ctx.echo.expectWrite(ctx.pk(op.path), out.stat.size, out.stat.mtimeMs);
+		const entry = ctx.record({
+			docId: op.docId, path: op.path, pathKey: ctx.pk(op.path), kind: "canvas", contentHash: hash, fingerprint: out.fingerprint,
+			size: out.stat.size, mtimeMs: out.stat.mtimeMs, bodyVersion: version, blobRev: 0, nsTouchSeq: ctx.touchSeq(op.docId), hasBase: base !== null,
+		});
+		await ctx.commit(
+			{ syncedPut: [entry], basePut: base ? [base] : [], baseDrop: base ? [] : [op.docId] },
+			[ctx.localEntry(op.path, out.stat, "canvas", hash, out.fingerprint)],
+		);
+		return "ok";
 	}
-	ctx.echo.expectWrite(ctx.pk(op.path), out.stat.size, out.stat.mtimeMs);
-	const entry = ctx.record({
-		docId: op.docId, path: op.path, pathKey: ctx.pk(op.path), kind: "canvas", contentHash: hash, fingerprint: out.fingerprint,
-		size: out.stat.size, mtimeMs: out.stat.mtimeMs, bodyVersion: version, blobRev: 0, nsTouchSeq: ctx.touchSeq(op.docId), hasBase: base !== null,
-	});
-	await ctx.commit(
-		{ syncedPut: [entry], basePut: base ? [base] : [], baseDrop: base ? [] : [op.docId] },
-		[ctx.localEntry(op.path, out.stat, "canvas", hash, out.fingerprint)],
-	);
-	return "ok";
-}

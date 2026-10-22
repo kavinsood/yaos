@@ -38,6 +38,8 @@ import { epochBaseOf, MAX_CAS_ATTEMPTS, overwriteAllowed, trustedEpochBase, writ
 import type { BodyHandle } from "./deps";
 import { writeOk, type Env, type JobOutcome } from "./diskJobs";
 import { MAX_TEXT_FILE_BYTES } from "./localState";
+import { heldTextsFit, keepHeld, publishHeld } from "./heldJob";
+import { KeyMissingError } from "../keyring/writeGate";
 import { applyOldDeletes } from "./oldDeletes";
 import { makeBase } from "./store";
 
@@ -57,79 +59,89 @@ export async function reconcileContent(env: Env, op: ReconcileOp): Promise<JobOu
 	const h = await ctx.log.acquireBody(op.docId, op.kind);
 	if (!h) return "fail";
 	try {
-		await applyOldDeletes(env, op.docId, h);
-		return op.kind === "canvas" ? await mergeCanvas(env, op, h) : await mergeMarkdown(env, op, h);
-	} finally {
-		h.release();
-	}
-}
-
-async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<JobOutcome> {
-	const { ctx } = env;
-	const docId = op.docId;
-	const diskPath = ctx.diskPathOf(op.path);
-	const rd = await ctx.read(diskPath, MAX_TEXT_FILE_BYTES);
-	if (!rd.ok) {
-		if (rd.reason === "too-large") ctx.notice("warn", "text-too-large", `note too large to sync: ${op.path}`, `big:${op.path}`);
-		env.scan.markDirty(diskPath, rd.reason === "missing" ? null : rd.stat);
-		return "fail";
-	}
-	const decoded = utf8Decode(rd.bytes, true);
-	if (decoded === null) {
-		ctx.notice("warn", "not-utf8", `not valid UTF-8, left alone: ${op.path}`, `utf8:${docId}`);
-		return "fail";
-	}
-	const port = ctx.deps.hash;
-	const D = canonicalizeMarkdown(decoded);
-	const F = await exactFingerprint(port, rd.bytes);
-	const s = ctx.synced(docId);
-	// §c.12: the old epoch's base at the path, only while the new epoch's text still contains it (trustedEpochBase):
-	// a base ahead of the new epoch would read as deletions.
-	const epochBase = epochBaseOf(env, op, s);
-	const storedBase = !op.pathBase && !op.noBase && op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : null;
-	// The synced-side fallback below needs a record describing this doc's last sync (not a rebound loser's, nor
-	// another file's: op.noBase).
-	const fallback = op.pathBase || op.noBase ? undefined : s;
-	const ytext = h.doc.getText("text");
-	const diskHash = await markdownContentHash(port, D);
-	// Bound: the disk holds a save of its editors (or the last disk text) that the replica already has: not an edit.
-	// Without this a save followed by more typing on the same line merges as a conflict against the old base.
-	const savedByEditor = h.bound && ctx.deps.boundSavedText?.(docId, D) === true;
-
-	let result: MergeResult | null = null;
-	let mHash: ContentHash | null = null; // markdownContentHash of `result`'s M, once taken
-	let crdt0 = "";
-	let crdt1 = ""; // the CRDT text right after the merge transaction
-	let v0 = h.version();
-	for (let attempt = 0; ; attempt++) {
-		if (attempt >= MAX_CAS_ATTEMPTS) return "fail"; // remote kept moving: re-plan
-		crdt0 = ytext.toString();
-		// No stored base (mirror recovery, too large to keep, a merged alias restarted at the winner's create): a side
-		// still at the synced content is the base, so a one-sided change applies as one instead of a no-base conflict copy.
-		const base = savedByEditor ? D : storedBase ?? trustedEpochBase(epochBase, crdt0)
-			?? (crdt0 === "" ? "" : !fallback ? null : diskHash === fallback.contentHash ? D : (await markdownContentHash(port, crdt0)) === fallback.contentHash ? crdt0 : null);
-		await ctx.deps.clock.yieldNow();
-		const res = merge({ base, disk: D, crdt: crdt0, limits: ctx.mergeLimits });
-		const M = res.kind === "identical" ? D : res.text;
-		let hashM: ContentHash | null = null; // M's markdownContentHash, when the brake took it
-		const transition = async (): Promise<string> => {
-			hashM = await markdownContentHash(port, M);
-			return `${diskHash}>${hashM}`;
-		};
-		if (!h.bound && M !== D && !(await overwriteAllowed(env, docId, op.path, rd.bytes.length, utf8ByteLength(M), transition))) {
-			return "held";
+			await applyOldDeletes(env, op.docId, h);
+			if (op.held) return await publishHeld(env, op, h);
+			return op.kind === "canvas" ? await mergeCanvas(env, op, h) : await mergeMarkdown(env, op, h);
+		} finally {
+			h.release();
 		}
-		// Synchronous section: CAS, apply, capture the version.
-		if (ytext.toString() !== crdt0) continue;
-		const apply = res.kind === "disk-only" || res.kind === "clean" || res.kind === "conflict";
-		if (apply) applyMinimalDiff(h, ytext, crdt0, res.text);
-		crdt1 = apply ? res.text : crdt0;
-		v0 = h.version();
-		result = res;
-		mHash = hashM;
-		break;
 	}
-	const v1 = await h.commitEdits();
+
+	async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<JobOutcome> {
+		const { ctx } = env;
+		const docId = op.docId;
+		const diskPath = ctx.diskPathOf(op.path);
+		const rd = await ctx.read(diskPath, MAX_TEXT_FILE_BYTES);
+		if (!rd.ok) {
+			if (rd.reason === "too-large") ctx.notice("warn", "text-too-large", `note too large to sync: ${op.path}`, `big:${op.path}`);
+			env.scan.markDirty(diskPath, rd.reason === "missing" ? null : rd.stat);
+			return "fail";
+		}
+		const decoded = utf8Decode(rd.bytes, true);
+		if (decoded === null) {
+			ctx.notice("warn", "not-utf8", `not valid UTF-8, left alone: ${op.path}`, `utf8:${docId}`);
+			return "fail";
+		}
+		const port = ctx.deps.hash;
+		const D = canonicalizeMarkdown(decoded);
+		const F = await exactFingerprint(port, rd.bytes);
+		const s = ctx.synced(docId);
+		// §c.12: the old epoch's base at the path, only while the new epoch's text still contains it (trustedEpochBase):
+		// a base ahead of the new epoch would read as deletions.
+		const epochBase = epochBaseOf(env, op, s);
+		const storedBase = !op.pathBase && !op.noBase && op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : null;
+		// The synced-side fallback below needs a record describing this doc's last sync (not a rebound loser's, nor
+		// another file's: op.noBase).
+		const fallback = op.pathBase || op.noBase ? undefined : s;
+		const ytext = h.doc.getText("text");
+		const diskHash = await markdownContentHash(port, D);
+		// Bound: the disk holds a save of its editors (or the last disk text) that the replica already has: not an edit.
+		// Without this a save followed by more typing on the same line merges as a conflict against the old base.
+		const savedByEditor = h.bound && ctx.deps.boundSavedText?.(docId, D) === true;
+
+		let result: MergeResult | null = null;
+		let mHash: ContentHash | null = null; // markdownContentHash of `result`'s M, once taken
+		let crdt0 = "";
+		let crdt1 = ""; // the CRDT text right after the merge transaction
+		let v0 = h.version();
+		let triedBase: string | null = null;
+		let v1: Awaited<ReturnType<BodyHandle["commitEdits"]>>;
+	try {
+		for (let attempt = 0; ; attempt++) {
+			if (attempt >= MAX_CAS_ATTEMPTS) return "fail"; // remote kept moving: re-plan
+			crdt0 = ytext.toString();
+			// No stored base (mirror recovery, too large to keep, a merged alias restarted at the winner's create): a side
+			// still at the synced content is the base, so a one-sided change applies as one instead of a no-base conflict copy.
+			const base = savedByEditor ? D : storedBase ?? trustedEpochBase(epochBase, crdt0)
+				?? (crdt0 === "" ? "" : !fallback ? null : diskHash === fallback.contentHash ? D : (await markdownContentHash(port, crdt0)) === fallback.contentHash ? crdt0 : null);
+			triedBase = base;
+			await ctx.deps.clock.yieldNow();
+			const res = merge({ base, disk: D, crdt: crdt0, limits: ctx.mergeLimits });
+			const M = res.kind === "identical" ? D : res.text;
+			let hashM: ContentHash | null = null; // M's markdownContentHash, when the brake took it
+			const transition = async (): Promise<string> => {
+				hashM = await markdownContentHash(port, M);
+				return `${diskHash}>${hashM}`;
+			};
+			if (!h.bound && M !== D && !(await overwriteAllowed(env, docId, op.path, rd.bytes.length, utf8ByteLength(M), transition))) {
+				return "held";
+			}
+			// Synchronous section: CAS, apply, capture the version.
+			if (ytext.toString() !== crdt0) continue;
+			const apply = res.kind === "disk-only" || res.kind === "clean" || res.kind === "conflict";
+			if (apply) applyMinimalDiff(h, ytext, crdt0, res.text);
+			crdt1 = apply ? res.text : crdt0;
+			v0 = h.version();
+			result = res;
+			mHash = hashM;
+			break;
+		}
+		v1 = await h.commitEdits();
+	} catch (e) {
+		// The write gate refused the edit (key missing): keep it on S, with its text (heldJob.ts).
+		if (e instanceof KeyMissingError && diskHash !== s?.contentHash) await keepHeld(env, docId, diskHash, heldTextsFit(env, docId, D, triedBase));
+		throw e;
+	}
 	// Editor keystrokes applied between the CAS and the frame close are covered by v1.localOrder but are not in M:
 	// recording v1 would claim the disk holds them, and a crash before the editor's save lost them on this disk
 	// for good (sim heavy seed 119). No sync point then (header): the next pass merges again.

@@ -421,11 +421,11 @@ test("a doc whose file the user renamed away does not take a new file at the pat
 	assert.ok(!opsOf(plain).includes("nsCreate"), JSON.stringify(plain.ops));
 });
 
-test("rename inference pairs a missing doc's file by the content a refused commit left (heldHash)", () => {
+test("rename inference pairs a missing doc's file by the content a refused commit left (held.hash)", () => {
 	// Sim suite-1 wipe/revoke/roll seed 112: the write gate refused B's canvas edit (key missing), then the canvas was
 	// renamed while the app was down. By S's content alone the file is new: a delete + a create, and a peer's edit
 	// restored the doc at its old path with the records B had deleted.
-	const held = S("d1", "a.canvas", { heldHash: h("c1") });
+	const held = S("d1", "a.canvas", { held: { hash: h("c1") } });
 	const p = run({ remote: [R("d1", "a.canvas")], synced: [held], local: [L("b.canvas", h("c1"))] });
 	assert.deepEqual(find(p, "nsRename"), { op: "nsRename", docId: "d1", path: "b.canvas" });
 	assert.equal(find(p, "reconcileContent").path, "b.canvas");
@@ -433,6 +433,19 @@ test("rename inference pairs a missing doc's file by the content a refused commi
 	// without it: a delete + a create
 	const none = run({ remote: [R("d1", "a.canvas")], synced: [S("d1", "a.canvas")], local: [L("b.canvas", h("c1"))] });
 	assert.ok(opsOf(none).includes("nsCreate") && opsOf(none).includes("nsDelete"), JSON.stringify(none.ops));
+});
+
+test("a missing doc's held edit with its text is published first; the file's absence is decided the next pass", () => {
+	// Sim suite-1 wipe/revoke/roll seed 112: renamed and edited again unobserved, the file pairs with nothing. Deciding
+	// its absence first (a peer's edit: edit beats delete) put the doc back without the user's held edit.
+	const kept = { hash: h("c1"), bytes: 2 };
+	const p = run({ remote: [R("d1", "a.canvas")], synced: [S("d1", "a.canvas", { held: kept })], local: [L("c5.canvas", h("c9"))] });
+	assert.deepEqual(find(p, "reconcileContent"), { op: "reconcileContent", docId: "d1", path: "a.canvas", kind: "canvas", hasBase: true, held: true });
+	assert.ok(!opsOf(p).includes("nsDelete") && !opsOf(p).includes("diskMaterialize"), JSON.stringify(p.ops));
+	// the hash alone (past the bound): decided at once, as before
+	const hashOnly = run({ remote: [R("d1", "a.canvas")], synced: [S("d1", "a.canvas", { held: { hash: h("c1") } })], local: [L("c5.canvas", h("c9"))] });
+	assert.ok(opsOf(hashOnly).includes("nsDelete"), JSON.stringify(hashOnly.ops));
+	assert.ok(!hashOnly.ops.some((o) => o.op === "reconcileContent" && o.held), JSON.stringify(hashOnly.ops));
 });
 
 test("a file renamed onto a fileGone path with the gone doc's bytes is a new file, and the fresh-id budget counts it", () => {

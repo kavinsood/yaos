@@ -26,29 +26,34 @@ import type { HashPort } from "../../ports/crypto";
 import type { StorageDb } from "../../ports/storage";
 import type { SideFileName, SideFilePort } from "../../ports/vault";
 import type { DiskSchema } from "../reconcile/store";
-import { decodeSyncedMirror, encodeSyncedMirror, nextMirrorSlot, pathMovesOf, pickOutboxMirror, pickSyncedMirror, untrustedSyncPoint, type MirrorIdentity } from "../runtime/mirrors";
-import { STORE, type SyncedMirror, type SyncedMirrorEntry, type SyncedRecord } from "../store/schema";
+import { decodeSyncedMirror, encodeSyncedMirror, nextMirrorSlot, recoverHeldTexts, recoveredHeld, pathMovesOf, pickOutboxMirror, pickSyncedMirror, untrustedSyncPoint, type MirrorIdentity } from "../runtime/mirrors";
+import { STORE, type HeldTextRecord, type SyncedMirror, type SyncedMirrorEntry, type SyncedRecord } from "../store/schema";
 
 export const SYNCED_FILES: readonly [SideFileName, SideFileName] = ["synced-a.bin", "synced-b.bin"];
 const OUTBOX_FILES: readonly SideFileName[] = ["outbox-a.bin", "outbox-b.bin"];
 export const SYNCED_MIRROR_DEBOUNCE_MS = 2_000;
 
+/** A held edit rides as its hash and texts' size; the texts are in its held-text file (heldMirror.ts). */
 export function toMirrorEntry(s: SyncedRecord): SyncedMirrorEntry {
+	const held = s.held;
 	return {
 		docId: s.docId, path: s.path, kind: s.kind, contentHash: s.contentHash, nsTouchSeq: s.nsTouchSeq,
 		bodyRemoteSeq: s.bodyVersion?.remoteSeq ?? 0, blobRev: s.blobRev,
-		...(s.fileGone ? { fileGone: true as const } : {}), ...(s.renamedTo ? { renamedTo: s.renamedTo } : {}), ...(s.heldHash !== undefined ? { heldHash: s.heldHash } : {}),
+		...(s.fileGone ? { fileGone: true as const } : {}), ...(s.renamedTo ? { renamedTo: s.renamedTo } : {}), ...(held ? { held } : {}),
 	};
 }
 
-export function fromMirrorEntry(e: SyncedMirrorEntry, pk: PathKeyFn, nowMs: number): SyncedRecord {
+/** `texts`: its held edit's texts, when recovery read them back (recoverHeldTexts); else the held hash alone. */
+export function fromMirrorEntry(e: SyncedMirrorEntry, pk: PathKeyFn, nowMs: number, texts?: HeldTextRecord): SyncedRecord {
+	const held = recoveredHeld(e.held, texts);
 	return {
 		docId: e.docId, path: e.path, pathKey: pk(e.path), kind: e.kind, contentHash: e.contentHash, fingerprint: "" as DiskFingerprint,
 		size: -1, mtimeMs: 0, bodyVersion: null, blobRev: e.blobRev,
 		nsTouchSeq: e.nsTouchSeq, hasBase: false, syncedAtMs: nowMs,
-		...(e.fileGone ? { fileGone: true as const } : {}), ...(e.renamedTo ? { renamedTo: e.renamedTo } : {}), ...(e.heldHash !== undefined ? { heldHash: e.heldHash } : {}),
+		...(e.fileGone ? { fileGone: true as const } : {}), ...(e.renamedTo ? { renamedTo: e.renamedTo } : {}), ...(held ? { held } : {}),
 	};
 }
+
 
 async function readSlots(side: SideFilePort, files: readonly SideFileName[] = SYNCED_FILES): Promise<(Uint8Array | null)[]> {
 	const out: (Uint8Array | null)[] = [];
@@ -82,11 +87,13 @@ export async function importSyncedMirror(o: {
 	if (picked.mirror.entries.length === 0) return 0;
 	const outbox = await pickOutboxMirror(await readSlots(o.side, OUTBOX_FILES), o.identity, o.hash);
 	const untrusted = new Set(outbox?.mirror.unmirrored ?? []);
-	const recs = picked.mirror.entries.map((e) => untrustedSyncPoint(fromMirrorEntry(e, o.pathKey, o.nowMs), untrusted));
-	return o.db.tx([STORE.synced], "readwrite", async (tx) => {
+	const held = await recoverHeldTexts(o.side, picked.mirror.entries, o.identity, o.hash);
+	const recs = picked.mirror.entries.map((e) => untrustedSyncPoint(fromMirrorEntry(e, o.pathKey, o.nowMs, held.get(e.docId)), untrusted));
+	return o.db.tx([STORE.synced, STORE.heldText], "readwrite", async (tx) => {
 		const existing = await tx.getAll(STORE.synced);
 		if (existing.length > 0) return 0;
 		for (const r of recs) tx.put(STORE.synced, r);
+		for (const t of held.values()) tx.put(STORE.heldText, t);
 		return recs.length;
 	});
 }

@@ -113,6 +113,12 @@ export const ROLL_OWN_SEALS = 2 ** 22;
 export const MAX_DOC_TEXT_CHARS = 8 * 1024 * 1024;
 export const MAX_BASE_TEXT_CHARS = 4 * 1024 * 1024;
 /**
+ * Held edits (SyncedEntry.held, DESIGN §f.6): a text (held or base) up to the largest doc text the engine merges, and
+ * their UTF-8 bytes over all synced records up to the outbox mirror's scale (OUTBOX_MIRROR_MAX_BYTES, below): they live
+ * in IndexedDB (heldText) and in the synced mirror, not in memory. Past either a held edit keeps its hash only.
+ */
+export const HELD_TEXT_MAX_CHARS = MAX_DOC_TEXT_CHARS;
+/**
  * Largest input core's synchronous pure-JS SHA-256 (core/hash/sha256.ts) takes; above it, it throws. It runs on the
  * engine thread and blocks it for the whole digest: ~3 ms per MiB (316 ms for 100 MB, against 42 ms through
  * WebCrypto, which does not block). Everything else (file, blob, canvas, config, snapshot content, brake ids) is
@@ -183,6 +189,8 @@ export const BRAKE_OVERWRITE_SHRINK_RATIO = 0.5;
 export const QUARANTINE_MAX_RECORDS = 500;
 export const QUARANTINE_ROW_BYTES = 256 * 1024;
 export const OUTBOX_MIRROR_MAX_BYTES = 32 * 1024 * 1024;
+/** Held edits' texts over all synced records (HELD_TEXT_MAX_CHARS above): the outbox mirror's scale. */
+export const HELD_TEXT_MAX_BYTES = OUTBOX_MIRROR_MAX_BYTES;
 export const OUTBOX_MIRROR_DEBOUNCE_MS = 1_000;
 
 // --- Settings sync (DESIGN §j.3; legacy settingsSync/types.ts) ---------------

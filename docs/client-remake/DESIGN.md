@@ -1647,7 +1647,8 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | `tail` | `[stream, seq]` | — | `TailRecord` (opened inner content) | Compaction keeps ≤ 200 rows / 256 KiB typical, hard 2000 rows per stream |
 | `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | No size limit is enforced (a soft limit with stretching and a notice was planned, not built). **Never dropped** |
 | `quarantine` | `[stream, seq]` | `byAt atMs` | `QuarantineRecord` (bytes + hash: ≤ 256 KiB for a deterministic failure, whole for a reader-dependent one so it can be re-gated) | `QUARANTINE_MAX_RECORDS` (500), by count only (no byte bound); oldest evicted (the doc stays frozen) |
-| `synced` | `docId` | — | `SyncedRecord` | 1 per synced doc |
+| `synced` | `docId` | — | `SyncedRecord` | 1 per synced doc (a held edit keeps only its hash and its texts' size here) |
+| `heldText` | `docId` | — | `HeldTextRecord` (held edit's text and base, §f.6) | 1 per synced record whose `held.bytes` is set, written and deleted with it; ≤ `HELD_TEXT_MAX_CHARS` (8 Mi) a text, ≤ `HELD_TEXT_MAX_BYTES` (32 MiB, the outbox mirror's scale) UTF-8 over all; past either a held edit keeps its hash only. Never cached in memory: read to publish (and at start, to write a missing held-text file, §e.4) |
 | `baseText` | `docId` | — | `BaseTextRecord` (deflated, ≤ `MAX_BASE_TEXT_CHARS`) | markdown/canvas synced docs |
 | `localTree` | `pathKey` | — | `LocalTreeRecord` | 1 per vault file |
 | `intents` | `id` | — | `IntentRecord` | In-flight multi-step disk ops (< 1000); deleted on completion |
@@ -1667,7 +1668,7 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
   shape. A DB whose `identity.schemaVersion` differs fails the identity check and is rebuilt (§i.5). Version 2 dropped
   the unused indexes `streams.byStalePriority` / `byAccess`, `synced.byPathKey` and `blobQueue.byActiveDue`, the
   fields only they read (`priority`, `lastAccessMs`, `active`), and the outbox `sent` state with `attempts` /
-  `lastSentAtMs`.
+  `lastSentAtMs`. Version 3: `SyncedRecord.heldHash` became `held` (hash, texts' size) and the `heldText` store holds the texts (§f.6 "Held edits").
 
 ### e.2 Transactions
 
@@ -1690,7 +1691,7 @@ Rules:
 | `T_drop_stream` (retire, §d.9; a tick's drops share one transaction, `Repo.tDropStreams`, each stream checked on its own) | streams, snapshots, tail, quarantine, outbox, meta, synced, intents | Refuses (no write) if the record's `remoteHeadSeq` / `remoteCheckpointCoversSeq` moved, the outbox holds a record of the stream other than a merged alias's held frames named by the caller, or a synced record or an intent names its doc; else deletes the stream record, its snapshot, tail and quarantine rows, those held frames, and its `ckptDuty` entry (`src/engine/store/repo.ts`). The cursor is untouched | Before commit: nothing changed, the next tick drops it. After: the doc loads as an empty replica; a later row of the stream (a late writer) re-creates the record and the stream is retired again. |
 | `T_adopt` | outbox, meta | Adoptable record | Before commit: the provisional was applied to the bound replica only. The edit reaches disk through the editor and is re-merged. The commit or the author's resend brings it anyway. |
 | `T_intent_begin` / `T_intent_end` | intents | Put / delete the intent | §f.7: startup completes or rolls back each intent from disk state. |
-| `T_synced` (after a disk-op batch) | synced, baseText, localTree, intents | Synced put/drop, base put, stat cache, intent end | Before commit: the next reconcile sees L = R ≠ S, which is the "identical" path. Only S advances. |
+| `T_synced` (after a disk-op batch) | synced, baseText, heldText, localTree, intents | Synced put/drop, base put, held texts put / dropped with their record, stat cache, intent end | Before commit: the next reconcile sees L = R ≠ S, which is the "identical" path. Only S advances. |
 | `T_cfg` | cfgBase | Settings sync base after projection (`src/engine/settings/cfgSync.ts:235`) | As `T_synced`. |
 
 - **Compaction and remote checkpoint gate.** They require "no own unreceipted frames of the stream". This is the only
@@ -1774,25 +1775,45 @@ src/engine/compose/syncedMirror.ts) after the first change; a fixed delay, not r
 8B magic "YAOSSYN1", u8 version, varstring vaultId, varstring vaultEpoch, varstring deviceId,
 varuint generation, varuint writtenAtMs, varuint nsCoversSeq, varuint count,
 count × { varstring docId, varstring path, u8 kindCode, 32B contentHash, varuint nsTouchSeq, varuint bodyRemoteSeq, varuint blobRev,
-          u8 flags (v2: bit0 fileGone, bit1 renamedTo, bit2 heldHash),
-          [bit1] varstring renamedTo.to, varuint renamedTo.atMs, [bit2] 32B heldHash },
-[v2] varuint moveCount, moveCount × { varstring from, varstring to, varuint atMs },
+          u8 flags (bit0 fileGone, bit1 renamedTo, bit2 held, bit3 held.bytes; bit3 needs bit2),
+          [bit1] varstring renamedTo.to, varuint renamedTo.atMs, [bit2] 32B held.hash, [bit3] varuint held.bytes },
+varuint moveCount, moveCount × { varstring from, varstring to, varuint atMs },
 32B sha256
 ```
 
 - Lets recovery tell "unchanged since sync" (hash equal) from "edited offline", so an IDB loss does not produce
   conflict copies.
 - Base texts are not mirrored. Recovered docs merge without a base only when both sides changed.
-- **Marks** (v2): a record's decided delete (`fileGone`), the user's rename that took the file away (`renamedTo`) and
-  the disk content a content merge the write gate refused left (`heldHash`, §f.6 rename inference pairs by it). They
-  are what the store alone knows of a file this device could not publish yet; recovered without them, the moved file
-  read as a new doc and the old one came back at its path (sim suite-1 wipe/revoke/roll seeds 40 and 112). Version 1
-  still decodes (no marks).
-- **Moves** (v2): the previous epoch's renames this store has not published (§c.12 "Renames", `pathMove:` meta
+- **Version** 3 only: an older mirror reads as none (pre-release, no fallback).
+- **Marks**: a record's decided delete (`fileGone`), the user's rename that took the file away (`renamedTo`) and
+  the edit a content merge the write gate refused left (`held`, §f.6 "Held edits": its hash, and its text and base
+  while the store keeps them). They are what the store alone knows of a file this device could not publish yet;
+  recovered without them, the moved file read as a new doc and the old one came back at its path, without the held
+  edit (sim suite-1 wipe/revoke/roll seeds 40 and 112). A held edit rides as its hash and its texts' size only: the
+  texts are in its held-text file (below), so a mirror write costs nothing per held text.
+- **Moves**: the previous epoch's renames this store has not published (§c.12 "Renames", `pathMove:` meta
   records). Recovery stores them again; written at once when a runtime starts with any, and when one is retired.
 - **Written at once**, not a debounce later, when a pass changes a record's marks (src/engine/compose/vaultRuntime.ts
   `runPass`, also when the write gate stopped the pass), and when the outbox mirror newly lists a doc as unmirrored
   (`MirrorWriter.onUnmirrored`): that doc's record is then all recovery has of it here.
+
+**Held-text files** (`held/<docId>.<hash>.bin`, src/engine/compose/heldMirror.ts): the text and base of one held
+edit (§f.6 "Held edits"), one file each:
+
+```
+8B magic "YAOSHLD1", u8 version (1), varstring vaultId, varstring vaultEpoch, varstring deviceId,
+varstring docId, 32B hash, varstring text, varstring base, 32B sha256
+```
+
+- **Written once** when the edit is kept (the commit that puts its `heldText` row, `ReconcileStore.onHeld`), and
+  **removed** when it is cleared (published, merged, its record dropped). Never rewritten: the synced mirror's writes
+  touch no held text. Writes run one at a time in commit order.
+- **At start** (`HeldTextMirror.sync`) the dir is brought to the store: files of kept texts that have none are written
+  (inherited from a lineage dir, a crash between a commit and its write), files no record keeps are removed.
+- **Recovery** (§i.5 step 3, predecessor inherit) reads the file each mirrored held edit with a size names, from the
+  dir the synced mirror came from; one missing, undecodable, or naming another store, doc or hash leaves that record
+  the held hash alone. The lineage dirs' held files go with their other files, after this store's are written.
+- **Bound:** `HELD_TEXT_MAX_BYTES` (32 MiB, the outbox mirror's scale) over all files, as for the `heldText` store.
 
 **Snapshots** (`snapshots/`): each snapshot's parts and its descriptor, plus the download cache for one remote
 snapshot (§j.4). A snapshot exists iff its descriptor decodes; parts without one are swept.
@@ -1870,7 +1891,7 @@ All are in `src/core/types.ts`.
 | R | S | L at key | Ops |
 |---|---|---|---|
 | live | present | present | 1. If `Rm` and not `pendingLocal`: `diskRename(S.path → R.path, expect hash)` (remote move; plain rename; case-only via temp on case-insensitive FS; folder-casing-only differences tolerated there). 2. Content: neither changed → `syncedPut` if the stat moved; `Rc` only → `reconcileContent` (crdt-only write) / blob `fetchBlob`; `Lc` only → `reconcileContent` (disk-only, frames) / blob `pushBlob` + `nsSetBlob(baseRev = R.blob.rev)`; both → `reconcileContent` (3-way) / blob keep-both (`conflictCopy`, `fetchBlob`, `nsCreate` for the copy). |
-| live | present | absent | Inferred or observed rename to a leftover L entry → `nsRename` (+ content step at the new path). Else if `Rc` (remote edited since sync) → `diskMaterialize(R.path, expect absent)` (edit beats delete). Else → `nsDelete(baseBodySeq = streams.appliedSeq)` (brake: mass-delete-local). |
+| live | present | absent | Inferred or observed rename to a leftover L entry → `nsRename` (+ content step at the new path). Else, with a held edit's text on S (§f.6 "Held edits") → `reconcileContent(held)` (the held text merged against its base into the doc, no disk I/O); the rest is the next pass's. Else if `Rc` (remote edited since sync) → `diskMaterialize(R.path, expect absent)` (edit beats delete). Else → `nsDelete(baseBodySeq = streams.appliedSeq)` (brake: mass-delete-local). |
 | deleted | present | absent | Observed rename (not hash inference) to a leftover L entry → `nsRestore(path = L.path, againstDeleteSeq = R.deletedSeq)` (the unseen rename wins, as in E6) + `reconcileContent` if L hash ≠ S.contentHash, else `syncedPut` at L.path. Else, with restore duty (§c.7: own rows the delete did not cover) → `nsRestore(R.path)`, S kept: the next pass is live/present/absent, so the local delete goes out again with a base covering the own rows (or edit beats delete). Dropping S left the restore to the no-S row, which brought the doc back for good. Else → `syncedDrop` (kept while ns is not ready). |
 | deleted | present | present, ¬`Lc` | If the doc has own pending body frames and the restore condition holds → `nsRestore`. Else → `diskTrash(S.path, expect hash = S.contentHash)` + `syncedDrop` (brake: mass-delete-remote). |
 | deleted | present | present, `Lc` | Local edit beats remote delete: `nsRestore(path = S.path, againstDeleteSeq = R.deletedSeq)` + `reconcileContent`. |
@@ -2032,11 +2053,34 @@ All are in `src/core/types.ts`.
   - *Missing* = synced docs whose `S.pathKey` has no L entry. *New* = L entries with no R or S match.
   - Pair by `(kind, contentHash)`. A unique pair is a rename. Several equal hashes are paired by score (same leaf
     name, then same parent folder), with ties broken by path code-unit order. Unpaired ones become delete + create.
-  - A missing doc also pairs by `SyncedEntry.heldHash`: the disk content of a content merge the write gate refused
-    (key missing, src/engine/reconcile/runner.ts `keepHeldContent`). S stays the merge base while the file moved on;
-    without it a file edited and then renamed before this device could write (or while the app was down) read as a
-    new doc. It is dropped with the next sync point (reconcile/store.ts). A file edited again after such a rename,
-    unobserved, still pairs with nothing (open: SIM-S1-HELD-EDIT-UNOBSERVED-RENAME).
+  - A missing doc also pairs by `SyncedEntry.held.hash`: the disk content of a content merge the write gate refused
+    (key missing). S stays the merge base while the file moved on; without it a file edited and then renamed before
+    this device could write (or while the app was down) read as a new doc.
+  - **Held edits** (`SyncedEntry.held`, src/engine/reconcile/heldJob.ts). The merge job a write gate refuses records
+    on S, before the KeyMissingError goes on, the disk content's hash and, within the bounds, its text and the base it
+    was merged against (markdown: canonical text and base; canvas: file text and base merge text). The texts go to the
+    `heldText` store in the record's transaction, and to a held-text file of their own (§e.4); the record keeps only
+    their UTF-8 size (`held.bytes`), so nothing of them stays in memory (read to publish). An IDB loss with the side
+    files kept recovers them from the file, base included, although recovered records have no stored base. Bounds: each
+    text ≤ `HELD_TEXT_MAX_CHARS` (= `MAX_DOC_TEXT_CHARS`, the largest doc text the engine merges; a markdown text
+    above `MERGE_MAX_INPUT_CHARS` publishes as a too-large conflict, its text a conflict copy) and all records' texts
+    ≤ `HELD_TEXT_MAX_BYTES` (32 MiB, the outbox mirror's scale).
+    - *Published* when the doc's file is gone and pairs with nothing (renamed and edited again unobserved, deleted):
+      the planner emits only `reconcileContent(held)` for the doc; the job merges the held text against its base into
+      the doc as the user's edit (no disk read or write; a conflict writes the held text as a conflict copy) and puts
+      S at the held content (base = held text). bodyVersion is the new version when the replica ends at the held
+      text, else null (a peer's edit: the remote side reads as changed). The next pass decides the absence against a
+      doc that holds the edit: a delete, or edit beats delete with it. Otherwise a peer's edit restored the doc
+      without it, with the canvas records the user had deleted (sim suite-1 wipe/revoke/roll seed 112). While the gate
+      is still shut the publish is refused like any merge, and nothing about the file is decided.
+    - With the file present nothing is published separately: the ordinary merge takes the disk, which supersedes
+      the held text, against S's base.
+    - *Cleared* with the next sync point (reconcile/store.ts commit: a record with another content hash, or the held
+      one), so by the publish or the ordinary merge; its `heldText` row goes in the same transaction, as with a
+      dropped record.
+    - *Past the bound*, or with no base known (a refusal right after recovery with both sides changed), the hash
+      alone: an unchanged renamed file still pairs by it; one renamed and edited again unobserved reads as a delete +
+      a create, every text still on disk (no loss; removals in the doc may come back, as before held texts).
   - Observed `rename` events that the scan verified (the target exists) win over inference, and may carry a content
     change (rename + edit).
   - Observed renames live in memory. One that took a synced doc's file away while inference was off (ns not ready),
@@ -2489,7 +2533,8 @@ Further caps:
 1. Open a fresh DB under the same name. On a WebKit connection loss, try reopening first.
 2. Import the outbox mirror: same `clientFrameId`s, `order`s and states (a legacy `sent` → pending), and `outboxOrder.next =
    max + 1`.
-3. Import the synced mirror as `SyncedEntry` with `hasBase = false` and `bodyVersion = null`. With `bodyVersion =
+3. Import the synced mirror as `SyncedEntry` with `hasBase = false` and `bodyVersion = null` (marks and held edits,
+   with their texts, as mirrored; §f.6 "Held edits"). With `bodyVersion =
    null` the planner compares content instead: `Rc := streams.textHash ≠ S.contentHash`. A doc the outbox mirror
    lists as unmirrored (§e.4) gets `contentHash = UNTRUSTED_CONTENT_HASH` (all zeros, no text's hash): its file reads
    as changed, neither side matches the synced content, and the merge keeps the replica's text with the disk text as

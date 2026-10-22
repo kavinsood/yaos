@@ -14,6 +14,7 @@ import { encodeOutboxMirror, UNTRUSTED_CONTENT_HASH, type MirrorIdentity } from 
 import { MemSideFiles } from "../runtime/testHarness";
 import type { DiskSchema } from "../reconcile/store";
 import { DB_SCHEMA_VERSION, STORE, STORE_SPECS, type SyncedRecord } from "../store/schema";
+import { HeldTextMirror } from "./heldMirror";
 import { importSyncedMirror, SyncedMirrorWriter } from "./syncedMirror";
 
 const rec: SyncedRecord = {
@@ -92,27 +93,75 @@ test("recovery: a doc the outbox mirror lists as unmirrored is imported with no 
 	assert.equal(none.get(rec.docId), rec.contentHash);
 });
 
-test("recovery: a record's decided delete, kept rename and held content come back with it (mirror format 2)", async () => {
+test("recovery: a record's decided delete, kept rename and held edit come back with it; the texts from its held-text file", async () => {
 	// Sim suite-1 wipe/revoke/roll seeds 40 and 112: a store lost after the user renamed (or edited, then renamed) a
 	// file this device could not publish came back as a plain sync point; the moved file read as a new doc and the
 	// old one was put back at its path.
-	const marked: SyncedRecord = {
-		...rec, fileGone: true, renamedTo: { to: "b/renamed.md" as VaultPath, atMs: 1_759_600_000_123 }, heldHash: "cd".repeat(32) as ContentHash,
+	const hashC = "cd".repeat(32) as ContentHash;
+	const marked: SyncedRecord = { ...rec, fileGone: true, renamedTo: { to: "b/renamed.md" as VaultPath, atMs: 1_759_600_000_123 }, held: { hash: hashC, bytes: 24 } };
+	const texts = { docId: rec.docId, hash: hashC, text: "one\nthree\n", base: "one\ntwo\nthree\n" };
+	const identity = { vaultId: "v", vaultEpoch: "e", deviceId: "dev" } as MirrorIdentity;
+	const hash = createWebHash();
+	const run = async (withFile: boolean): Promise<{ row: SyncedRecord | undefined; held: unknown[] }> => {
+		const side = new MemSideFiles();
+		const w = new SyncedMirrorWriter({ side, hash, clock: createWebClock(), identity: () => identity, entries: () => [marked], nsCoversSeq: () => 2 as Seq, debounceMs: 60_000 });
+		w.markDirty();
+		await w.flush();
+		if (withFile) {
+			const files = new HeldTextMirror({ side, hash, identity: () => identity });
+			files.onHeld([texts], []);
+			await files.idle();
+		}
+		const storage = new MemStoragePort();
+		const db = await storage.open<DiskSchema>("fresh", DB_SCHEMA_VERSION, STORE_SPECS);
+		assert.equal(await importSyncedMirror({ db, side, hash, identity, pathKey: (p) => p as PathKey, nowMs: 1 }), 1);
+		const [row] = await db.tx([STORE.synced], "readonly", (tx) => tx.getAll(STORE.synced));
+		const held = await db.tx([STORE.heldText], "readonly", (tx) => tx.getAll(STORE.heldText));
+		db.close();
+		return { row, held };
 	};
+	const { row, held } = await run(true);
+	assert.deepEqual({ gone: row?.fileGone, to: row?.renamedTo, held: row?.held }, { gone: true, to: marked.renamedTo, held: marked.held });
+	assert.deepEqual(held, [texts], "the held texts are back in the heldText store");
+	assert.equal(row?.contentHash, rec.contentHash);
+	assert.equal(row?.bodyVersion, null, "still no CRDT sync point (§i.5 step 3)");
+	// The file not written (lost before its write): the held hash alone, no size.
+	const lost = await run(false);
+	assert.deepEqual(lost.row?.held, { hash: hashC });
+	assert.deepEqual(lost.held, []);
+});
+
+test("held texts: a synced-record change with held edits present writes no held-text bytes; a held edit's file is written once and removed when cleared", async () => {
 	const identity = { vaultId: "v", vaultEpoch: "e", deviceId: "dev" } as MirrorIdentity;
 	const hash = createWebHash();
 	const side = new MemSideFiles();
-	const w = new SyncedMirrorWriter({ side, hash, clock: createWebClock(), identity: () => identity, entries: () => [marked], nsCoversSeq: () => 2 as Seq, debounceMs: 60_000 });
-	w.markDirty();
-	await w.flush();
-	const storage = new MemStoragePort();
-	const db = await storage.open<DiskSchema>("fresh", DB_SCHEMA_VERSION, STORE_SPECS);
-	assert.equal(await importSyncedMirror({ db, side, hash, identity, pathKey: (p) => p as PathKey, nowMs: 1 }), 1);
-	const [row] = await db.tx([STORE.synced], "readonly", (tx) => tx.getAll(STORE.synced));
-	db.close();
-	assert.deepEqual({ gone: row?.fileGone, to: row?.renamedTo, held: row?.heldHash }, { gone: true, to: marked.renamedTo, held: marked.heldHash });
-	assert.equal(row?.contentHash, rec.contentHash);
-	assert.equal(row?.bodyVersion, null, "still no CRDT sync point (§i.5 step 3)");
+	const written: [string, number][] = [];
+	const orig = side.write.bind(side);
+	side.write = async (n, b) => {
+		written.push([n, b.length]);
+		await orig(n, b);
+	};
+	const big = "x".repeat(1_000_000);
+	const heldHash = "cd".repeat(32) as ContentHash;
+	const files = new HeldTextMirror({ side, hash, identity: () => identity });
+	files.onHeld([{ docId: rec.docId, hash: heldHash, text: big, base: big }], []);
+	await files.idle();
+	assert.equal(written.length, 1);
+	assert.ok(written[0]![0].startsWith("held/") && written[0]![1] > 2_000_000, "the texts, once, in their own file");
+	let records: SyncedRecord[] = [{ ...rec, held: { hash: heldHash, bytes: 2_000_000 } }];
+	const w = new SyncedMirrorWriter({ side, hash, clock: createWebClock(), identity: () => identity, entries: () => records, nsCoversSeq: () => 2 as Seq, debounceMs: 60_000 });
+	for (let i = 0; i < 3; i++) {
+		// any synced change: another record, the held one's stat
+		records = [...records, { ...rec, docId: `doc-${i}-0000000000000` as DocId, path: `n${i}.md`, pathKey: `n${i}.md` as PathKey }];
+		w.markDirty();
+		await w.flush();
+	}
+	const after = written.slice(1);
+	assert.deepEqual(after.map(([n]) => n), ["synced-a.bin", "synced-b.bin", "synced-a.bin"], "only the synced mirror is written");
+	assert.ok(after.every(([, n]) => n < 1024), `no held-text bytes in it: ${after.map(([, n]) => n).join(", ")}`);
+	files.onHeld([], [{ docId: rec.docId, hash: heldHash }]);
+	await files.idle();
+	assert.deepEqual([...side.files.keys()].filter((k) => k.startsWith("held/")), [], "removed when cleared");
 });
 
 test("recovery: the previous epoch's unpublished renames ride the mirror and come back into meta (MetaPathMove), entries or not", async () => {

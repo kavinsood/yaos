@@ -111,7 +111,7 @@ export class MemSideFiles implements SideFilePort {
 	async remove(name: SideFileName): Promise<void> {
 		this.files.delete(name);
 	}
-	async list(prefix: "snapshots/"): Promise<readonly SideFileName[]> {
+	async list(prefix: "snapshots/" | "held/"): Promise<readonly SideFileName[]> {
 		return [...this.files.keys()].filter((k) => k.startsWith(prefix)) as SideFileName[];
 	}
 }

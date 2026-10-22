@@ -20,7 +20,7 @@ export class MemSide implements SideFilePort {
 	async read(n: SideFileName) { return this.files.get(n)?.slice() ?? null; }
 	async write(n: SideFileName, b: Uint8Array) { this.files.set(n, b.slice()); }
 	async remove(n: SideFileName) { this.files.delete(n); }
-	async list(prefix: "snapshots/") { return [...this.files.keys()].filter((k) => k.startsWith(prefix)).sort() as SideFileName[]; }
+	async list(prefix: "snapshots/" | "held/") { return [...this.files.keys()].filter((k) => k.startsWith(prefix)).sort() as SideFileName[]; }
 	names(suffix: string): string[] { return [...this.files.keys()].filter((k) => k.endsWith(suffix)).sort(); }
 }
 

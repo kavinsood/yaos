@@ -18,12 +18,15 @@ export const OUTBOX_MIRROR_MAGIC = new Uint8Array([0x59, 0x41, 0x4f, 0x53, 0x4f,
 /** "YAOSSYN1" */
 export const SYNCED_MIRROR_MAGIC = new Uint8Array([0x59, 0x41, 0x4f, 0x53, 0x53, 0x59, 0x4e, 0x31]);
 /**
- * The synced mirror's format: 2 adds each entry's decided delete (`fileGone`), the observed rename that took the
- * file away (`renamedTo`) and the disk content a refused commit left (`heldHash`): a store lost after a rename the
- * planner could not infer or carry out yet (ns not ready, write gate refused) would otherwise recover the record as a
- * plain sync point and read the moved file as new. Version 1 still decodes (none of them).
+ * The synced mirror's format, 3: each entry carries its decided delete (`fileGone`), the observed rename that took the
+ * file away (`renamedTo`) and the edit the write gate refused (`held`: its hash, and its text and base while the store
+ * keeps them): a store lost after a rename the planner could not infer or carry out yet (ns not ready, write gate
+ * refused), or with an edit it could not publish yet, would otherwise recover the record as a plain sync point. The
+ * held edit's texts are not in it: they sit in one held-text file per held edit (HELD_TEXT_MAGIC below), written once
+ * when the edit is kept and removed when it is cleared. Only this version decodes (pre-release: an older mirror reads
+ * as none).
  */
-export const MIRROR_FORMAT_VERSION = 2;
+export const MIRROR_FORMAT_VERSION = 3;
 /**
  * The outbox mirror's format: 2 adds each frame's origins (identity-per-store §5.2: a frame inherited from a lost
  * predecessor store and re-issued under this one keeps the identity it had there, for the commit check); 3 adds the
@@ -82,12 +85,18 @@ export interface SyncedMirrorEntryData {
 	readonly nsTouchSeq: Seq;
 	readonly bodyRemoteSeq: Seq;
 	readonly blobRev: Seq;
-	/** Format 2: SyncedEntry.fileGone. */
+	/** SyncedEntry.fileGone. */
 	readonly fileGone?: true;
-	/** Format 2: SyncedEntry.renamedTo (atMs floored to an integer). */
+	/** SyncedEntry.renamedTo (atMs floored to an integer). */
 	readonly renamedTo?: { readonly to: VaultPath; readonly atMs: number };
-	/** Format 2: SyncedEntry.heldHash. */
-	readonly heldHash?: ContentHash;
+	/** SyncedEntry.held (its texts are in a held-text file, `heldTextFileName`). */
+	readonly held?: MirrorHeldEdit;
+}
+
+/** A held edit as the synced mirror carries it: its hash, and its texts' UTF-8 size when a held-text file has them. */
+export interface MirrorHeldEdit {
+	readonly hash: ContentHash;
+	readonly bytes?: number;
 }
 
 export interface SyncedMirrorData extends MirrorIdentity {
@@ -96,8 +105,8 @@ export interface SyncedMirrorData extends MirrorIdentity {
 	readonly nsCoversSeq: Seq;
 	readonly entries: readonly SyncedMirrorEntryData[];
 	/**
-	 * Format 2: the previous epoch's renames this store has not published yet (MetaPathMove, DESIGN §c.12
-	 * "Renames"; atMs floored to an integer). Absent: none (or format 1).
+	 * The previous epoch's renames this store has not published yet (MetaPathMove, DESIGN §c.12 "Renames"; atMs
+	 * floored to an integer). Absent: none.
 	 */
 	readonly moves?: readonly SyncedMirrorMoveData[];
 }
@@ -226,9 +235,11 @@ export function encodeSyncedMirror(m: SyncedMirrorData, hash: Sha): Promise<Uint
 	for (const e of m.entries) {
 		w.varstring(e.docId).varstring(e.path).u8(docKindCode(e.kind)).fixed(hashToBytes(e.contentHash), 32);
 		w.varuint(e.nsTouchSeq).varuint(e.bodyRemoteSeq).varuint(e.blobRev);
-		w.u8((e.fileGone ? 1 : 0) | (e.renamedTo ? 2 : 0) | (e.heldHash !== undefined ? 4 : 0));
+		const sized = e.held?.bytes !== undefined;
+		w.u8((e.fileGone ? 1 : 0) | (e.renamedTo ? 2 : 0) | (e.held ? 4 : 0) | (sized ? 8 : 0));
 		if (e.renamedTo) w.varstring(e.renamedTo.to).varuint(Math.max(0, Math.floor(e.renamedTo.atMs)));
-		if (e.heldHash !== undefined) w.fixed(hashToBytes(e.heldHash), 32);
+		if (e.held) w.fixed(hashToBytes(e.held.hash), 32);
+		if (sized) w.varuint(e.held.bytes);
 	}
 	const moves = m.moves ?? [];
 	w.varuint(moves.length);
@@ -237,7 +248,7 @@ export function encodeSyncedMirror(m: SyncedMirrorData, hash: Sha): Promise<Uint
 }
 
 export function decodeSyncedMirror(bytes: Uint8Array, hash: Sha): Promise<MirrorDecodeResult<SyncedMirrorData>> {
-	return open(bytes, SYNCED_MIRROR_MAGIC, hash, (r, version) => {
+	return open(bytes, SYNCED_MIRROR_MAGIC, hash, (r) => {
 		const id = readIdentity(r);
 		const nsCoversSeq = r.varuint();
 		const n = r.varuint();
@@ -250,28 +261,69 @@ export function decodeSyncedMirror(bytes: Uint8Array, hash: Sha): Promise<Mirror
 			const nsTouchSeq = r.varuint();
 			const bodyRemoteSeq = r.varuint();
 			const blobRev = r.varuint();
-			const flags = version >= 2 ? r.u8() : 0;
-			if (flags > 7) throw new CodecError("unknown synced entry flags");
+			const flags = r.u8();
+			if (flags > 15 || (flags & 12) === 8) throw new CodecError("unknown synced entry flags");
 			let renamedTo: SyncedMirrorEntryData["renamedTo"];
 			if (flags & 2) {
 				const to = r.varstring();
 				renamedTo = { to, atMs: r.varuint() };
 			}
-			const heldHash = flags & 4 ? bytesToHash(r.copy(32)) : undefined;
+			let held: MirrorHeldEdit | undefined;
+			if (flags & 4) {
+				const hash = bytesToHash(r.copy(32));
+				held = flags & 8 ? { hash, bytes: r.varuint() } : { hash };
+			}
 			entries.push({
 				docId, path, kind, contentHash, nsTouchSeq, bodyRemoteSeq, blobRev,
-				...(flags & 1 ? { fileGone: true as const } : {}), ...(renamedTo ? { renamedTo } : {}), ...(heldHash !== undefined ? { heldHash } : {}),
+				...(flags & 1 ? { fileGone: true as const } : {}), ...(renamedTo ? { renamedTo } : {}), ...(held ? { held } : {}),
 			});
 		}
 		const moves: SyncedMirrorMoveData[] = [];
-		const nm = version >= 2 ? r.varuint() : 0;
+		const nm = r.varuint();
 		for (let i = 0; i < nm; i++) {
 			const from = r.varstring();
 			const to = r.varstring();
 			moves.push({ from, to, atMs: r.varuint() });
 		}
 		return { ...id, nsCoversSeq, entries, ...(moves.length > 0 ? { moves } : {}) };
-	}, [1, MIRROR_FORMAT_VERSION]);
+	});
+}
+
+/** "YAOSHLD1" */
+export const HELD_TEXT_MAGIC = new Uint8Array([0x59, 0x41, 0x4f, 0x53, 0x48, 0x4c, 0x44, 0x31]);
+export const HELD_TEXT_FORMAT_VERSION = 1;
+
+/** A held edit's texts as one side file holds them (DESIGN §e.4 "Held-text files"). */
+export interface HeldTextFileData extends MirrorIdentity {
+	readonly docId: DocId;
+	readonly hash: ContentHash;
+	readonly text: string;
+	readonly base: string;
+}
+
+/** The held-text file of `docId`'s held edit `hash`: one per held edit, never rewritten. */
+export function heldTextFileName(docId: DocId, hash: ContentHash): `held/${string}.bin` {
+	return `held/${docId}.${hash}.bin`;
+}
+
+export function encodeHeldTextFile(m: HeldTextFileData, hash: Sha): Promise<Uint8Array> {
+	const w = new Writer(64 + m.text.length + m.base.length);
+	w.raw(HELD_TEXT_MAGIC).u8(HELD_TEXT_FORMAT_VERSION);
+	w.varstring(m.vaultId).varstring(m.vaultEpoch).varstring(m.deviceId).varstring(m.docId).fixed(hashToBytes(m.hash), 32);
+	w.varstring(m.text).varstring(m.base);
+	return seal(w, hash);
+}
+
+export function decodeHeldTextFile(bytes: Uint8Array, hash: Sha): Promise<MirrorDecodeResult<HeldTextFileData>> {
+	return open(bytes, HELD_TEXT_MAGIC, hash, (r) => {
+		const vaultId = r.varstring() as VaultId;
+		const vaultEpoch = r.varstring();
+		const deviceId = r.varstring() as DeviceId;
+		const docId = r.varstring() as DocId;
+		const h = bytesToHash(r.copy(32));
+		const text = r.varstring();
+		return { vaultId, vaultEpoch, deviceId, docId, hash: h, text, base: r.varstring() };
+	}, [HELD_TEXT_FORMAT_VERSION]);
 }
 
 /**

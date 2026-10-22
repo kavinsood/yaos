@@ -710,6 +710,13 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		// "Not a rename" needs the inference inputs, for edit-beats-delete as for nsDelete: while ns
 		// is not ready inference is off, and re-materializing would undo the user's rename into a copy.
 		if (!input.localComplete || unhashedFresh || !ctx.nsReady) return hold();
+		// An edit the write gate refused, kept with its text (SyncedEntry.held): published into the doc first, as the
+		// user's edit of the file before it went (renamed and edited again unobserved, deleted). The next pass decides
+		// the file's absence against the doc that holds it. Otherwise edit beats delete (a peer's edit) brought back what
+		// the held edit removed (sim suite-1 wipe/revoke/roll seed 112). Not for a rebound loser's record (prefix).
+		if (s.held?.bytes !== undefined && s.kind !== "blob" && docId === origId) {
+			return push([...prefix, { op: "reconcileContent", docId, path: s.path, kind: s.kind, hasBase: s.hasBase, held: true }]);
+		}
 		const Rc = s.kind === "blob" ? (r.blob?.rev ?? 0) !== s.blobRev : !versionEq(r.body!.version, s.bodyVersion);
 		if (Rc) {
 			// Edit beats delete. A decided delete whose path holds a new file by now: the file merges into the doc
