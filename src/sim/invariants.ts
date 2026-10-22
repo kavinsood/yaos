@@ -41,10 +41,10 @@
  *                      call that kept moving (a slow one)
  *
  *   retired            every provably dead doc's b: / c: stream with rows (a merged alias, or no committed ns
- *                      entry but a pruned-delete stub) is retired on the relay (gcSeq = lastSeq: nothing beyond
- *                      its checkpoint) and no running device holds a record of it (stream, snapshot, tail,
- *                      quarantine); and no doc with a live or deleted entry has a retired checkpoint (DESIGN §b.5
- *                      "retired", checkRetired)
+ *                      entry but a record of its prune: a stub, or a device's kept delete base) is retired on
+ *                      the relay (gcSeq = lastSeq: nothing beyond its checkpoint) and no running device that
+ *                      can tell holds a record of it (stream, snapshot, tail, quarantine); and no doc with a
+ *                      live or deleted entry has a retired checkpoint (DESIGN §b.5 "retired", checkRetired)
  *   identity           one deviceId per store (identity-per-store §1.3, §5.2): no two devices ever ran as the
  *                      same deviceId (a clone gets its own), and every state dir a device's engines read, listed,
  *                      wrote or removed is one of its own stores' (a copied or synced folder's foreign dirs are
@@ -71,7 +71,7 @@ import type { QuarantineRecord } from "../engine/store/schema";
 import { checkNsInvariants } from "../core/ns/verify";
 import { pathKey } from "../core/paths/pathKey";
 import { MAX_NS_FRAME_BYTES, NS_DEDUPE_RING, TAIL_HARD_ROWS } from "../core/limits";
-import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type DeviceId, type StreamName } from "../core/types";
+import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type DeviceId, type DocId, type StreamName } from "../core/types";
 import type { SnapshotRecord, TailRecord } from "../engine/store/schema";
 import { gateRow } from "../engine/sync/ingestRow";
 import { gate } from "../engine/ingest/gate";
@@ -381,11 +381,13 @@ export function checkCheckpoints(devs: readonly SimDevice[], net: SimNet): Viola
 
 /**
  * Invariant "retired" (DESIGN §b.5 "retired", §c.9; body/retire.ts), at quiescence, both ways:
- *  - every b: / c: stream with rows whose doc is provably dead in the devices' ns fold (a merged alias, or no
- *    committed entry but a pruned-delete stub) is retired on the relay (gcSeq = lastSeq: nothing beyond its
- *    checkpoint, any encoding), and no running device holds a record of it (stream record, snapshot, tail rows,
- *    quarantine records). A doc with no entry and no stub (an aged-out stub, a pruned merged alias, junk rows of an
- *    ignored create) may keep its stream: absence is not evidence (retire.ts deadReason);
+ *  - every b: / c: stream with rows whose doc is provably dead is retired on the relay (gcSeq = lastSeq: nothing
+ *    beyond its checkpoint, any encoding), and no running device that can tell holds a record of it (stream record,
+ *    snapshot, tail rows, quarantine records). Provably dead: a merged alias or a pruned-delete stub in the devices'
+ *    common ns fold (every device), or a delete base a device's own fold kept when it pruned the entry
+ *    (StreamRecord.prunedDeleteBase, NsRuntime.removedDeletes: that device). A doc no device has evidence for (an
+ *    aged-out stub, a pruned merged alias, junk rows of an ignored create) may keep its stream: absence is not
+ *    evidence (retire.ts deadReason);
  *  - no stream of a doc with a live or deleted entry carries a `retired` checkpoint: retiring it destroyed the rows
  *    of a doc that is not dead (a body retired before its create folded, suite-1 seed 264).
  * `isDown`: devices not running now.
@@ -396,7 +398,14 @@ export async function checkRetired(devs: readonly SimDevice[], net: SimNet, isDo
 	const ref = devs.find((d, i) => !isDown(i) && d.vrt);
 	const ns = ref?.vrt?.log.c.ns;
 	if (!ns) return out;
-	const dead: StreamName[] = [];
+	const running = devs.filter((d, i) => !isDown(i) && d.vrt);
+	/** The delete base a device's own fold kept for the doc's pruned entry. */
+	const kept = (d: SimDevice, stream: StreamName, docId: string): boolean => {
+		const c = d.vrt!.log.c;
+		return c.ns.removedDeletes.has(docId as DocId) || c.repo.stream(stream)?.prunedDeleteBase !== undefined;
+	};
+	/** Dead streams, with the devices that must not hold them (null: every device). */
+	const dead: { readonly stream: StreamName; readonly by: readonly SimDevice[] | null }[] = [];
 	for (const stream of net.relay.streams()) {
 		const cls = streamClass(stream);
 		const docId = cls === "body" || cls === "canvas" ? streamDocId(stream) : null;
@@ -409,19 +418,21 @@ export async function checkRetired(devs: readonly SimDevice[], net: SimNet, isDo
 			if (g.ok && g.t === "checkpoint" && g.checkpoint.encoding === CheckpointEncoding.retired) bad(`${stream} (${e.state}) has a retired checkpoint at ${ck.coversSeq}: a doc that is not dead`);
 			continue;
 		}
-		if (!e && !ns.state.pruned.has(docId)) continue;
+		const common = e !== undefined || ns.state.pruned.has(docId);
+		const knowers = common ? null : running.filter((d) => kept(d, stream, docId));
+		if (knowers !== null && knowers.length === 0) continue;
 		const rows = net.relay.rows(stream, { includeGc: true });
 		const last = rows[rows.length - 1]?.seq ?? 0;
 		if (last === 0) continue;
-		dead.push(stream);
+		dead.push({ stream, by: knowers });
 		const gc = net.relay.gcSeq(stream);
-		if (gc !== last) bad(`${stream} (${e ? "merged" : "pruned"}) not retired on the relay: gcSeq ${gc}, lastSeq ${last}, checkpoint ${net.relay.checkpoint(stream)?.coversSeq ?? 0}`);
+		if (gc !== last) bad(`${stream} (${e ? "merged" : common ? "pruned" : `pruned, base kept by ${knowers!.map((d) => d.name).join("")}`}) not retired on the relay: gcSeq ${gc}, lastSeq ${last}, checkpoint ${net.relay.checkpoint(stream)?.coversSeq ?? 0}`);
 	}
-	for (const [i, d] of devs.entries()) {
-		const repo = d.vrt?.log.c.repo;
-		if (isDown(i) || !repo) continue;
+	for (const d of running) {
+		const repo = d.vrt!.log.c.repo;
 		const held: string[] = [];
-		for (const stream of dead) {
+		for (const { stream, by } of dead) {
+			if (by !== null && !by.includes(d)) continue;
 			const what: string[] = [];
 			if (repo.stream(stream)) what.push("stream");
 			if (await repo.getSnapshot(stream)) what.push("snapshot");

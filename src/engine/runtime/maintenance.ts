@@ -18,7 +18,7 @@ import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
 import { bodyCheckpointDue, foldCheckpointDue, refreshRemoteBatch, writeBodyCheckpoint, writeFoldCheckpoint } from "../body/checkpoints";
 import { compactBody, compactFold, needsCompaction } from "../body/compaction";
-import { deadReason, writeRetired, DROPS_PER_TICK, RETIRES_PER_TICK, type DeadReason, type FoldCompleteness } from "../body/retire";
+import { deadReason, writeRetired, DROPS_PER_TICK, RETIRES_PER_TICK, type DeadReason, type FoldCompleteness, type PruneEvidence } from "../body/retire";
 import type { StreamRecord } from "../store/schema";
 import type { EngineCtx } from "./context";
 
@@ -230,9 +230,15 @@ export class Maintenance {
 		}
 	}
 
+	/** What this device knows of the prune of the stream's doc (body/retire.ts PruneEvidence). */
+	private pruneEvidence(rec: StreamRecord): PruneEvidence {
+		const docId = rec.docId!;
+		return { stub: this.c.ns.state.pruned.get(docId), keptBase: this.c.ns.removedDeletes.get(docId)?.deleteBaseBodySeq ?? rec.prunedDeleteBase };
+	}
+
 	/**
 	 * The b: / c: streams whose doc is dead (body/retire.ts deadReason), with why. The ns fold's completeness is
-	 * checked (FoldRuntime.gap reads the ns tail) only when some stream's doc has a pruned stub and no committed entry.
+	 * checked (FoldRuntime.gap reads the ns tail) only when some stream's doc has a record of a prune and no committed entry.
 	 */
 	async deadStreams(): Promise<{ readonly rec: StreamRecord; readonly why: DeadReason }[]> {
 		const c = this.c;
@@ -242,8 +248,11 @@ export class Maintenance {
 			if ((r.cls !== "body" && r.cls !== "canvas") || !r.docId) continue;
 			const e = c.ns.entry(r.docId);
 			if (e && e.state !== "merged") continue;
-			// No entry and no pruned stub: not provably dead (deadReason), kept.
-			if (!e && !c.ns.state.pruned.has(r.docId)) continue;
+			// No entry and no record of a prune: not provably dead (deadReason), kept.
+			if (!e) {
+				const ev = this.pruneEvidence(r);
+				if (ev.stub === undefined && ev.keptBase === undefined) continue;
+			}
 			if (!e) absent = true;
 			cands.push(r);
 		}
@@ -260,7 +269,7 @@ export class Maintenance {
 		for (const r of cands) {
 			const rec = c.repo.stream(r.stream);
 			if (!rec) continue;
-			const why = deadReason(rec, c.ns.entry(r.docId!), c.ns.state.pruned.get(r.docId!), fold, pending);
+			const why = deadReason(rec, c.ns.entry(r.docId!), this.pruneEvidence(rec), fold, pending);
 			if (why) out.push({ rec, why });
 		}
 		return out;

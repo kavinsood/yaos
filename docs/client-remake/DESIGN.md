@@ -279,15 +279,18 @@ stream (server H7: every segment and the open rows go, gcSeq = lastSeq; the head
 It is written only for the `b:`/`c:` stream of a **dead** doc, on positive evidence (`src/engine/body/retire.ts`
 `deadReason`):
 - **merged**: the committed entry is a merged alias (final; ops on it are redirected);
-- **pruned**: no committed entry but the committed state's pruned-delete stub (§c.9, `NsFoldState.pruned`; docIds
-  are never reused, so nothing revives it), and the fold provably saw every ns row up to the stream's last row: the
-  ns stream is caught up and not frozen, the fold has no gap (`FoldRuntime.gap`), the vault cursor accounts for
-  every seq up to that row, and no own create of the doc is pending.
+- **pruned**: no committed entry but a record of its deleted entry's prune: the committed state's pruned-delete stub
+  (§c.9, `NsFoldState.pruned`), or the delete base this device's own fold kept when it removed the entry
+  (`StreamRecord.prunedDeleteBase`; docIds are never reused and a restore of a pruned docId is ignored, so nothing
+  revives it); and the fold provably saw every ns row up to the stream's last row: the ns stream is caught up and
+  not frozen, the fold has no gap (`FoldRuntime.gap`), the vault cursor accounts for every seq up to that row, and
+  no own create of the doc is pending.
 
-Absence is not evidence: a doc with no entry and no stub is never retired. Its create may not be folded yet (a body
-row can commit before its create's ns row, e.g. a create refused and re-sent: sim suite-1 seed 264 retired such a
-canvas body and lost the canvas), its stub may have aged out of `PRUNED_STUB_CAP`, or it was a merged alias pruned
-(they leave no stub). Such a stream stays on the relay and the device: a cost, never a loss.
+Absence is not evidence: a doc with no entry and no record of a prune is never retired. Its create may not be folded
+yet (a body row can commit before its create's ns row, e.g. a create refused and re-sent: sim suite-1 seed 264
+retired such a canvas body and lost the canvas), its stub may have aged out of `PRUNED_STUB_CAP` on a device that
+never folded the prune, or it was a merged alias pruned (they leave no stub). Such a stream stays on the relay and
+the device: a cost, never a loss.
 
 A deleted doc is not dead: its body stays for a restore (§c.7) and its stream is checkpointed like any other.
 The ingest gate takes a `retired` checkpoint only on `b:`/`c:` and only with an empty state (`kind-not-allowed` /
@@ -544,9 +547,9 @@ path (example E8).
     asserts <= 3.75 MiB). A 40000-note vault is over the cap without any stubs (OR-3).
   - With `TOMBSTONE_CAP`, a device behind by up to ~40000 prunes still finds every base: in an entry or a stub.
 - Later ops on pruned docIds are `unknown-docid`.
-- The pruned deleted docs' `b:`/`c:` streams are retired while their stub lasts (§b.5, §d.9): the device whose
-  frame pruned them puts the `retired` checkpoint, every device then drops their local records. A pruned merged
-  alias (no stub) keeps its stream unless it was retired while its merged entry stood.
+- The pruned deleted docs' `b:`/`c:` streams are retired (§b.5, §d.9): the device whose frame pruned them puts the
+  `retired` checkpoint, every device that folded the prune or holds the stub then drops their local records. A
+  pruned merged alias (no stub) keeps its stream unless it was retired while its merged entry stood.
 - `TOMBSTONE_CAP` and `TOMBSTONE_PRUNE_HYSTERESIS` are fold rules: every device folds with the same values.
   `EngineTuning.nsPrune` (`src/engine/runtime/options.ts:57`) carries them for the sim only (one draw per run for
   every device and the oracle, `src/sim/run.ts` `pruneWorld`); production never passes engine tuning.
