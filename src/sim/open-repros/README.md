@@ -22,7 +22,5 @@ Status as of integrate-3 (2026-10-21): every file below still fails. "base": als
 | `20701862-41-min.json` | canvas: a folder rename (`cRename folder`) after a user's dangling-edge fix revives the edges A deleted (no concurrent edit, no conflict copy); base | SIM-CANVAS-FOLDER-REVIVE |
 | `1370759151-13-min.json` | blob faults, 2 devices, delete / restore races: no convergence, A's disk keeps a stale `notes/r5.md` while its body replica and the relay have the newer text | SIM-BLOB-STALE-DISK |
 | `532933571-114.json` | identity-per-store clone faults, 4 devices: no quiescence, D waits on the creator of a body-less doc that never sends its body; base | SIM-CLONE-BODYLESS-WAIT |
-| `prune-epoch-merged-overwrite.json` | small tombstone cap (soak): an import storm, an epoch reset, mass overwrites, no file deleted (every pruned entry is a merged alias): A's overwrite of 10 notes is lost. Passes without `smallPrune` | PRUNE-STORM |
-| `prune-storm-mass-delete.json` | small tombstone cap (soak): mass deletes and import storms: imported notes on B lost. Passes without `smallPrune` | PRUNE-STORM |
 | `canvas-reorder-lost-1025898366.json` | E2EE faults, 2 devices, suite 1, races (soak): B's reorder of a node to the front is lost; fails the same on `generators` | SIM-CANVAS-REORDER |
 | `flood-flapping-1557069770.json` | FLOOD_FAULTS, 5 devices, storms, races, clean-ups (soak): no quiescence, "flapping". Unminimized (256 steps; a replay takes ~5 min); fails the same on `generators` | SIM-FLOOD-FLAP |

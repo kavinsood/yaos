@@ -190,7 +190,7 @@ export const MATRICES: readonly Matrix[] = [
 	{ name: "3 devices, clone + synced config faults", base: { devices: 3, faults: CLONE_FAULTS, faultRate: 0.25 }, seeds: part(10), smoke: 1, cost: 2.2, hits: cloneHits },
 	// Per-device engine tuning and budgets drawn per seed (run.ts tuningWorld); every other matrix keeps SIM_TUNING.
 	{ name: "3 devices, seeded faults, randomized tuning", base: { devices: 3, faults: DEFAULT_FAULTS, randomTuning: true }, seeds: part(4), smoke: 1, cost: 2 },
-	// A tombstone cap of 3..8 (run.ts pruneWorld, the same on every device and the oracle): pruning, the retired
+	// A tombstone cap of 0..8, pruned to 0..cap (run.ts pruneWorld, the same on every device and the oracle): pruning, the retired
 	// checkpoints of dead streams and their local drop run in most seeds (invariants.ts checkRetired at quiescence).
 	{ name: "3 devices, seeded faults, small tombstone cap", base: { devices: 3, faults: DEFAULT_FAULTS, smallPrune: true }, seeds: SEEDS, smoke: 1, cost: 2.3 },
 	// Coverage generators (the soak draws them too, with more weight variety). Socket drops between APPEND, the

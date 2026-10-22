@@ -327,7 +327,7 @@ export class StubLog implements LogPort {
 		}
 		return {
 			remote, remoteByPathKey: byKey, nsCoversSeq: this.seq, nsReady: this.nsReady,
-			docsWithPendingBody, restoreDuty: new Set(), lostCreateBody: this.lostCreateBody, textHash, appliedSeq, pendingMoves,
+			docsWithPendingBody, restoreDuty: new Set(), prunedBody: new Map(), lostCreateBody: this.lostCreateBody, textHash, appliedSeq, pendingMoves,
 		};
 	}
 

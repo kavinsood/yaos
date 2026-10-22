@@ -25,6 +25,7 @@ import { decodeNsOps } from "../../core/codec/nsOps";
 import { NS_CANDIDATE_INTERVAL } from "../../core/ns/candidate";
 import { DEFAULT_NS_FOLD_RULES, buildIndex, foldNsFrameWith, newNsFoldState, nsFoldHalted, type NsFoldRules } from "../../core/ns/fold";
 import { overlayPending, type NsOverlay, type PendingNsFrame } from "../../core/ns/overlay";
+import { removedDeletes } from "../../core/ns/pruned";
 import { pathKey } from "../../core/paths/pathKey";
 import {
 	NS_STREAM, streamClass, streamDocId,
@@ -54,6 +55,12 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	readonly encoding = CheckpointEncoding.nsFoldV1;
 	state: NsFoldState = newNsFoldState();
 	index: NsFoldIndex = buildIndex(this.state);
+	/**
+	 * Deleted entries the committed fold removed (DESIGN §c.9 "Pruned docs"), by docId: their delete base must
+	 * outlive them. Set in the same step that removes the entry (a fold, or a reload past it), so no view sees the doc
+	 * gone without its base; context.afterNsChange then keeps the base on the doc's stream record and drops it here.
+	 */
+	readonly removedDeletes = new Map<DocId, NsEntry>();
 
 	/**
 	 * The fold's tunables. knownRulesVersion: the highest fold rules this reader implements (tests raise it: an
@@ -63,12 +70,13 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 
 	constructor(
 		repo: FoldRepo, self: DeviceId, candidateModulus = NS_CANDIDATE_MODULUS, knownRulesVersion = FOLD_RULES_VERSION,
-		prune: Pick<NsFoldRules, "tombstoneCap" | "pruneHysteresis"> = DEFAULT_NS_FOLD_RULES,
+		prune: Pick<NsFoldRules, "tombstoneCap" | "pruneHysteresis"> & { readonly prunedCap?: number } = DEFAULT_NS_FOLD_RULES,
 	) {
 		super(repo, self, NS_STREAM, candidateModulus);
 		const d = DEFAULT_NS_FOLD_RULES;
-		const same = knownRulesVersion === d.knownRulesVersion && prune.tombstoneCap === d.tombstoneCap && prune.pruneHysteresis === d.pruneHysteresis;
-		this.rules = same ? d : { ...d, knownRulesVersion, tombstoneCap: prune.tombstoneCap, pruneHysteresis: prune.pruneHysteresis };
+		const prunedCap = prune.prunedCap ?? d.prunedCap;
+		const same = knownRulesVersion === d.knownRulesVersion && prune.tombstoneCap === d.tombstoneCap && prune.pruneHysteresis === d.pruneHysteresis && prunedCap === d.prunedCap;
+		this.rules = same ? d : { ...d, knownRulesVersion, tombstoneCap: prune.tombstoneCap, pruneHysteresis: prune.pruneHysteresis, prunedCap };
 	}
 
 	get coversSeq(): Seq {
@@ -82,9 +90,16 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 
 	protected reset(snap: SnapshotRecord | undefined): boolean {
 		const st = snap && snap.encoding === CheckpointEncoding.nsFoldV1 && snap.bytes.length > 0 ? decodeNsFoldV1(snap.bytes) : null;
+		const before = this.state.entries;
 		this.state = st ?? newNsFoldState();
 		this.index = buildIndex(this.state);
+		// A checkpoint adopted past a prune skips its event: the deleted entries it lacks (none at an engine start).
+		this.noteRemoved(removedDeletes([], before, this.state.entries));
 		return !snap || st !== null;
+	}
+
+	private noteRemoved(entries: readonly NsEntry[]): void {
+		for (const e of entries) this.removedDeletes.set(e.docId, e);
 	}
 
 	protected decodeOps(content: Uint8Array): NsOp[] | null {
@@ -93,6 +108,7 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 
 	protected foldFrame(row: TailRecord, ops: readonly NsOp[]): { events: readonly NsFoldEvent[]; halted: boolean } {
 		const events = foldNsFrameWith(this.rules, this.state, this.index, { seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, authorNsSeq: row.authorNsSeq, frameNo: row.frameNo ?? 0, ops });
+		this.noteRemoved(removedDeletes(events, null, this.state.entries));
 		return { events, halted: nsFoldHalted(events) };
 	}
 

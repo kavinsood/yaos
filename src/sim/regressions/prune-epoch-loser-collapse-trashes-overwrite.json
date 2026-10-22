@@ -42,7 +42,10 @@
 		"faultRate": 0.154,
 		"randomTuning": true,
 		"storms": 0.17,
-		"smallPrune": true
+		"smallPrune": {
+			"tombstoneCap": 7,
+			"pruneHysteresis": 2
+		}
 	},
 	"violations": [
 		{

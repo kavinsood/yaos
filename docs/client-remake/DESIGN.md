@@ -194,6 +194,12 @@ deviceCount × (ascending deviceId)
   varstring deviceId
   varuint n (1..64)
   n × varstring clientFrameId   oldest first
+(frameNo replay windows, e2ee-design §8.2)
+varuint stubCount             pruned-delete stubs (§c.9 "Pruned docs"), at most PRUNED_STUB_CAP
+stubCount × (ascending (prunedSeq, docId))
+  varstring docId
+  varuint prunedSeq − previous stub's prunedSeq (first: prunedSeq)   prunedSeq: the frame whose fold pruned it
+  varuint zigzag(prunedSeq − deleteBaseBodySeq)                      2d if d >= 0, else −2d − 1
 ```
 
 `pathKey`, `byPathKey`, `folderRefs` and `tombstones` are derived (`NsFoldIndex`) and never encoded.
@@ -310,7 +316,7 @@ is pure and total: it never throws on a decoded `NsFrame` and never reads clocks
 ### c.1 State
 
 - `NsFoldState`: `formatVersion`, `foldRulesVersion`, `coversSeq`, `entries: Map<DocId, NsEntry>`, `recentFrames:
-  Map<DeviceId, ClientFrameId[]>`.
+  Map<DeviceId, ClientFrameId[]>`, `replay`, `pruned: Map<DocId, NsPrunedStub>` (§c.9 "Pruned docs").
 - `coversSeq` is the seq of the last folded ns row, or of the checkpoint the state came from. It is never advanced by
   feed pages or by rows of other streams.
 - **Entry states.**
@@ -495,6 +501,9 @@ The first valid restore wins; later restores are no-ops by rule 3.
 - Detection is cheap: the feed's per-stream `lastSeq` is compared with `deleteBaseBodySeq`.
 - Locally, the planner also rematerializes when the remote content changed since the sync point and the local file is
   missing (§f.2).
+- **Pruned before the restore.** A delete pruned (§c.9) before its restore commits leaves `unknown-docid` for the
+  restore. The duty then outlives the entry on the author's device and re-creates the doc from its file under a
+  fresh docId (§c.9 "Pruned docs").
 
 ### c.8 setBlob
 
@@ -518,7 +527,16 @@ path (example E8).
   `(lastTouchSeq, docId)` order until `tombstones = TOMBSTONE_CAP − TOMBSTONE_PRUNE_HYSTERESIS` (19000).
 - Before removing a deleted entry, every merged alias pointing at it is pruned first, in the same pass, so aliases
   never dangle.
-- One frame-level event `pruned{docIds}` is emitted.
+- One frame-level event `pruned{docIds, entries}` is emitted; `entries` are the removed entries as they were (a
+  deleted one keeps its `deleteBaseBodySeq` there, "Pruned docs" below).
+- Each removed deleted entry leaves a **stub** in the state, `pruned[docId] = {deleteBaseBodySeq, prunedSeq}`
+  (encoded in `nsFoldV1` with both seqs as small deltas: ~21 bytes deflated, nearly all the docId's entropy). Merged
+  aliases leave none. When there are more than `PRUNED_STUB_CAP` (20000) stubs, the oldest by `(prunedSeq, docId)`
+  go. A stub is not an entry: ops on its docId stay `unknown-docid`.
+  - Size: the cap keeps the stubs at <= 448 KiB of the 4 MiB checkpoint cap (§b.6). A 20000-note vault with
+    `TOMBSTONE_CAP` tombstones is 3.04 MiB deflated, 3.44 MiB with a full stub pool (`src/core/codec/folds.test.ts`
+    asserts <= 3.75 MiB). A 40000-note vault is over the cap without any stubs (OR-3).
+  - With `TOMBSTONE_CAP`, a device behind by up to ~40000 prunes still finds every base: in an entry or a stub.
 - Later ops on pruned docIds are `unknown-docid`.
 - The pruned docs' `b:`/`c:` streams are retired (§b.5, §d.9): the device whose frame pruned them puts the `retired`
   checkpoint, every device then drops their local records.
@@ -527,6 +545,52 @@ path (example E8).
   every device and the oracle, `src/sim/run.ts` `pruneWorld`); production never passes engine tuning.
 - A long-offline device that still holds a pruned doc is handled by the planner row "absent/pruned" (§f.2). An
   absent doc this device never saw committed (`S.nsTouchSeq = 0`) is not taken for pruned (§f.2).
+- **Pruned docs keep their restore duty.** Pruning removes what edit-beats-delete needs: a restore names the
+  docId and `againstDeleteSeq`, and the fold answers `unknown-docid` once the entry is gone. A delete can be pruned
+  before any restore commits: in the frame that made it (a mass delete larger than `CAP − HYSTERESIS`, an epoch reset
+  whose migrated losers collapse by `nsDelete`, §c.12), or before a device that was offline or backgrounded folds it.
+  No fold rule can hold the prune until every restore is in: the restore condition reads body rows the ns fold never
+  sees, and a device with uncovered rows can come back after any number of seqs. So the duty moves to the device:
+  - the fold keeps each pruned entry's delete base in its stub (above), so the base travels in every ns checkpoint:
+    a reader that adopts a checkpoint past the delete and its prune (it had the doc live, or never folded it) reads
+    the base there;
+  - when this device's committed fold removes a deleted entry (a `pruned` event, or an ns checkpoint adopted past it:
+    the deleted entries of the state before that the state after lacks), the removed entry is kept in memory in the
+    same step (`NsRuntime.removedDeletes`), so no view sees the doc gone without its base. Its `deleteBaseBodySeq`
+    then goes onto the doc's `b:`/`c:` stream record (`StreamRecord.prunedDeleteBase`, made if this device has none
+    yet; `src/engine/runtime/context.ts` `keepRemovedDeletes`) before the fold is reported, queued ahead of any later
+    snapshot of the fold (a crash in between refolds the rows and keeps it again). The record lives while a synced
+    record names the doc (`Repo.tDropStream` refuses), which is as long as the planner can still trash the file, so
+    a device that folded the prune keeps the base after its stub aged out;
+  - the view (`src/engine/compose/logPort.ts`) gives a doc it no longer holds a **restore duty** by §c.7's
+    condition against that base, as for a deleted entry: rows past it, own (`lastOwnSeq`) or any (`remoteHeadSeq`:
+    the fallback duty; it covers rows whose author is gone, e.g. own rows of an earlier store of this install after
+    an IndexedDB loss, which are not `lastOwnSeq`), or own body frames still to send (`src/core/ns/pruned.ts`
+    `prunedRestoreDuty`). The base comes from, first match: the committed entry (a doc only the optimistic view
+    pruned, an own pending frame's prune), the kept base, the stub. A committed merged entry has no base: own rows
+    only, all of them (the winner holds the rest). Nothing known (a pruned merged alias, whose only synced record is
+    its creator's, with its create's own rows; or a stub aged out and this device never folded the prune): any row is
+    a duty, and the file is re-created;
+  - the planner's pruned row never trashes a file with a restore duty: it re-creates it under a fresh docId with
+    the file's content (§f.2). The doc comes back as edit-beats-delete would have brought it back, under a new id.
+    The file holds this device's rows only once it is synced at the replica's body version: the view hands the
+    replica's version of each such doc (`RemoteView.prunedBody`), and while it differs from `S.bodyVersion` (an edit
+    a bound editor never saved before a crash, rows from elsewhere) the row runs `reconcileContent` under the old id
+    first (`acquireBody` opens a pruned doc's replica for it), and the re-create follows from the merged file.
+  - **Invariant.** Body rows of a doc that the doc's delete did not cover (seq > `deleteBaseBodySeq`, or not yet
+    committed) are never trashed on their author's device because the delete was pruned, and a device that saw such
+    rows re-creates from its file too. Every device with the duty re-creates: copies of the same text fold
+    `merged` into the first (§c.5); a device whose file lacks rows it had not read yet makes a suffixed copy. The
+    worst cases are such a copy and a resurrection (a merged alias's author whose file the winner does not own; a
+    doc a device knows nothing of: more than ~40000 deletes pruned while it was away), never a loss.
+    The rule needs no author to come back: whoever holds the doc's synced record and its rows judges them against
+    a base it always has (entry, kept base or stub) or, lacking all three, keeps the file.
+  - Alternative: hold a deleted entry from pruning for some ns-seq horizon. Rejected: no horizon bounds an offline
+    device, and the sim's goal-0 caps (every delete pruned in its own frame) need the device rule anyway.
+  - Alternative: keep stubs forever, or 100000 of them. Rejected: the state would grow with every delete (100000
+    stubs are ~2 MiB, enough to push a 20000-note vault over the checkpoint cap); past the stub cap the "nothing
+    known" rule is never a loss, only a rare resurrection. Short docId fingerprints instead of docIds: rejected, a
+    collision would hand an unrelated doc a base.
 - Alternative: age-based pruning. Rejected: it needs wall clocks, which the fold never reads.
 
 ### c.10 Rules versioning (`upgradeRules`)
@@ -691,7 +755,9 @@ changes.
   never makes its own delete stale. Creates and renames pipeline freely.
 - **Pruned**: the doc's streams are retired (§b.5, §d.9). A bound doc the fold pruned is retargeted by path
   (`docRetarget{renamed}`, `src/engine/compose/foldBridge.ts`): its views re-bind to whatever doc owns the path, so
-  its replica can be dropped. **Restore duty**: see §c.7.
+  its replica can be dropped. A reload (an adopted ns checkpoint, a refold) names no pruned docs: every bound doc
+  the new committed state lacks (other than an own create still in the outbox) is retargeted the same way, and a
+  merged one into its winner. **Restore duty**: see §c.7.
 
 ### c.14 Worked examples
 
@@ -848,7 +914,9 @@ cold ──load──▶ resident ──bind──▶ bound
 - **Opening a note.**
   - The host sends `openDoc{path, viewId}` and the engine answers `bind{docId, kind, frozen}`. Resolution is as
     before (`remoteByPathKey`, optimistic remote). The engine answers `notBindable` for excluded, untracked and
-    non-markdown paths, and a later `bindable{path}` makes the host retry. No answer carries text or CRDT state.
+    non-markdown paths, and while the file at the path is another doc's, or the doc's own file is elsewhere (the
+    planner's L lookup, following the user's observed renames: `bindTarget`); a later `bindable{path}` makes the
+    host retry. No answer carries text or CRDT state.
   - Main uploads the editor text as `textChunk{uploadId, bytes, last}`:
     - UTF-16 slices of `TEXT_CHUNK_UNITS` (65 536) units, each buffer transferred;
     - one macrotask per chunk, with a `setTimer(0)` yield between chunks.
@@ -1703,8 +1771,8 @@ All are in `src/core/types.ts`.
 | deleted | present | present, `Lc` | Local edit beats remote delete: `nsRestore(path = S.path, againstDeleteSeq = R.deletedSeq)` + `reconcileContent`. |
 | merged → W | present | any | `rebind(S.docId → W)`, then plan as W. |
 | absent (pruned) | present | present, owned by a live doc | The live doc at S.path has its own S there, or its create / blob bytes equal L: `syncedDrop` only. No trash (the owner's row would read the file as a user delete: `nsDelete`), no create (a duplicate). An unsynced owner adopts the file next pass. |
-| absent (pruned) | present | ¬`Lc`, `S.nsTouchSeq > 0` / absent | `diskTrash` (braked) + `syncedDrop` / `syncedDrop`. |
-| absent (pruned) | present | `Lc`, or `S.nsTouchSeq = 0` | `nsCreate` (fresh docId) + `reconcileContent` / `pushBlob`; `syncedDrop(old)`. `nsTouchSeq = 0`: this device never saw the doc committed (S1 stamps an own create's fold seq), so the absence is an own create the fold ignored (`replay-duplicate`, ...), not a prune (below). |
+| absent (pruned) | present | ¬`Lc`, `S.nsTouchSeq > 0`, no restore duty / absent | `diskTrash` (braked) + `syncedDrop` / `syncedDrop`. |
+| absent (pruned) | present | `Lc`, or `S.nsTouchSeq = 0`, or restore duty | `nsCreate` (fresh docId) + `reconcileContent` / `pushBlob`; `syncedDrop(old)`. `nsTouchSeq = 0`: this device never saw the doc committed (S1 stamps an own create's fold seq), so the absence is an own create the fold ignored (`replay-duplicate`, ...), not a prune (below). Restore duty (§c.9 "Pruned docs"): own rows the pruned delete did not cover, or own body frames still to send; the file holds them, and the restore can no longer name the pruned id. With a duty and the replica's version (`prunedBody`) ≠ `S.bodyVersion`: `reconcileContent(old)` first, the re-create next pass. |
 | live | absent | absent | `diskMaterialize(R.path, expect absent)` once `body.caughtUp && (hasContent ∨ createSize = 0)`, else `wait(body-empty / body-not-caught-up)`. Blob: `fetchBlob`. |
 | live | absent | present | L hash = remote hash (`streams.textHash` / `blob.hash` / `createHash` at initial version) → `syncedPut` (adopt, no I/O). Else `reconcileContent(hasBase: false)`, which gives a no-base conflict copy unless identical. Path-keyed bases from recovery or epoch migration supply a base when present. |
 | absent | absent | present | Portable and not excluded → `nsCreate(freshDocId, path, hash, size)` + initial `reconcileContent` / `pushBlob`. Not portable (§c.2 validity) → notice, skip. |

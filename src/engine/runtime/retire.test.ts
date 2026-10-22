@@ -9,9 +9,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { CheckpointEncoding } from "../../core/envelope";
 import { encodeCheckpointContent } from "../../core/codec/contents";
-import { docStream, type DocId, type StreamName } from "../../core/types";
+import { NS_STREAM, docStream, type DeviceId, type DocId, type NsEntry, type NsFoldEvent, type StreamName } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
 import { writeRetired } from "../body/retire";
+import { prunedRestoreDuty, removedDeletes } from "../../core/ns/pruned";
+import { ComposedLog } from "../compose/logPort";
 import { gate } from "../ingest/gate";
 import { sealCheckpoint } from "../ingest/envelope";
 import type { LogEngine } from "./engine";
@@ -214,6 +216,106 @@ test("retire: a merged alias's junk rows are retired by their author and dropped
 	} finally {
 		for (const e of es) await e.stop();
 	}
+});
+
+test("pruned docs (§c.9): the delete's base outlives the entry on the stream record; own rows past it are a restore duty", async () => {
+	const relay = new SimRelay();
+	// Goal 0: every delete is pruned in its own frame, before a restore could commit. No maintenance tick: the
+	// records stay (this harness has no synced records to keep them past the retirement).
+	const es = await engines(relay, ["a", "b"], { ...TUNING, maintenanceMs: 1e9, nsPrune: { tombstoneCap: 0, pruneHysteresis: 0 } });
+	const [a, b] = es as [LogEngine, LogEngine];
+	try {
+		const uncovered = await createDoc(a, "u.md", "u;");
+		const covered = await createDoc(a, "c.md", "c;");
+		await converged(es);
+		await editDoc(b, uncovered, (t) => t.insert(t.length, "b's edit;"));
+		await editDoc(b, covered, (t) => t.insert(t.length, "b's edit;"));
+		await converged(es);
+		const own = (id: DocId) => b.c.repo.stream(md(id))!.lastOwnSeq;
+		assert.ok(own(uncovered) > 0 && own(covered) > 0);
+		// a deletes one without having seen b's rows (base below them), the other covering them.
+		await a.submitNs([{ t: "delete", docId: uncovered, baseBodySeq: own(uncovered) - 1 }, { t: "delete", docId: covered, baseBodySeq: own(covered) }]);
+		await until(() => b.c.repo.stream(md(uncovered))?.prunedDeleteBase !== undefined && b.c.repo.stream(md(covered))?.prunedDeleteBase !== undefined, 5_000, "bases kept");
+		assert.equal(b.c.ns.entry(uncovered), undefined);
+		assert.equal(b.c.ns.entry(covered), undefined);
+		assert.equal(b.c.repo.stream(md(uncovered))!.prunedDeleteBase, own(uncovered) - 1);
+		const duty = new ComposedLog(b).view().restoreDuty;
+		assert.equal(duty.has(uncovered), true, "b's edit beats the pruned delete");
+		assert.equal(duty.has(covered), false, "the delete covered b's rows");
+		// a wrote no row past the base, but b's row is there: §c.7's fallback duty (a re-creates the same text, which
+		// folds merged into b's re-create, §c.5).
+		assert.equal(new ComposedLog(a).view().restoreDuty.has(uncovered), true);
+		assert.equal(new ComposedLog(a).view().restoreDuty.has(covered), false);
+	} finally {
+		for (const e of es) await e.stop();
+	}
+});
+
+test("pruned docs (§c.9): a reader that adopts an ns checkpoint past a delete and its prune still knows the delete's base", async () => {
+	// The reader b had the doc live, saw e's row, and was away while a (which had not seen e's row) deleted the doc and
+	// the delete was pruned at once. b catches up from an ns checkpoint past both: no prune event, no deleted entry
+	// before. e's row beats the delete (§c.7 fallback duty) and e may never come back (gone, or an earlier store of
+	// b's own install): b must still tell that the row is past the base.
+	const relay = new SimRelay();
+	const ckpt = { ...NO_CKPT, nsRows: 1, nsBytes: 1, settleMs: 0, idleMs: 0, fallbackMs: 0 };
+	const tuning: Partial<EngineTuning> = { ...TUNING, maintenanceMs: 25, checkpoint: ckpt, nsCandidateModulus: 1, nsPrune: { tombstoneCap: 0, pruneHysteresis: 0 } };
+	const es = await engines(relay, ["a", "b", "e"], tuning);
+	const [a, b, e] = es as [LogEngine, LogEngine, LogEngine];
+	try {
+		const id = await createDoc(a, "u.md", "u;");
+		await converged(es);
+		await editDoc(e, id, (t) => t.insert(t.length, "e's edit;"));
+		await converged(es);
+		const row = e.c.repo.stream(md(id))!.lastOwnSeq;
+		assert.ok(row > 0 && b.c.repo.stream(md(id))!.remoteHeadSeq >= row);
+		b.disconnect();
+		await e.stop();
+		await a.submitNs([{ t: "delete", docId: id, baseBodySeq: row - 1 }]);
+		const later = await createDoc(a, "later.md", "l;");
+		await until(() => a.c.ns.entry(id) === undefined && a.c.ns.entry(later) !== undefined, 5_000, "a folded the delete, its prune and a later create");
+		const deleted = a.c.ns.state.coversSeq;
+		await until(() => (relay.checkpoint(NS_STREAM)?.coversSeq ?? 0) >= deleted && relay.gcSeq(NS_STREAM) >= deleted, 10_000, "ns checkpoint past the prune, rows gone");
+		await b.reconnect();
+		await until(() => b.c.ns.state.coversSeq >= deleted, 10_000, "b caught up");
+		assert.equal(b.c.ns.entry(id), undefined);
+		assert.equal(b.c.ns.removedDeletes.has(id), false, "no prune event and no deleted entry before: the reload saw the doc live");
+		assert.equal(new ComposedLog(b).view().restoreDuty.has(id), true, "e's row past the base beats the pruned delete");
+	} finally {
+		for (const x of [a, b]) await x.stop();
+	}
+});
+
+test("pruned docs (§c.9, core/ns/pruned): removedDeletes takes prune events and, on a reload, deleted entries the adopted state lacks", () => {
+	const entry = (id: string, state: NsEntry["state"], base = 0): NsEntry => ({
+		docId: id as DocId, kind: "markdown", state, path: `${id}.md`, pathKey: `${id}.md` as NsEntry["pathKey"], createdSeq: 1,
+		createdBy: "dev-x" as DeviceId, lastTouchSeq: 2, deletedSeq: state === "deleted" ? 2 : 0, deleteBaseBodySeq: base, createHash: "h" as NsEntry["createHash"],
+		createSize: 1, blob: null, aliasOf: state === "merged" ? ("w" as DocId) : null,
+	});
+	const ev = (entries: NsEntry[]): NsFoldEvent => ({ seq: 9, index: -1, deviceId: "dev-x" as DeviceId, clientFrameId: "f" as NsFoldEvent["clientFrameId"], docId: null, outcome: { kind: "pruned", docIds: entries.map((e) => e.docId), entries } });
+	// Events: deleted entries only (a merged alias has no delete base).
+	assert.deepEqual(removedDeletes([ev([entry("m", "merged"), entry("d", "deleted", 5)])], null, new Map()).map((e) => [e.docId, e.deleteBaseBodySeq]), [["d", 5]]);
+	// Reload: deleted before and absent after; a live one gone (deleted and pruned inside the checkpoint) has no base.
+	const before = new Map([entry("gone", "deleted", 3), entry("stays", "deleted", 4), entry("live", "live")].map((e) => [e.docId, e]));
+	const after = new Map([[("stays" as DocId), entry("stays", "deleted", 4)]]);
+	assert.deepEqual(removedDeletes([], before, after).map((e) => e.docId), ["gone"]);
+	// The duty: rows past the base (own, or anyone's: §c.7's fallback); a committed entry the optimistic view pruned
+	// decides itself; then the kept base; then the committed state's stub; nothing known: any row (re-create).
+	const rec = (lastOwnSeq: number, remoteHeadSeq: number) => ({ lastOwnSeq, remoteHeadSeq });
+	const stub = (base: number) => ({ deleteBaseBodySeq: base, prunedSeq: 9 });
+	assert.equal(prunedRestoreDuty(rec(5, 5), 5, undefined, undefined), false);
+	assert.equal(prunedRestoreDuty(rec(6, 6), 5, undefined, undefined), true);
+	assert.equal(prunedRestoreDuty(rec(0, 6), 5, undefined, undefined), true, "another device's (or an earlier store's) row past the base");
+	assert.equal(prunedRestoreDuty(rec(6, 6), undefined, entry("d", "deleted", 6), undefined), false);
+	assert.equal(prunedRestoreDuty(rec(0, 7), undefined, entry("d", "deleted", 6), undefined), true);
+	assert.equal(prunedRestoreDuty(rec(7, 7), 3, entry("l", "live"), undefined), false);
+	assert.equal(prunedRestoreDuty(rec(7, 7), 3, entry("m", "merged"), undefined), true);
+	assert.equal(prunedRestoreDuty(rec(0, 7), 3, entry("m", "merged"), undefined), false);
+	// a reader that adopted a checkpoint past the delete and its prune: the stub's base
+	assert.equal(prunedRestoreDuty(rec(0, 7), undefined, undefined, stub(6)), true, "a row past the stub's base");
+	assert.equal(prunedRestoreDuty(rec(0, 6), undefined, undefined, stub(6)), false, "the delete covered every row");
+	// the stub aged out, or a merged alias was pruned: nothing known, any row re-creates (never a loss)
+	assert.equal(prunedRestoreDuty(rec(0, 9), undefined, undefined, undefined), true);
+	assert.equal(prunedRestoreDuty(rec(0, 0), undefined, undefined, undefined), false);
 });
 
 test("checkpoint duty runs for a deleted (not pruned) doc's stream: the settle rule checkpoints it like a live one", async () => {

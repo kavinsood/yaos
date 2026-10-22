@@ -36,10 +36,11 @@ import type {
 	NsOp,
 	NsOpOutcome,
 	FoldNsFrame,
+	Seq,
 	VaultPath,
 } from "../types";
 import { kindOfPath } from "../types";
-import { FOLD_RULES_VERSION, NS_DEDUPE_RING, TOMBSTONE_CAP, TOMBSTONE_PRUNE_HYSTERESIS } from "../limits";
+import { FOLD_RULES_VERSION, NS_DEDUPE_RING, PRUNED_STUB_CAP, TOMBSTONE_CAP, TOMBSTONE_PRUNE_HYSTERESIS } from "../limits";
 import { pathKey } from "../paths/pathKey";
 import { isValidPath } from "../paths/validate";
 import { replayAccept, replayCheck } from "../replayWindow";
@@ -52,6 +53,8 @@ export { newNsFoldState, newNsFoldIndex, buildIndex, cloneNsFold } from "./index
 export interface NsFoldRules {
 	readonly tombstoneCap: number;
 	readonly pruneHysteresis: number;
+	/** Pruned-entry stubs kept (PRUNED_STUB_CAP). */
+	readonly prunedCap: number;
 	readonly dedupeRing: number;
 	/** Highest fold rules version this reader implements (upgradeRules above it halts). */
 	readonly knownRulesVersion: number;
@@ -60,6 +63,7 @@ export interface NsFoldRules {
 export const DEFAULT_NS_FOLD_RULES: NsFoldRules = {
 	tombstoneCap: TOMBSTONE_CAP,
 	pruneHysteresis: TOMBSTONE_PRUNE_HYSTERESIS,
+	prunedCap: PRUNED_STUB_CAP,
 	dedupeRing: NS_DEDUPE_RING,
 	knownRulesVersion: FOLD_RULES_VERSION,
 };
@@ -220,8 +224,8 @@ function foldOp(ctx: Ctx, op: NsOp): { docId: DocId | null; outcome: NsOpOutcome
 	}
 }
 
-/** §c.9. Returns the pruned docIds in removal order. */
-function prune(state: NsFoldState, index: NsFoldIndex, rules: NsFoldRules): DocId[] {
+/** §c.9. Returns the pruned entries (as they were) in removal order. */
+function prune(state: NsFoldState, index: NsFoldIndex, rules: NsFoldRules, seq: Seq): NsEntry[] {
 	if (index.tombstones <= rules.tombstoneCap) return [];
 	const goal = rules.tombstoneCap - rules.pruneHysteresis;
 	const dead: NsEntry[] = [];
@@ -238,17 +242,24 @@ function prune(state: NsFoldState, index: NsFoldIndex, rules: NsFoldRules): DocI
 		}
 	}
 	dead.sort((a, b) => a.lastTouchSeq - b.lastTouchSeq || (a.docId < b.docId ? -1 : a.docId > b.docId ? 1 : 0));
-	const removed: DocId[] = [];
+	const removed: NsEntry[] = [];
 	const drop = (id: DocId) => {
+		const e = state.entries.get(id)!;
+		removed.push(e);
 		state.entries.delete(id);
 		index.tombstones--;
-		removed.push(id);
+		if (e.state === "deleted") state.pruned.set(id, { deleteBaseBodySeq: e.deleteBaseBodySeq, prunedSeq: seq });
 	};
 	for (const e of dead) {
 		if (index.tombstones <= goal) break;
 		if (!state.entries.has(e.docId)) continue;
 		if (e.state === "deleted") for (const a of aliases.get(e.docId) ?? []) if (state.entries.has(a)) drop(a);
 		drop(e.docId);
+	}
+	// The stubs keep the newest prunedCap, by (prunedSeq, docId).
+	if (state.pruned.size > rules.prunedCap) {
+		const old = [...state.pruned].sort(([a, x], [b, y]) => x.prunedSeq - y.prunedSeq || (a < b ? -1 : a > b ? 1 : 0));
+		for (const [id] of old.slice(0, state.pruned.size - rules.prunedCap)) state.pruned.delete(id);
 	}
 	return removed;
 }
@@ -294,8 +305,8 @@ export function foldNsFrameWith(rules: NsFoldRules, state: NsFoldState, index: N
 		events.push(ev(i, docId, outcome));
 	}
 	// §c.3.4 prune.
-	const pruned = prune(state, index, rules);
-	if (pruned.length > 0) events.push(ev(-1, null, { kind: "pruned", docIds: pruned }));
+	const pruned = prune(state, index, rules, frame.seq);
+	if (pruned.length > 0) events.push(ev(-1, null, { kind: "pruned", docIds: pruned.map((e) => e.docId), entries: pruned }));
 	state.coversSeq = frame.seq;
 	return events;
 }

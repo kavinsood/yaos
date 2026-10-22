@@ -56,7 +56,7 @@ test("bindTarget: a doc whose delete waits (fileGone) does not bind at its synce
 		const s = new Map(synced.map((e) => [e.docId, e]));
 		return {
 			port: { view: () => ({ remote: new Map(remote.map((r) => [r.docId, r])), remoteByPathKey: new Map(remote.map((r) => [r.pathKey, r.docId])) }) },
-			rec: { ctx: { synced: (id: string) => s.get(id), local: new Map(local.map((k) => [k, {}])), store: { synced: s } } },
+			rec: { ctx: { synced: (id: string) => s.get(id), local: new Map(local.map((k) => [k, {}])), store: { synced: s }, renames: [], pk: (p: string) => p } },
 		} as never;
 	};
 	// gone at a.md, the doc still live there: a file at a.md is new
@@ -67,6 +67,33 @@ test("bindTarget: a doc whose delete waits (fileGone) does not bind at its synce
 	// not gone: the doc's file still at a.md blocks the bind at b.md (the planner has not moved it yet)
 	const notGone = fake([live("d1", "b.md")], [{ docId: "d1", pathKey: "a.md" }], ["a.md", "b.md"]);
 	assert.equal(bindTarget(notGone, "b.md" as never), undefined);
+});
+
+test("bindTarget: observed renames say whose file is at the path", () => {
+	// Sim storm seed 86: offline, B renamed deleted doc d2's file onto r.md and moved live doc d1's file to n/a.md;
+	// the remote meanwhile moved d1 to r.md. Binding the view at r.md to d1 merged d2's text into d1 and destroyed
+	// d1's content.
+	const live = (docId: string, path: string) => ({ docId, path, pathKey: path, state: "live", createHash: "h0", body: { hasContent: true, caughtUp: true, version: { remoteSeq: 1, localOrder: 0 } } });
+	type S = { docId: string; path: string; pathKey: string; fileGone?: true; renamedTo?: { to: string; atMs: number } };
+	const fake = (remote: ReturnType<typeof live>[], synced: S[], local: string[], renames: { from: string; to: string; atMs: number }[] = []) => {
+		const s = new Map(synced.map((e) => [e.docId, e]));
+		return {
+			port: { view: () => ({ remote: new Map(remote.map((r) => [r.docId, r])), remoteByPathKey: new Map(remote.map((r) => [r.pathKey, r.docId])) }) },
+			rec: { ctx: { synced: (id: string) => s.get(id), local: new Map(local.map((k) => [k, {}])), store: { synced: s }, renames, pk: (p: string) => p } },
+		} as never;
+	};
+	const d1Kept: S = { docId: "d1", path: "m/a.md", pathKey: "m/a.md", fileGone: true, renamedTo: { to: "n/a.md", atMs: 2 } };
+	const d2Kept: S = { docId: "d2", path: "m/b.md", pathKey: "m/b.md", fileGone: true, renamedTo: { to: "r.md", atMs: 1 } };
+	// kept on the records (fileGone + renamedTo)
+	assert.equal(bindTarget(fake([live("d1", "r.md")], [d1Kept, d2Kept], ["r.md", "n/a.md"]), "r.md" as never), undefined);
+	// only another doc's rename onto the path
+	assert.equal(bindTarget(fake([live("d1", "r.md")], [{ docId: "d1", path: "x.md", pathKey: "x.md", fileGone: true }, d2Kept], ["r.md"]), "r.md" as never), undefined);
+	// only the doc's own file renamed away (in memory, not yet on the record)
+	const away = fake([live("d1", "r.md")], [{ docId: "d1", path: "m/a.md", pathKey: "m/a.md" }], ["r.md", "n/a.md"], [{ from: "m/a.md", to: "n/a.md", atMs: 1 }]);
+	assert.equal(bindTarget(away, "r.md" as never), undefined);
+	// the doc's own file renamed onto the path: its own
+	const onto = fake([live("d1", "r.md")], [{ docId: "d1", path: "m/a.md", pathKey: "m/a.md" }], ["r.md"], [{ from: "m/a.md", to: "r.md", atMs: 1 }]);
+	assert.equal(bindTarget(onto, "r.md" as never)?.docId, "d1");
 });
 
 /**
@@ -89,7 +116,7 @@ function entry(body: Partial<RemoteBodyInfo>, createHash = "c".repeat(64)): Remo
 
 function rt(e: RemoteEntry): BindTargetRuntime {
 	const view = { remote: new Map([[DOC, e]]), remoteByPathKey: new Map([[KEY, DOC]]) };
-	const ctx = { synced: () => undefined, local: new Map<PathKey, LocalEntry>(), store: { synced: new Map<DocId, SyncedRecord>() } };
+	const ctx = { synced: () => undefined, local: new Map<PathKey, LocalEntry>(), store: { synced: new Map<DocId, SyncedRecord>() }, renames: [], pk: (p: string) => p as PathKey };
 	return { port: { view: () => view }, rec: { ctx } };
 }
 

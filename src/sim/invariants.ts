@@ -155,7 +155,7 @@ export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly 
 		const c = d.vrt?.log.c;
 		const st = c?.ns.state;
 		if (!c || !st) continue;
-		const bad = checkNsInvariants(st, undefined, { tombstoneCap: c.ns.rules.tombstoneCap });
+		const bad = checkNsInvariants(st, undefined, { tombstoneCap: c.ns.rules.tombstoneCap, prunedCap: c.ns.rules.prunedCap });
 		if (bad) out.push({ inv: "convergence", detail: `${d.name}: ns invariant ${bad}` });
 		add("ns", hex(encodeNsFoldV1(st)), d.name);
 		add("cfg", hex(c.cfg.encodeState()), d.name);

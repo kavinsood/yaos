@@ -1,0 +1,93 @@
+{
+	"seed": 20,
+	"config": {
+		"devices": 3,
+		"faults": {
+			"engineCrash": 3,
+			"appCrash": 2,
+			"commitCrash": 2,
+			"idbWipe": 1,
+			"idbLost": 1,
+			"offline": 4,
+			"ioFail": 2,
+			"background": 3,
+			"socketDrop": 4,
+			"relayRestart": 1,
+			"relayDrain": 1,
+			"httpFail": 1,
+			"dailyLimit": 0.5,
+			"epochReset": 0.3,
+			"clockSkew": 1,
+			"keyStoreLoss": 0,
+			"keyRoll": 0,
+			"revoke": 0,
+			"epochRestore": 0,
+			"hostileReplay": 0,
+			"hostileDowngrade": 0,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"smallPrune": {
+			"tombstoneCap": 0,
+			"pruneHysteresis": 0
+		},
+		"seed": 20
+	},
+	"violations": [
+		{
+			"inv": "tokens",
+			"detail": "lost [C.46] (disk-user on C at step 46)"
+		}
+	],
+	"minimizedPlan": [
+		{
+			"i": 39,
+			"gapMs": 831,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.17194652766920626,
+				"pos": 0.9473006189800799,
+				"nl": false
+			}
+		},
+		{
+			"i": 40,
+			"gapMs": 491,
+			"fault": {
+				"t": "dailyLimit",
+				"durationMs": 37655
+			}
+		},
+		{
+			"i": 46,
+			"gapMs": 985,
+			"user": {
+				"t": "diskInsert",
+				"dev": 2,
+				"file": 0.9791857122909278,
+				"pos": 0.6268103558104485,
+				"by": "user"
+			}
+		},
+		{
+			"i": 54,
+			"gapMs": 1368,
+			"user": {
+				"t": "delete",
+				"dev": 1,
+				"file": 0.9294061404652894
+			}
+		}
+	]
+}

@@ -19,6 +19,14 @@ export const SUFFIX_DOCID_CHARS = 8;
 /** FOLD. Tombstone pool (deleted + merged) cap; prune to cap - hysteresis when exceeded. */
 export const TOMBSTONE_CAP = 20_000;
 export const TOMBSTONE_PRUNE_HYSTERESIS = 1_000;
+/**
+ * FOLD. Pruned-delete stubs kept (DESIGN §c.9 "Pruned docs"): a pruned deleted entry leaves its docId and delete base
+ * (~21 bytes deflated, mostly the docId's entropy) so a reader that adopts an ns checkpoint past the prune still knows
+ * the base. Beyond the cap the oldest stubs go; a reader then knows nothing of the doc and re-creates its file (a
+ * resurrection, never a loss). 20000 stubs are <= 448 KiB of the 4 MiB checkpoint cap (folds.test.ts asserts it), and
+ * with TOMBSTONE_CAP a device behind by up to ~40000 deletes still knows every base.
+ */
+export const PRUNED_STUB_CAP = 20_000;
 /** FOLD. clientFrameIds remembered per device for duplicate-frame suppression (ns and cfg). */
 export const NS_DEDUPE_RING = 64;
 /**

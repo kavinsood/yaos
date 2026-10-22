@@ -19,7 +19,7 @@
 import type { DocId, NsEntry, NsFoldIndex, NsFoldState, PathKey, VaultPath } from "../types";
 import { kindOfPath } from "../types";
 import { CheckpointEncoding, type CheckpointContent } from "../envelope";
-import { FOLD_RULES_VERSION, NS_DEDUPE_RING, TOMBSTONE_CAP } from "../limits";
+import { FOLD_RULES_VERSION, NS_DEDUPE_RING, PRUNED_STUB_CAP, TOMBSTONE_CAP } from "../limits";
 import { replayWindowValid } from "../replayWindow";
 import { bytesEqual } from "../codec/lib0";
 import { isContentHash, isDocId } from "../codec/ids";
@@ -30,6 +30,7 @@ import { buildIndex, folderPrefixes, indexesEqual } from "./index";
 
 export interface NsInvariantOptions {
 	readonly tombstoneCap?: number;
+	readonly prunedCap?: number;
 	readonly knownRulesVersion?: number;
 }
 
@@ -140,6 +141,12 @@ export function checkNsInvariants(state: NsFoldState, index?: NsFoldIndex, opts:
 	for (const [device, w] of state.replay) {
 		if (typeof device !== "string" || device.length === 0) return "empty deviceId in replay";
 		if (!replayWindowValid(w)) return `replay ${device} window not canonical`;
+	}
+	if (state.pruned.size > (opts.prunedCap ?? PRUNED_STUB_CAP)) return `pruned stubs ${state.pruned.size} > cap`;
+	for (const [id, p] of state.pruned) {
+		if (!isDocId(id)) return "pruned stub: invalid docId";
+		if (!isCount(p.deleteBaseBodySeq) || !isCount(p.prunedSeq)) return `pruned stub ${id}: bad integer`;
+		if (p.prunedSeq < 1 || p.prunedSeq > state.coversSeq) return `pruned stub ${id}: prunedSeq out of range`;
 	}
 	if (index) {
 		const d = indexesEqual(index, { byPathKey, folderRefs: folders, tombstones });

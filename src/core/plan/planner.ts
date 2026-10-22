@@ -11,7 +11,8 @@
  *   - tzOffsetMinutes: local time for conflict names (core may not read Date)
  *   - remoteTextHash: streams.textHash of caught-up md/canvas docs
  *   - bodyAppliedSeq: streams.appliedSeq (nsDelete.baseBodySeq)
- *   - restoreDuty: docs whose restore condition + own duty hold (§c.7)
+ *   - restoreDuty: docs whose restore condition + own duty hold (§c.7), pruned docs with rows past the pruned
+ *     delete's base included (§c.9 "Pruned docs")
  *   - lostCreateBody: live docs whose initial body never reached the relay and never will: created by
  *     this install's lineage and no longer pending here (store lost), or by a retired store (abandoned)
  *
@@ -78,6 +79,8 @@ export interface PlannerContext {
 	readonly remoteTextHash: ReadonlyMap<DocId, ContentHash>;
 	readonly bodyAppliedSeq: ReadonlyMap<DocId, Seq>;
 	readonly restoreDuty: ReadonlySet<DocId>;
+	/** Replica body version of each pruned doc with a restore duty (§c.9 "Pruned docs"). */
+	readonly prunedBody: ReadonlyMap<DocId, BodyVersion>;
 	readonly lostCreateBody: ReadonlySet<DocId>;
 	/** Paths with a path-keyed base carried over an epoch migration (§c.12). */
 	readonly pathBaseKeys: ReadonlySet<PathKey>;
@@ -91,6 +94,7 @@ export const DEFAULT_PLANNER_CONTEXT: PlannerContext = {
 	remoteTextHash: new Map(),
 	bodyAppliedSeq: new Map(),
 	restoreDuty: new Set(),
+	prunedBody: new Map(),
 	lostCreateBody: new Set(),
 	pathBaseKeys: new Set(),
 };
@@ -138,14 +142,15 @@ export function takesNoFreshId(s: Pick<SyncedEntry, "contentHash" | "nsTouchSeq"
  * merged doc counts as absent (its winner may be). Kept tight: every id is a random draw, and seeded runs replay them.
  */
 export function freshIdBudget(
-	synced: ReadonlyMap<DocId, SyncedEntry>, local: ReadonlyMap<PathKey, LocalEntry>, remote: ReadonlyMap<DocId, RemoteEntry>, pendingBody: ReadonlySet<DocId> = new Set(),
+	synced: ReadonlyMap<DocId, SyncedEntry>, local: ReadonlyMap<PathKey, LocalEntry>, remote: ReadonlyMap<DocId, RemoteEntry>, restoring: (docId: DocId) => boolean = () => false,
 ): number {
 	const covered = new Map<PathKey, boolean>();
 	for (const s of synced.values()) {
 		const l = local.get(s.pathKey);
 		const r = remote.get(s.docId);
-		// An absent doc with own body frames still to send re-creates (the pruned row), as a changed file does.
-		const ok = l !== undefined && takesNoFreshId(s, l.hash, r !== undefined && r.state !== "merged") && (r !== undefined || !pendingBody.has(s.docId));
+		// An absent doc with a restore duty (own body frames still to send, rows its pruned delete did not cover)
+		// re-creates (the pruned row), as a changed file does.
+		const ok = l !== undefined && takesNoFreshId(s, l.hash, r !== undefined && r.state !== "merged") && (r !== undefined || !restoring(s.docId));
 		covered.set(s.pathKey, (covered.get(s.pathKey) ?? true) && ok);
 	}
 	let n = 0;
@@ -167,6 +172,16 @@ function withKeptRenames(input: PlannerInput, pk: PathKeyFn): PlannerInput {
 		if (!input.renames.some((x) => pk(x.from) === pk(e.from) && pk(x.to) === pk(e.to))) kept.push(e);
 	}
 	return kept.length === 0 ? input : { ...input, renames: [...input.renames, ...kept] };
+}
+
+/**
+ * Where the file of synced record `s` is now: the end of the observed rename chain from its synced path (the
+ * observed renames and the one the record kept), else its synced path, or null for a file gone with no rename.
+ */
+export function syncedFileKey(s: SyncedEntry, renames: readonly ObservedRename[], pk: PathKeyFn): PathKey | null {
+	const all = s.renamedTo ? [...renames, { from: s.path, to: s.renamedTo.to, atMs: s.renamedTo.atMs }] : renames;
+	const away = renamedAway(all, s.pathKey, pk);
+	return away ? pk(away.to) : s.fileGone ? null : s.pathKey;
 }
 
 /** The end of the observed rename chain starting at `key` (its last event), if any. */
@@ -527,12 +542,22 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		// is then an own create the fold ignored (replay-duplicate, duplicate-docid, ...), not a prune: the file is
 		// created anew instead of trashed, as a changed file is below. The worst case of the rule is a resurrection
 		// (an own create that did fold, was deleted elsewhere and pruned before S1 ran), never a loss.
-		// Own body frames of the doc still wait in the outbox: no delete covered them (edit beats delete, §c.7), but the
-		// restore can no longer name the pruned id. The file (S tracks a bound doc's local edits, so it reads
-		// unchanged) is created anew with them instead of trashed (sim smallPrune seed 104: offline edits trashed).
-		if (takesNoFreshId(s, l.hash, false) && !input.docsWithPendingBody.has(s.docId)) {
+		// Restore duty of a pruned doc (§c.9 "Pruned docs"): body rows the pruned delete did not cover (committed past
+		// its base, or own frames still in the outbox) beat the delete (§c.7), but the restore can no longer name the
+		// pruned id. The file (S tracks the edits this device sent, so it reads unchanged) is created anew with them
+		// instead of trashed (sim smallPrune seed 104: offline edits trashed; open-repro prune-storm-mass-delete:
+		// sent edits trashed when the delete and its prune folded in one batch).
+		if (takesNoFreshId(s, l.hash, false) && !hasRestoreDuty(s.docId)) {
 			return push([...prefix, { op: "diskTrash", docId: s.docId, path: l.path, expect: { t: "hash", hash: s.contentHash } }, drop(s.docId)],
 				"diskTrash", brakeKey("diskTrash", s.docId, l.path, s.contentHash), l.path);
+		}
+		// The re-create takes the file's bytes: a replica ahead of what the file was synced at (own edits a bound
+		// editor never saved before a crash, rows from elsewhere) is merged into the file first, under the old id,
+		// and the next pass creates anew from the merged file (sim smallPrune storm seed 200: an unsaved bound edit
+		// lost to a re-create from the file).
+		const replica = s.kind === "blob" ? undefined : ctx.prunedBody.get(s.docId);
+		if (replica && !versionEq(replica, s.bodyVersion) && (l.kind === "markdown" || l.kind === "canvas") && l.kind === s.kind) {
+			return push([...prefix, { op: "reconcileContent", docId: s.docId, path: l.path, kind: l.kind, hasBase: s.hasBase }]);
 		}
 		const id = takeFresh();
 		if (id === null) return push(prefix);

@@ -327,6 +327,40 @@ test("E11b prune removes aliases of a deleted entry first", () => {
 	assert.deepEqual(prunedIds(ev2.find((e) => e.outcome.kind === "pruned")), [d2, d5, d6]);
 });
 
+test("E11c the pruned event carries each removed entry as it was (the delete's base for the restore duty, §c.9)", () => {
+	// Goal 0: the delete is pruned in the frame that made it, before any restore can commit.
+	const w = world({ ...DEFAULT_NS_FOLD_RULES, tombstoneCap: 0, pruneHysteresis: 0 });
+	w.fold(1, A, 0, [create(d1, "a.md", H(1)), create(d2, "b.md", H(2))]);
+	w.fold(2, B, 0, [create(d3, "a.md", H(1))]); // alias of d1, pruned at once
+	assert.equal(w.state.entries.has(d3), false);
+	const ev = w.fold(3, C, 2, [del(d1, 17), del(d2, 4)]);
+	const p = ev.find((e) => e.outcome.kind === "pruned")!;
+	assert.ok(p.outcome.kind === "pruned");
+	assert.deepEqual(p.outcome.docIds, [d1, d2]);
+	assert.deepEqual(p.outcome.entries.map((e) => e.docId), p.outcome.docIds);
+	assert.deepEqual(p.outcome.entries.map((e) => [e.state, e.deletedSeq, e.deleteBaseBodySeq, e.path]), [["deleted", 3, 17, "a.md"], ["deleted", 3, 4, "b.md"]]);
+	assert.equal(w.state.entries.size, 0);
+});
+
+test("E11d a pruned deleted entry leaves a stub (delete base, prune seq) in the state; the stub cap drops the oldest", () => {
+	// A reader that adopts a checkpoint past the delete and its prune folds neither: the stub is its delete base.
+	const w = world({ ...DEFAULT_NS_FOLD_RULES, tombstoneCap: 0, pruneHysteresis: 0, prunedCap: 2 });
+	w.fold(1, A, 0, [create(d1, "a.md", H(1)), create(d2, "b.md", H(2)), create(d4, "c.md", H(3))]);
+	w.fold(2, B, 0, [create(d3, "a.md", H(1))]); // alias of d1, pruned at once: merged aliases leave no stub
+	assert.equal(w.state.pruned.size, 0);
+	w.fold(3, C, 2, [del(d4, 1)]);
+	w.fold(4, C, 3, [del(d1, 2)]);
+	assert.deepEqual([...w.state.pruned].sort(), [[d1, { deleteBaseBodySeq: 2, prunedSeq: 4 }], [d4, { deleteBaseBodySeq: 1, prunedSeq: 3 }]].sort());
+	// a third stub: the oldest (d4, pruned at 3) goes
+	w.fold(5, C, 4, [del(d2, 4)]);
+	assert.deepEqual([...w.state.pruned.keys()].sort(), [d1, d2].sort());
+	assert.deepEqual(w.state.pruned.get(d2), { deleteBaseBodySeq: 4, prunedSeq: 5 });
+	// encoded and verified with the state
+	const back = decodeNsFoldV1(encodeNsFoldV1(w.state))!;
+	assert.deepEqual(back.pruned, w.state.pruned);
+	assert.ok(verifyNsFoldBytes(encodeNsFoldV1(w.state), 5).ok);
+});
+
 test("E12 upgradeRules halt: frame folds whole or not at all", () => {
 	const w = world();
 	w.fold(9099, A, 0, [create(d1, "a.md")]);
@@ -464,6 +498,7 @@ test("verify V1: canonical bytes pass; unsorted, duplicate, trailing and non-min
 		const replayDevices = [...s.replay.keys()].sort();
 		wr.varuint(replayDevices.length);
 		for (const d of replayDevices) wr.varstring(d).varuint(s.replay.get(d)!.r).raw(replayBitsToBytes(s.replay.get(d)!.bits));
+		wr.varuint(0); // no pruned stubs
 		return wr.finish();
 	};
 	assert.ok(bytesEqual(raw(w.state, [d1, d2, d3], [A, B]), bytes), "raw helper matches the encoder");

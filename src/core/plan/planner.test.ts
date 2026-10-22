@@ -17,10 +17,10 @@ const find = <K extends PlannerOp["op"]>(p: Plan, k: K): Extract<PlannerOp, { op
  * Every plan here also checks the reconciler's fresh-docId budget: a row taking more ids than freshIdBudget counts is
  * starved in the engine (takeFresh returns null), however many ids the fixture hands it (d1f8a750's pruned re-create).
  */
-const run = (sc: Scenario, ctx = {}): Plan => {
+const run = (sc: Scenario, ctx: Parameters<typeof planWith>[1] = {}): Plan => {
 	const inp = input(sc);
 	const p = planWith(inp, ctx);
-	const budget = freshIdBudget(inp.synced, inp.local, inp.remote, inp.docsWithPendingBody);
+	const budget = freshIdBudget(inp.synced, inp.local, inp.remote, (d) => inp.docsWithPendingBody.has(d) || (ctx?.restoreDuty?.has(d) ?? false));
 	assert.ok(p.consumedDocIds <= budget, `plan took ${p.consumedDocIds} fresh docIds, freshIdBudget allows ${budget}: ${JSON.stringify(p.ops)}`);
 	return p;
 };
@@ -648,11 +648,49 @@ test("row pruned: own body frames still in the outbox -> the file is created ane
 	]);
 	assert.equal(p.brake, null);
 	const inp = input(pending);
-	assert.equal(freshIdBudget(inp.synced, inp.local, inp.remote, inp.docsWithPendingBody), 1);
+	assert.equal(freshIdBudget(inp.synced, inp.local, inp.remote, (d) => inp.docsWithPendingBody.has(d)), 1);
 	assert.equal(freshIdBudget(inp.synced, inp.local, inp.remote), 0);
 	// a live doc with pending body is not counted (its own row waits on the frames)
 	const live = input({ ...pending, remote: [R("d1", "a.md")] });
-	assert.equal(freshIdBudget(live.synced, live.local, live.remote, live.docsWithPendingBody), 0);
+	assert.equal(freshIdBudget(live.synced, live.local, live.remote, (d) => live.docsWithPendingBody.has(d)), 0);
+});
+
+test("row pruned: a restore duty (own sent rows the pruned delete did not cover) -> the file is created anew, never trashed", () => {
+	// Open-repro prune-storm-mass-delete: B overwrote imported notes (its rows sent and committed, so S tracks them and
+	// L reads unchanged, nothing pending) while A's mass delete, which had not seen them, folded with its prune in one
+	// batch: the pruned row trashed the overwrite. The view hands the duty in restoreDuty (§c.9 "Pruned docs").
+	const sc = { synced: [S("d1", "a.md")], local: [L("a.md", h("c0"), { size: 9 })] };
+	const duty = { restoreDuty: new Set([id("d1")]) };
+	const p = run(sc, duty);
+	assert.deepEqual(p.ops, [
+		{ op: "nsCreate", docId: "fresh1", kind: "markdown", path: "a.md", contentHash: h("c0"), size: 9 },
+		{ op: "reconcileContent", docId: "fresh1", path: "a.md", kind: "markdown", hasBase: false },
+		{ op: "syncedDrop", docId: "d1" },
+	]);
+	assert.equal(p.brake, null);
+	const inp = input(sc);
+	assert.equal(freshIdBudget(inp.synced, inp.local, inp.remote, (d) => duty.restoreDuty.has(d)), 1);
+	// no duty: the delete covered every own row, the trash stands
+	assert.deepEqual(opsOf(run(sc)), ["diskTrash", "syncedDrop"]);
+	// the duty never overrides a live owner of the file (its S at the path): S is dropped, the file stays the owner's
+	const owned = run({ synced: [S("d1", "a.md"), S("d2", "a.md")], local: [L("a.md", h("c0"))], remote: [R("d2", "a.md")] }, duty);
+	assert.deepEqual(opsOf(owned).filter((o) => o !== "reconcileContent" && o !== "syncedPut"), ["syncedDrop"]);
+});
+
+test("row pruned: a restore duty with the replica ahead of S -> the replica is merged into the file first, under the old id", () => {
+	// Sim smallPrune storm seed 200: an edit typed into a bound note was never saved (app crash), so it lived in the
+	// replica only; the doc was deleted elsewhere and pruned. A re-create from the file lost the edit.
+	const sc = { synced: [S("d1", "a.md", { bodyVersion: V(10) })], local: [L("a.md", h("c0"), { size: 9 })] };
+	const ahead = { restoreDuty: new Set([id("d1")]), prunedBody: new Map([[id("d1"), V(10, 3)]]) };
+	assert.deepEqual(run(sc, ahead).ops, [{ op: "reconcileContent", docId: "d1", path: "a.md", kind: "markdown", hasBase: true }]);
+	// a changed file merges too: the re-create takes the merged bytes
+	const changed = { ...sc, local: [L("a.md", h("c1"), { size: 9 })] };
+	assert.deepEqual(opsOf(run(changed, ahead)), ["reconcileContent"]);
+	// the replica at S: nothing to merge, the re-create runs
+	const level = { restoreDuty: ahead.restoreDuty, prunedBody: new Map([[id("d1"), V(10)]]) };
+	assert.deepEqual(opsOf(run(sc, level)), ["nsCreate", "reconcileContent", "syncedDrop"]);
+	// no duty: the trash stands whatever the replica holds (the delete covered every row)
+	assert.deepEqual(opsOf(run(sc, { prunedBody: ahead.prunedBody })), ["diskTrash", "syncedDrop"]);
 });
 
 test("row pruned: the file is a live doc's (its S at the path, or its bytes) -> syncedDrop only, no trash, no create", () => {

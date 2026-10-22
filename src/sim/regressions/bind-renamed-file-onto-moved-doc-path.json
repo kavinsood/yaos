@@ -1,0 +1,236 @@
+{
+	"seed": 86,
+	"config": {
+		"devices": 3,
+		"faults": {
+			"engineCrash": 3,
+			"appCrash": 2,
+			"commitCrash": 2,
+			"idbWipe": 1,
+			"idbLost": 1,
+			"offline": 4,
+			"ioFail": 2,
+			"background": 3,
+			"socketDrop": 4,
+			"relayRestart": 1,
+			"relayDrain": 1,
+			"httpFail": 1,
+			"dailyLimit": 0.5,
+			"epochReset": 0.3,
+			"clockSkew": 1,
+			"keyStoreLoss": 0,
+			"keyRoll": 0,
+			"revoke": 0,
+			"epochRestore": 0,
+			"hostileReplay": 0,
+			"hostileDowngrade": 0,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"smallPrune": null,
+		"steps": 80,
+		"storms": 0.06,
+		"seed": 86
+	},
+	"violations": [
+		{
+			"inv": "convergence",
+			"detail": "moved4/seed0.md differs: A=\"seed 1 [Z.1]\\n\" B=\"seed 0 [Z.0]\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "B: body replica of moved4/seed0.md=\"seed 1 [Z.1]\\n\" disk=\"seed 0 [Z.0]\\n\""
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [Z.0] (seed on Z at step -1)"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[Z.0] was on A:notes/seed0.md (user) and is gone"
+		}
+	],
+	"minimizedPlan": [
+		{
+			"i": 80,
+			"gapMs": 0,
+			"user": {
+				"t": "folderMove",
+				"dev": 1,
+				"folder": 0.23652287991717458,
+				"name": 5
+			}
+		},
+		{
+			"i": 10,
+			"gapMs": 1337,
+			"fault": {
+				"t": "socketDrop",
+				"dev": 0,
+				"code": 1001
+			}
+		},
+		{
+			"i": 86,
+			"gapMs": 258,
+			"canvas": {
+				"t": "cRewrite",
+				"dev": 1,
+				"file": 0.2194649709854275,
+				"seed": 1102815277,
+				"move": true,
+				"sort": false,
+				"by": "external"
+			}
+		},
+		{
+			"i": 11,
+			"gapMs": 346,
+			"user": {
+				"t": "deleteToken",
+				"dev": 1,
+				"view": 0.165082064922899,
+				"pick": 0.2921206336468458
+			}
+		},
+		{
+			"i": 12,
+			"gapMs": 6,
+			"fault": {
+				"t": "offline",
+				"dev": 1,
+				"durationMs": 60359
+			}
+		},
+		{
+			"i": 17,
+			"gapMs": 17,
+			"fault": {
+				"t": "engineCrash",
+				"dev": 1
+			}
+		},
+		{
+			"i": 89,
+			"gapMs": 0,
+			"user": {
+				"t": "setting",
+				"dev": 2,
+				"file": 3,
+				"key": 1,
+				"del": true
+			}
+		},
+		{
+			"i": 90,
+			"gapMs": 0,
+			"user": {
+				"t": "massDelete",
+				"dev": 2,
+				"frac": 0.2974158203462139,
+				"salt": 1831834825
+			}
+		},
+		{
+			"i": 91,
+			"gapMs": 148,
+			"canvas": {
+				"t": "cAddNode",
+				"dev": 1,
+				"file": 0.45128256594762206,
+				"kind": "text",
+				"seed": 534060502
+			}
+		},
+		{
+			"i": 18,
+			"gapMs": 82,
+			"fault": {
+				"t": "relayRestart"
+			}
+		},
+		{
+			"i": 19,
+			"gapMs": 757,
+			"user": {
+				"t": "rename",
+				"dev": 1,
+				"file": 0.4851994167547673,
+				"name": 5
+			}
+		},
+		{
+			"i": 29,
+			"gapMs": 727,
+			"user": {
+				"t": "rename",
+				"dev": 0,
+				"file": 0.8814332385081798,
+				"name": 5
+			}
+		},
+		{
+			"i": 101,
+			"gapMs": 224,
+			"canvas": {
+				"t": "cAddEdge",
+				"dev": 2,
+				"file": 0.6029927195049822,
+				"from": 0.5646541942842305,
+				"to": 0.8771365324500948,
+				"seed": 1868709933
+			}
+		},
+		{
+			"i": 115,
+			"gapMs": 295,
+			"canvas": {
+				"t": "cCreate",
+				"dev": 1,
+				"name": 3,
+				"nodes": 5,
+				"seed": 978174337
+			}
+		},
+		{
+			"i": 61,
+			"gapMs": 953,
+			"user": {
+				"t": "open",
+				"dev": 1,
+				"file": 0.5304730872157961
+			}
+		},
+		{
+			"i": 79,
+			"gapMs": 1228,
+			"user": {
+				"t": "type",
+				"dev": 0,
+				"view": 0.4786174187902361,
+				"pos": 0.23562794015742838,
+				"nl": true
+			}
+		},
+		{
+			"i": 125,
+			"gapMs": 0,
+			"user": {
+				"t": "folderMove",
+				"dev": 1,
+				"folder": 0.19169508665800095,
+				"name": 4
+			}
+		}
+	]
+}

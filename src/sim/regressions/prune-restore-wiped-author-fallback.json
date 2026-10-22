@@ -1,0 +1,399 @@
+{
+	"seed": 503,
+	"config": {
+		"devices": 3,
+		"faults": {
+			"engineCrash": 3,
+			"appCrash": 2,
+			"commitCrash": 2,
+			"idbWipe": 1,
+			"idbLost": 1,
+			"offline": 4,
+			"ioFail": 2,
+			"background": 3,
+			"socketDrop": 4,
+			"relayRestart": 1,
+			"relayDrain": 1,
+			"httpFail": 1,
+			"dailyLimit": 0.5,
+			"epochReset": 0.3,
+			"clockSkew": 1,
+			"keyStoreLoss": 0,
+			"keyRoll": 0,
+			"revoke": 0,
+			"epochRestore": 0,
+			"hostileReplay": 0,
+			"hostileDowngrade": 0,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"smallPrune": {
+			"tombstoneCap": 0,
+			"pruneHysteresis": 0
+		},
+		"seed": 503
+	},
+	"violations": [
+		{
+			"inv": "tokens",
+			"detail": "lost [C.42] (disk-user on C at step 42)"
+		}
+	],
+	"minimizedPlan": [
+		{
+			"i": 121,
+			"gapMs": 437,
+			"canvas": {
+				"t": "cRewrite",
+				"dev": 2,
+				"file": 0.809439250966534,
+				"seed": 1897996496,
+				"move": false,
+				"sort": true,
+				"by": "user"
+			}
+		},
+		{
+			"i": 10,
+			"gapMs": 1400,
+			"user": {
+				"t": "diskDeleteToken",
+				"dev": 2,
+				"file": 0.2750756738241762,
+				"pick": 0.8751406851224601,
+				"by": "external"
+			}
+		},
+		{
+			"i": 11,
+			"gapMs": 305,
+			"user": {
+				"t": "create",
+				"dev": 2,
+				"name": 3
+			}
+		},
+		{
+			"i": 125,
+			"gapMs": 182,
+			"canvas": {
+				"t": "cRewrite",
+				"dev": 1,
+				"file": 0.866514645749703,
+				"seed": 514036416,
+				"move": false,
+				"sort": false,
+				"by": "external"
+			}
+		},
+		{
+			"i": 21,
+			"gapMs": 826,
+			"user": {
+				"t": "deleteToken",
+				"dev": 2,
+				"view": 0.48882800131104887,
+				"pick": 0.28772758413106203
+			}
+		},
+		{
+			"i": 22,
+			"gapMs": 1349,
+			"user": {
+				"t": "create",
+				"dev": 0,
+				"name": 6
+			}
+		},
+		{
+			"i": 127,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 0,
+				"name": 1,
+				"size": 1066
+			}
+		},
+		{
+			"i": 128,
+			"gapMs": 36,
+			"canvas": {
+				"t": "cAddNode",
+				"dev": 0,
+				"file": 0.17496478906832635,
+				"kind": "group",
+				"seed": 250010773
+			}
+		},
+		{
+			"i": 25,
+			"gapMs": 1061,
+			"user": {
+				"t": "create",
+				"dev": 0,
+				"name": 4
+			}
+		},
+		{
+			"i": 27,
+			"gapMs": 1427,
+			"user": {
+				"t": "type",
+				"dev": 0,
+				"view": 0.2014501909725368,
+				"pos": 0.5050986262504011,
+				"nl": false
+			}
+		},
+		{
+			"i": 28,
+			"gapMs": 97,
+			"fault": {
+				"t": "offline",
+				"dev": 1,
+				"durationMs": 72768
+			}
+		},
+		{
+			"i": 131,
+			"gapMs": 334,
+			"canvas": {
+				"t": "cText",
+				"dev": 1,
+				"file": 0.08943681698292494,
+				"node": 0.4550121212378144,
+				"pos": 0.14862863719463348,
+				"del": false
+			}
+		},
+		{
+			"i": 132,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 2,
+				"name": 1,
+				"size": 2751
+			}
+		},
+		{
+			"i": 32,
+			"gapMs": 460,
+			"user": {
+				"t": "delete",
+				"dev": 1,
+				"file": 0.4353743332903832
+			}
+		},
+		{
+			"i": 133,
+			"gapMs": 0,
+			"user": {
+				"t": "attachRename",
+				"dev": 1,
+				"file": 0.6281475820578635,
+				"name": 0
+			}
+		},
+		{
+			"i": 37,
+			"gapMs": 562,
+			"user": {
+				"t": "diskInsert",
+				"dev": 1,
+				"file": 0.6130510200746357,
+				"pos": 0.5388121663127095,
+				"by": "user"
+			}
+		},
+		{
+			"i": 136,
+			"gapMs": 26,
+			"canvas": {
+				"t": "cText",
+				"dev": 1,
+				"file": 0.4326492212712765,
+				"node": 0.6307785359676927,
+				"pos": 0.13122860621660948,
+				"del": true
+			}
+		},
+		{
+			"i": 38,
+			"gapMs": 76,
+			"user": {
+				"t": "type",
+				"dev": 0,
+				"view": 0.017324955202639103,
+				"pos": 0.9059831104241312,
+				"nl": false
+			}
+		},
+		{
+			"i": 39,
+			"gapMs": 1409,
+			"user": {
+				"t": "open",
+				"dev": 2,
+				"file": 0.3069360791705549
+			}
+		},
+		{
+			"i": 40,
+			"gapMs": 617,
+			"user": {
+				"t": "type",
+				"dev": 2,
+				"view": 0.21066089812666178,
+				"pos": 0.45172761124558747,
+				"nl": false
+			}
+		},
+		{
+			"i": 137,
+			"gapMs": 54,
+			"canvas": {
+				"t": "cMove",
+				"dev": 1,
+				"file": 0.05295358318835497,
+				"node": 0.34400834259577096
+			}
+		},
+		{
+			"i": 41,
+			"gapMs": 605,
+			"user": {
+				"t": "rename",
+				"dev": 1,
+				"file": 0.14292661775834858,
+				"name": 5
+			}
+		},
+		{
+			"i": 42,
+			"gapMs": 72,
+			"user": {
+				"t": "diskInsert",
+				"dev": 2,
+				"file": 0.3601769849192351,
+				"pos": 0.6448137555271387,
+				"by": "user"
+			}
+		},
+		{
+			"i": 43,
+			"gapMs": 688,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.792123761260882,
+				"pos": 0.7068495177663863,
+				"nl": true
+			}
+		},
+		{
+			"i": 44,
+			"gapMs": 788,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.3128172638826072,
+				"pos": 0.11866830592043698,
+				"nl": false
+			}
+		},
+		{
+			"i": 138,
+			"gapMs": 326,
+			"canvas": {
+				"t": "cColor",
+				"dev": 1,
+				"file": 0.10488415183499455,
+				"node": 0.9782774646300822,
+				"clear": false
+			}
+		},
+		{
+			"i": 45,
+			"gapMs": 1114,
+			"user": {
+				"t": "rename",
+				"dev": 2,
+				"file": 0.19041686062701046,
+				"name": 5
+			}
+		},
+		{
+			"i": 145,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 1,
+				"name": 1,
+				"size": 1193
+			}
+		},
+		{
+			"i": 68,
+			"gapMs": 588,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.11959554557688534,
+				"pos": 0.43690725695341825,
+				"nl": false
+			}
+		},
+		{
+			"i": 146,
+			"gapMs": 139,
+			"canvas": {
+				"t": "cAddEdge",
+				"dev": 2,
+				"file": 0.1514061528723687,
+				"from": 0.12000784371048212,
+				"to": 0.8770390967838466,
+				"seed": 52532438
+			}
+		},
+		{
+			"i": 69,
+			"gapMs": 370,
+			"fault": {
+				"t": "idbWipe",
+				"dev": 2,
+				"mirrors": true,
+				"downMs": 9685
+			}
+		},
+		{
+			"i": 70,
+			"gapMs": 637,
+			"fault": {
+				"t": "socketDrop",
+				"dev": 2,
+				"code": 1006
+			}
+		},
+		{
+			"i": 71,
+			"gapMs": 1038,
+			"user": {
+				"t": "open",
+				"dev": 0,
+				"file": 0.5771032443735749
+			}
+		}
+	]
+}

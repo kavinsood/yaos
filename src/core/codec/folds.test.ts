@@ -1,7 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import type { CfgFoldState, ClientFrameId, ContentHash, DeviceId, DocId, NsEntry, NsFoldState, VaultId } from "../types";
+import { deflateSync } from "fflate";
+import type { CfgFoldState, ClientFrameId, ContentHash, DeviceId, DocId, NsEntry, NsFoldState, NsPrunedStub, VaultId } from "../types";
+import { PRUNED_STUB_CAP, TOMBSTONE_CAP, TOMBSTONE_PRUNE_HYSTERESIS } from "../limits";
+import { verifyNsFoldBytes } from "../ns/verify";
 import { pathKey } from "../paths/pathKey";
 import { Writer, bytesEqual } from "./lib0";
 import { decodeNsFoldV1, encodeNsFoldV1 } from "./nsFoldV1";
@@ -41,7 +44,7 @@ export function sampleNsState(): NsFoldState {
 	const recentFrames = new Map<DeviceId, ClientFrameId[]>([[B, [fid("x")]], [A, [fid("y"), fid("w")]]]);
 	// B: frameNos 70, 69 and 7 (bit 63 = 70 - 63); A: frameNo 3 only.
 	const replay = new Map([[B, { r: 70, bits: BigInt(3) | (BigInt(1) << BigInt(63)) }], [A, { r: 3, bits: BigInt(1) }]]);
-	return { formatVersion: 1, foldRulesVersion: 1, coversSeq: 6, entries, recentFrames, replay };
+	return { formatVersion: 1, foldRulesVersion: 1, coversSeq: 6, entries, recentFrames, replay, pruned: new Map() };
 }
 
 test("nsFoldV1: canonical (insertion-order independent) and round trips", () => {
@@ -69,7 +72,7 @@ test("nsFoldV1: malformed bytes are rejected", () => {
 	assert.equal(decodeNsFoldV1(new Uint8Array([0x81, 0x00, ...bytes.subarray(1)])), null, "non-minimal formatVersion");
 	const empty = new Writer().varuint(1).varuint(1).varuint(0).varuint(0).varuint(1).varstring("d").varuint(0).finish();
 	assert.equal(decodeNsFoldV1(empty), null, "ring n = 0");
-	const ok = new Writer().varuint(1).varuint(1).varuint(0).varuint(0).varuint(0).varuint(0).finish();
+	const ok = new Writer().varuint(1).varuint(1).varuint(0).varuint(0).varuint(0).varuint(0).varuint(0).finish();
 	assert.ok(decodeNsFoldV1(ok));
 });
 
@@ -78,7 +81,7 @@ test("fold-state replay windows: byte layout and strict decode (e2ee-design §8.
 	const win = (r: number | number[], bits: number[]) => {
 		const w = head().varuint(1).varstring("d");
 		if (Array.isArray(r)) w.raw(new Uint8Array(r)); else w.varuint(r);
-		return decodeNsFoldV1(w.raw(new Uint8Array(bits)).finish());
+		return decodeNsFoldV1(w.raw(new Uint8Array(bits)).varuint(0).finish());
 	};
 	assert.deepEqual(win(2, [0, 0, 0, 0, 0, 0, 0, 3])?.replay.get("d" as DeviceId), { r: 2, bits: BigInt(3) });
 	assert.equal(win(0, [0, 0, 0, 0, 0, 0, 0, 1]), null, "r = 0");
@@ -89,11 +92,72 @@ test("fold-state replay windows: byte layout and strict decode (e2ee-design §8.
 	assert.equal(win(100, [0x80, 0, 0, 0, 0, 0, 0, 1])?.replay.get("d" as DeviceId)?.bits, (BigInt(1) << BigInt(63)) | BigInt(1));
 	const sB = sampleNsState();
 	const bytes = encodeNsFoldV1(sB);
-	// Tail: varuint 2, "devA" r=3 bits 1, "devB" r=70 bits 0x8000000000000003.
-	assert.deepEqual([...bytes.subarray(bytes.length - 29)], [
+	// Tail: varuint 2, "devA" r=3 bits 1, "devB" r=70 bits 0x8000000000000003; then no pruned stubs.
+	assert.deepEqual([...bytes.subarray(bytes.length - 30)], [
 		2, 4, ...Buffer.from("devA"), 3, 0, 0, 0, 0, 0, 0, 0, 1,
 		4, ...Buffer.from("devB"), 70, 0x80, 0, 0, 0, 0, 0, 0, 3,
+		0,
 	]);
+});
+
+test("nsFoldV1: pruned-delete stubs (DESIGN §c.9 \"Pruned docs\"): layout, canonical order, strict decode", () => {
+	const s: NsFoldState = { ...sampleNsState(), pruned: new Map([
+		[id("y"), { deleteBaseBodySeq: 2, prunedSeq: 6 }],
+		[id("w"), { deleteBaseBodySeq: 6, prunedSeq: 6 }],
+		[id("x"), { deleteBaseBodySeq: 3, prunedSeq: 5 }],
+	]) };
+	const bytes = encodeNsFoldV1(s);
+	assert.deepEqual(decodeNsFoldV1(bytes)?.pruned, s.pruned);
+	assert.ok(bytesEqual(encodeNsFoldV1({ ...s, pruned: new Map([...s.pruned].reverse()) }), bytes));
+	// count 3, by (prunedSeq, docId): x at 5 (delta 5, base 5 - 2: zigzag 4), w at 6 (delta 1, 6 - 0), y at 6 (delta 0, 6 - 4: 8)
+	const x = [22, ...Buffer.from("x".repeat(22))], w = [22, ...Buffer.from("w".repeat(22))], y = [22, ...Buffer.from("y".repeat(22))];
+	assert.deepEqual([...bytes.subarray(bytes.length - 76)], [3, ...x, 5, 4, ...w, 1, 0, ...y, 0, 8]);
+	const below = new Uint8Array(bytes);
+	below[bytes.length - 51] = 12; // x's base 5 - 6 < 0
+	assert.equal(decodeNsFoldV1(below), null, "a base below 0");
+	// a base past the prune (a frame's base is not checked against its seq) round trips
+	const past: NsFoldState = { ...s, pruned: new Map([[id("x"), { deleteBaseBodySeq: 17, prunedSeq: 5 }]]) };
+	assert.deepEqual(decodeNsFoldV1(encodeNsFoldV1(past))?.pruned, past.pruned);
+	const swapped = new Uint8Array([...bytes.subarray(0, bytes.length - 50), ...y, 1, 8, ...w, 0, 0]);
+	const v = verifyNsFoldBytes(swapped, 6);
+	assert.equal(!v.ok && v.reason, "non-canonical", "ties out of docId order");
+});
+
+test("nsFoldV1 size bound: a large vault (20000 notes) + TOMBSTONE_CAP + PRUNED_STUB_CAP stays well under the 4 MiB checkpoint cap", () => {
+	// DESIGN §b.6: an ns checkpoint over maxCheckpointBytes (4 MiB) is skipped and the stream keeps its rows (OR-3).
+	// The stubs must not be what pushes a vault over it: realistic ids, hashes, paths and seqs, deflated as sealed.
+	let n = 0;
+	const rid = (): string => createHash("sha256").update(String(n++)).digest("base64url").slice(0, 22);
+	const words = ["alpha", "beta", "project", "meeting", "notes", "daily", "journal", "idea", "draft", "review", "plan", "reading"];
+	const word = (i: number) => words[i % words.length]!;
+	const devices = [0, 1, 2, 3, 4, 5].map(() => rid() as DeviceId);
+	const entries = new Map<DocId, NsEntry>();
+	let seq = 1_000_000;
+	const LIVE = 20_000;
+	for (let i = 0; i < LIVE + TOMBSTONE_CAP; i++) {
+		const del = i >= LIVE;
+		const path = `${word(i)}/${word(i >> 3)} ${word(i >> 5)}/${word(i >> 7)} ${i}.md`;
+		seq += 37;
+		const e = entry({
+			docId: rid() as DocId, path, createdSeq: seq - 30, createdBy: devices[i % 6]!, lastTouchSeq: seq, createSize: 1000 + i,
+			createHash: createHash("sha256").update(`h${i}`).digest("hex") as ContentHash,
+			...(del ? { state: "deleted" as const, deletedSeq: seq, deleteBaseBodySeq: seq - 5 } : {}),
+		});
+		entries.set(e.docId, e);
+	}
+	const pruned = new Map<DocId, NsPrunedStub>();
+	for (let i = 0; i < PRUNED_STUB_CAP; i++) {
+		const prunedSeq = 2_000_000 + Math.floor(i / TOMBSTONE_PRUNE_HYSTERESIS) * 97;
+		pruned.set(rid() as DocId, { prunedSeq, deleteBaseBodySeq: prunedSeq - 3 - (i % 4000) });
+	}
+	const base: NsFoldState = { formatVersion: 1, foldRulesVersion: 1, coversSeq: seq + 2_000_000, entries, recentFrames: new Map(), replay: new Map(), pruned: new Map() };
+	const without = deflateSync(encodeNsFoldV1(base)).length;
+	const withStubs = deflateSync(encodeNsFoldV1({ ...base, pruned })).length;
+	const stubBytes = withStubs - without;
+	if (process.env.YAOS_PRINT_SIZES) console.log({ without, withStubs, stubBytes, perStub: stubBytes / PRUNED_STUB_CAP });
+	assert.ok(stubBytes / PRUNED_STUB_CAP <= 22, `stubs ${(stubBytes / PRUNED_STUB_CAP).toFixed(1)} B each`);
+	assert.ok(stubBytes <= 448 * 1024, `stubs ${stubBytes} B`);
+	assert.ok(withStubs <= 3.75 * 1024 * 1024, `checkpoint ${withStubs} B`);
 });
 
 function sampleCfg(): CfgFoldState {
