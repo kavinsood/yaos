@@ -21,7 +21,7 @@
  * re-checks and the runtime starts in this process; an unpinned device waits for main to pin and restart it.
  */
 
-import type { DeviceId, VaultEpoch } from "../../core/types";
+import type { DeviceId, ObservedRename, VaultEpoch } from "../../core/types";
 import { BUDGETS } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
@@ -127,6 +127,10 @@ export class ComposedEngine {
 	private listing: LocalObservation[] | null = null;
 	private partialListing: LocalObservation[] = [];
 	private eventsSince: VaultEvent[] = [];
+	/** Rename events of `eventsSince` no runtime got (none ran): the next runtime observes them. */
+	private unobserved = new Set<VaultEvent>();
+	/** Renames the stopped runtime observed and had not used (its ctx.renames), for the next runtime. */
+	private carried: ObservedRename[] = [];
 	private retryTimer: number | null = null;
 	/** A revoked store's successor registration failed on a passing refusal: retried (onStoreRevoked). */
 	private replaceTimer: number | null = null;
@@ -589,10 +593,23 @@ export class ComposedEngine {
 		if (!this.disposed && !this.rt && !this.starting) void this.startRuntime("retry");
 	}
 
+	/**
+	 * A new runtime's local tree: the last listing and the vault events since. Renames are observations only once, to
+	 * the runtime that got them (DESIGN §f.6: they live in memory; one that took a doc's file away wins even when the
+	 * source path is re-occupied). A rename an earlier runtime got is history here: used (published, or an echo of the
+	 * engine's own disk rename), or carried with that runtime's unused ones. Replayed as one, it moved whatever doc is
+	 * at its source now onto the file at its end (soak seed 63846271, an epoch migration that kept such renames for the
+	 * new epoch: another device's note moved over an unrelated file). On disk it is a delete and a create.
+	 */
 	private async replayInto(rt: VaultRuntime): Promise<void> {
+		const carried = this.carried;
+		this.carried = [];
+		rt.carryRenames(carried);
 		if (this.listing) {
 			await rt.observations(this.listing, true);
-			if (this.eventsSince.length > 0) rt.vaultEvents(this.eventsSince);
+			const events = this.eventsSince.flatMap((e): VaultEvent[] => (e.t === "rename" && !this.unobserved.has(e) ? [{ t: "delete", path: e.from }, { t: "create", path: e.to, stat: e.stat }] : [e]));
+			this.unobserved.clear();
+			if (events.length > 0) rt.vaultEvents(events);
 		}
 	}
 
@@ -606,7 +623,7 @@ export class ComposedEngine {
 				this.log(`epoch prepare failed: ${String(e)}`);
 				return { bases: [], docDeletes: [], moves: [] };
 			});
-		}
+		} else if (old) this.carried = [...this.carried, ...old.rec.ctx.renames]; // an epoch's migration keeps them (MetaPathMove)
 		this.rt = null;
 		this.options.onRuntime?.(null);
 		for (const b of [...this.bound.byId.values()]) {
@@ -646,15 +663,19 @@ export class ComposedEngine {
 		this.listing = this.partialListing;
 		this.partialListing = [];
 		this.eventsSince = [];
+		this.unobserved.clear();
 	}
 
-	private recordEvents(events: readonly VaultEvent[]): void {
+	/** `seen`: a runtime gets these events. */
+	private recordEvents(events: readonly VaultEvent[], seen: boolean): void {
 		if (!this.listing) return;
 		this.eventsSince.push(...events);
+		if (!seen) for (const e of events) if (e.t === "rename") this.unobserved.add(e);
 		if (this.eventsSince.length > MAX_REPLAY_EVENTS) {
 			// Too much churn to replay: forget the listing; the host's next full scan refreshes it.
 			this.listing = null;
 			this.eventsSince = [];
+			this.unobserved.clear();
 		}
 	}
 
@@ -681,7 +702,7 @@ export class ComposedEngine {
 				this.answer(m.rid, { t: "ok" });
 				return;
 			case "vaultEvents":
-				this.recordEvents(m.events);
+				this.recordEvents(m.events, rt !== null);
 				for (const e of m.events) if (e.t === "rename") this.bound.followRename(pathKey(e.from), e.to, pathKey);
 				if (m.events.some((e) => e.t === "rename")) rt?.viewsMoved();
 				rt?.vaultEvents(m.events);

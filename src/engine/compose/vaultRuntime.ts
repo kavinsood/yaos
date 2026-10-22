@@ -13,7 +13,7 @@
  * and after IndexedDB recovery (before the first pass of the new DB).
  */
 
-import type { BrakeReport, ConflictReason, ContentHash, DocId, DocKind, PathKey, PlanScope, PlannerOp, VaultEpoch, VaultPath } from "../../core/types";
+import type { BrakeReport, ConflictReason, ContentHash, DocId, DocKind, ObservedRename, PathKey, PlanScope, PlannerOp, VaultEpoch, VaultPath } from "../../core/types";
 import { bytesToHex } from "../../core/codec/lib0";
 import { FULL_RECONCILE_IDLE_MAX_MS, type Budgets } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
@@ -777,6 +777,11 @@ export class VaultRuntime {
 			else paths.push(pathKey(e.path));
 		}
 		this.sched.request({ t: "docs", docIds: [], pathKeys: paths });
+	}
+
+	/** The previous runtime's observed renames it had not used (ComposedEngine.replayInto). */
+	carryRenames(renames: readonly ObservedRename[]): void {
+		this.rec.ctx.renames.push(...renames);
 	}
 
 	openDoc(path: VaultPath, viewId: number): Promise<EngineResultValue> {

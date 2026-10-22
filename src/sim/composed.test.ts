@@ -893,6 +893,94 @@ test("a view opened on a bound doc's own file while its other views show another
 	}
 });
 
+test("a new runtime replays the vault events since the listing, but never observes again a rename an earlier runtime saw", async () => {
+	// Soak seed 63846271: the epoch migration's runtime got every vault event since the plugin's listing replayed, and
+	// took each rename in it as the user's, observed now: B's own published rename chain of minutes before, and the
+	// engine's own disk renames of peers' moves. The new epoch kept them (MetaPathMove) and the planner moved the doc
+	// now at the chain's source, another device's note, onto B's unrelated file at its end.
+	const { clock, net, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "first\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.ok(a.vault.userRename("x.md", "y.md")); // A's rename; B's engine renames its file (an echo, not B's rename)
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("y.md"), "first\n");
+	a.vault.userWrite("x.md", "second\n"); // a new note at the rename's source
+	await clock.advance(10_000);
+	const want = [["x.md", "second\n"], ["y.md", "first\n"]];
+	for (const d of devs) assert.deepEqual([...d.vault.snapshot().entries()].sort(), want, d.name);
+	const before = devs.map((d) => d.vrt);
+	net.relay.resetEpoch("sim-epoch-2" as VaultEpoch);
+	await clock.runUntil(() => devs.every((d, i) => d.vrt !== null && d.vrt !== before[i] && d.vrt.listingComplete), 60_000);
+	for (const d of devs) {
+		const rt = d.vrt;
+		assert.ok(rt);
+		assert.deepEqual(rt.rec.ctx.renames, [], `${d.name}: no rename observed again`);
+		assert.deepEqual(rt.bases.renames(), [], `${d.name}: none kept for the new epoch`);
+	}
+	await clock.advance(30_000);
+	for (const d of devs) assert.deepEqual([...d.vault.snapshot().entries()].sort(), want, d.name);
+});
+
+/** A's rename x.md -> y.md (with an edit, so no hash pairs them) moved the doc: x.md is gone, both edits are kept. */
+function renameKept(a: SimDevice, b: SimDevice, xid: string | undefined): void {
+	assert.ok(xid);
+	assert.equal(a.vrt?.port.view().remoteByPathKey.get(pathKey("y.md")), xid, "y.md is the renamed doc");
+	for (const d of [a, b]) {
+		const files = [...d.vault.snapshot().entries()].sort();
+		assert.ok(!files.some(([p]) => p === "x.md"), `${d.name}: x.md not back`);
+		for (const t of ["one\nA\n", "one\nB\n"]) assert.ok(files.some(([, s]) => s === t), `${d.name}: ${JSON.stringify(t)} kept`);
+	}
+	assert.deepEqual([...a.vault.snapshot().entries()].sort(), [...b.vault.snapshot().entries()].sort());
+}
+
+test("a rename made while no runtime runs (its start fails offline) is observed by the next runtime", async () => {
+	const { clock, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "one\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	const xid = a.vrt?.port.view().remoteByPathKey.get(pathKey("x.md"));
+	a.setOnline(false);
+	a.crashApp({ wipe: true }); // the new store's registration needs the network: no runtime until it is back
+	void a.restartApp();
+	await clock.advance(5_000);
+	assert.equal(a.vrt, null, "no runtime");
+	assert.ok(a.vault.userRename("x.md", "y.md"));
+	a.vault.userWrite("y.md", "one\nA\n");
+	b.vault.userWrite("x.md", "one\nB\n");
+	await clock.advance(5_000);
+	a.setOnline(true);
+	await clock.advance(60_000);
+	renameKept(a, b, xid);
+});
+
+test("a rename the stopped runtime observed and had not planned yet is the next runtime's", async () => {
+	const { clock, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "one\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	const xid = a.vrt?.port.view().remoteByPathKey.get(pathKey("x.md"));
+	a.setOnline(false);
+	await clock.advance(1_000);
+	const old = a.vrt;
+	assert.ok(old);
+	assert.ok(a.vault.userRename("x.md", "y.md"));
+	a.vault.userWrite("y.md", "one\nA\n");
+	await clock.runUntil(() => old.rec.ctx.renames.length > 0, 5_000);
+	const passes = old.stats.passes;
+	for (const n of await a.storage.listDatabases()) a.storage.loseConnection(n); // a storage-lost restart, now
+	b.vault.userWrite("x.md", "one\nB\n");
+	await clock.advance(5_000);
+	assert.equal(old.stats.passes, passes, "the stopped runtime never planned the rename");
+	assert.ok(a.vrt && a.vrt !== old, "a new runtime");
+	a.setOnline(true);
+	await clock.advance(60_000);
+	renameKept(a, b, xid);
+});
+
 test("bound views on a file no doc is synced at re-open only when two pass ends saw it; a rename of the open note never does", async () => {
 	const { clock, devs } = world();
 	const [a, b] = pair(devs);

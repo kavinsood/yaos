@@ -2093,6 +2093,11 @@ All are in `src/core/types.ts`.
     the old path merged into the doc as an edit (edit beats delete), deleting the old content. A gated pass commits
     the plan's marks before it throws, as they wait for nothing. While such a rename is known, a file at the doc's
     remote path is not the doc's (planner `localFor`): the file is where the rename took it.
+  - A new runtime (a restart in the same worker) gets the last listing and the vault events since replayed. A rename
+    is observed once, by the runtime that got it: the stopped runtime's unused renames carry over (an epoch
+    migration keeps them as `MetaPathMove`), and so do the rename events that came while no runtime ran. Every other
+    rename replays as a delete and a create: it was used already, or it was the engine's own disk rename. Observed
+    again, the old renames moved whatever doc is at their source now (soak seed 63846271).
   - An observed rename wins even when the source path is re-occupied. If the file there holds exactly S's bytes, the
     engine re-materialized the doc there before the event arrived, so S describes that file and not the moved one.
     The moved file then merges with no base (`reconcileContent.noBase`): neither S's stored base nor its
