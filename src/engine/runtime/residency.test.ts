@@ -71,7 +71,7 @@ test("residency: rows that grow a clean replica past the byte budget evict it", 
 	}
 });
 
-test("residency: acquire returns a pinned, resident handle even when an eviction runs before its caller resumes", async () => {
+test("residency: acquire returns a pinned, resident handle even when a drop runs before its caller resumes", async () => {
 	const clock = new VirtualClock(Date.UTC(2026, 0, 1, 12, 0));
 	const { a, b } = await pair(clock);
 	try {
@@ -80,22 +80,54 @@ test("residency: acquire returns a pinned, resident handle even when an eviction
 		const hs = b.c.handles;
 		const stream = b.streamOf(id);
 		assert.equal(hs.isResident(stream), false);
-		// The first load is evicted in the microtask after it registers, before acquire's continuation runs.
+		// The first load is dropped in the microtask after it registers, before acquire's continuation runs (a budget
+		// eviction skips it: the next test).
 		// @ts-expect-error -- the test reaches HandleCache's private hooks to run an eviction inside the load.
 		const hooks: HandleHooks = hs.hooks;
 		const onLoaded = hooks.onLoaded.bind(hooks);
 		let once = true;
 		hooks.onLoaded = (h) => {
 			onLoaded(h);
-			if (once) queueMicrotask(() => hs.evictAllClean());
+			if (once) queueMicrotask(() => hs.drop(stream));
 			once = false;
 		};
 		const loads = hs.loads;
 		const h = await drive(hs.acquire(stream), clock);
-		assert.equal(hs.loads, loads + 2, "loaded again after the eviction");
+		assert.equal(hs.loads, loads + 2, "loaded again after the drop");
 		assert.equal(hs.peek(stream), h, "the handle returned is the resident one");
 		assert.equal(h.pins, 1);
 		hs.unpin(h);
+	} finally {
+		await drive(a.stop(), clock);
+		await drive(b.stop(), clock);
+	}
+});
+
+test("residency: concurrent acquires past maxResidentDocs all resolve: a handle its caller waits on is not evicted for another's load", async () => {
+	// Sim canvas-reorder-rerank-lost-in-record-conflict after the runner's parallel diskMaterialize jobs: each load
+	// evicted the other's clean handle before its caller resumed, and both reloaded forever.
+	const clock = new VirtualClock(Date.UTC(2026, 0, 1, 12, 0));
+	const { a, b } = await pair(clock);
+	try {
+		const ids: DocId[] = [];
+		for (const n of ["x", "y", "z"]) ids.push(await drive(createDoc(a, `${n}.md`, `${n}\n`), clock));
+		await caughtUp(clock, a, b, ids);
+		const hs = b.c.handles;
+		const streams = ids.map((id) => b.streamOf(id));
+		const loads = hs.loads;
+		// One doc; past 20 reloads (the livelock) the budget opens, so the test fails on the count instead of hanging.
+		const budgets = hs.budgets;
+		hs.budgets = { ...budgets, get maxResidentDocs() {
+			return hs.loads > loads + 20 ? budgets.maxResidentDocs : 1;
+		} };
+		const got = await drive(Promise.all(streams.map((s) => hs.acquire(s))), clock);
+		assert.equal(hs.loads, loads + streams.length, "each loaded once");
+		got.forEach((h, i) => {
+			assert.equal(hs.peek(streams[i]!), h, "resident");
+			assert.equal(h.pins, 1, "pinned");
+		});
+		for (const h of got) hs.unpin(h);
+		assert.equal(hs.count, 1, "within the docs budget once unpinned");
 	} finally {
 		await drive(a.stop(), clock);
 		await drive(b.stop(), clock);

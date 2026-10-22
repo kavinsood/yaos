@@ -73,6 +73,8 @@ export const evictedHandleUses: string[] = [];
 export class HandleManager {
 	private readonly handles = new Map<StreamName, Handle>();
 	private readonly loading = new Map<StreamName, Promise<Handle>>();
+	/** withResident callers waiting on each stream's load: its handle is not clean until they ran (isClean). */
+	private readonly awaited = new Map<StreamName, number>();
 	loads = 0;
 
 	constructor(private readonly repo: Repo, public budgets: Budgets, private readonly hooks: HandleHooks) {}
@@ -108,8 +110,9 @@ export class HandleManager {
 		return n;
 	}
 
+	/** Not bound, pinned or holding edits, and no withResident caller is waiting to take it. */
 	isClean(h: Handle): boolean {
-		return h.bound === 0 && h.pins === 0 && h.builder.empty;
+		return h.bound === 0 && h.pins === 0 && h.builder.empty && !this.awaited.has(h.stream);
 	}
 
 	/** Load (or return) the handle and pin it; callers must unpin(). */
@@ -123,12 +126,24 @@ export class HandleManager {
 	/**
 	 * Load (or return) the handle and run `fn` on it synchronously while it is resident. Any await between a load
 	 * and its use (a shared load promise resolves its waiters in later microtasks) lets another path's eviction drop
-	 * a clean handle: then it is loaded again. `fn` pins or binds it to keep it past its own return.
+	 * a handle: then it is loaded again. Until `fn` ran the handle is not clean (`awaited`), so budget evictions skip
+	 * it: otherwise concurrent loads past `maxResidentDocs` (the runner's parallel diskMaterialize jobs) evict each
+	 * other's handle before its caller resumes, forever (sim canvas-reorder-rerank-lost-in-record-conflict). An
+	 * explicit drop still can. `fn` pins or binds it to keep it past its own return.
 	 */
 	async withResident<T>(stream: StreamName, fn: (h: Handle) => T): Promise<T> {
-		for (;;) {
-			const h = await this.load(stream);
-			if (this.handles.get(stream) === h) return fn(h);
+		this.awaited.set(stream, (this.awaited.get(stream) ?? 0) + 1);
+		try {
+			for (;;) {
+				const h = await this.load(stream);
+				if (this.handles.get(stream) === h) return fn(h);
+			}
+		} finally {
+			const n = (this.awaited.get(stream) ?? 1) - 1;
+			if (n > 0) this.awaited.set(stream, n);
+			else this.awaited.delete(stream);
+			// A handle `fn` did not keep (pin / bind) is clean again: within budget again.
+			this.enforceBudget();
 		}
 	}
 	unpin(h: Handle): void {
