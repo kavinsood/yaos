@@ -32,7 +32,7 @@ import type { ReconcileSettings } from "../reconcile/context";
 import type { DiskSchema } from "../reconcile/store";
 import { LogEngine } from "../runtime/engine";
 import type { EngineTuning } from "../runtime/options";
-import type { MetaDocDeletes, MetaPathBase } from "../store/schema";
+import type { MetaDocDeletes, MetaPathBase, MetaPathMove } from "../store/schema";
 import { CFG_BLOB_DOC, CfgSync } from "../settings/cfgSync";
 import { listLocal, partName } from "../snapshots/localStore";
 import { SnapshotJob } from "../snapshots/snapshotJob";
@@ -102,6 +102,8 @@ export interface VaultRuntimeStart {
 	readonly pathBases?: readonly MetaPathBase[] | null;
 	/** The old epoch's docs' deletes by docId (§c.12 "Deletes"), stored in the new DB (epochBases.ts). */
 	readonly docDeletes?: readonly MetaDocDeletes[] | null;
+	/** The old epoch's unpublished renames (§c.12 "Renames"), stored in the new DB (epochBases.ts). */
+	readonly pathMoves?: readonly MetaPathMove[] | null;
 }
 
 /** Observational test hook: called after the engine acted; it must not change anything (production: absent). */
@@ -221,7 +223,7 @@ export class VaultRuntime {
 			inherit: o.identity.inherit ?? null,
 			supersedes: o.identity.supersedes ?? null,
 			lineageSideFiles: (deviceId) => engine.link.sideFilesOf(deviceId),
-			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, pathBases: o.pathBases ?? null, docDeletes: o.docDeletes ?? null,
+			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, pathBases: o.pathBases ?? null, docDeletes: o.docDeletes ?? null, pathMoves: o.pathMoves ?? null,
 			provisionalBroadcast: o.settings.provisionalBroadcast, tuning: o.tuning, budgets: o.budgets,
 			onBoundText: (docId, changes, length, origin) => engine.bound.onText(docId, changes, length, origin),
 			onFrameTaken: (docId) => engine.bound.frameTaken(docId),
@@ -311,7 +313,12 @@ export class VaultRuntime {
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
 			notice: this.notice, onBrake: (r) => this.onBrake(r), onConflictCopy: () => this.conflictCopies.add(), observeConflict: o.observe?.conflict ? (r, w) => o.observe?.conflict?.(r, w) : undefined, onRebind: (from, into) => this.retarget(from, into),
 			pathBase: (k: PathKey) => bases.get(k), pathBaseKeys: bases.keys, pathDeleted: (k: PathKey) => bases.deleted(k),
-			docDeletes: (d) => bases.docDeletes(d), docDeletesApplied: (d) => bases.applied(d),
+			docDeletes: (d) => bases.docDeletes(d), docDeletesApplied: (d) => bases.applied(d), epochRenames: () => bases.renames(),
+			keepUnrecordedRenames: async (r) => {
+				if ((await bases.keep(r)) === 0) return;
+				this.mirror.markDirty(); // the mirror takes them at once (SyncedMirror.moves)
+				void this.mirror.flush();
+			},
 			boundSavedText: (docId, text) => {
 				const b = o.engine.bound.get(docId);
 				return b !== undefined && (text === b.diskText || b.candidates.includes(text));
@@ -330,11 +337,17 @@ export class VaultRuntime {
 		});
 		this.mirror = new SyncedMirrorWriter({
 			side: link.sideFiles, hash: ports.hash, clock: ports.clock, identity: () => identity,
-			entries: () => this.rec.ctx.store.synced.values(), nsCoversSeq: () => c.ns.coversSeq,
+			entries: () => this.rec.ctx.store.synced.values(), nsCoversSeq: () => c.ns.coversSeq, moves: () => bases.renames(),
 			onError: (e) => this.diag(`synced mirror write failed: ${String(e)}`),
 			before: () => c.mirror.flushed(),
 			onWritten: () => void this.dropLineageDirs(),
 		});
+		// The previous epoch's unpublished renames (§c.12 "Renames") are in this DB only: the mirror takes them now, so a
+		// store lost before the moves still has them (sim suite-1 wipe/revoke/roll seed 40).
+		if (bases.renames().length > 0) {
+			this.mirror.markDirty();
+			void this.mirror.flush();
+		}
 		// A doc whose frames left the outbox mirror rests on its synced-mirror record from now on (MirrorWriter.onUnmirrored).
 		c.mirror.onUnmirrored = () => {
 			this.mirror.markDirty();
@@ -582,7 +595,10 @@ export class VaultRuntime {
 		if (scope.t === "full") {
 			this.lastFullAtMs = this.o.ports.clock.now();
 			const settled = await this.bases.settle(this.port.view(), this.rec.ctx.store.synced.values(), (k) => this.rec.ctx.local.has(k));
-			if (settled > 0) this.diag(`epoch bases: ${settled} path(s) settled, ${this.bases.keys.size} left`);
+			if (settled > 0) {
+				this.diag(`epoch bases: ${settled} path(s) settled, ${this.bases.keys.size} left`);
+				this.mirror.markDirty(); // a settled move leaves the mirror (SyncedMirror.moves)
+			}
 			if (r.brake === null && this.listingComplete) await this.pruneBlobQueue();
 			this.requestCfg();
 			if (this.settings.snapshots.enabled) void this.snaps.maybeDaily().catch((e) => this.diag(`daily snapshot failed: ${String(e)}`));

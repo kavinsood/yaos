@@ -26,8 +26,8 @@ import type { HashPort } from "../../ports/crypto";
 import type { StorageDb } from "../../ports/storage";
 import type { SideFileName, SideFilePort } from "../../ports/vault";
 import type { DiskSchema } from "../reconcile/store";
-import { decodeSyncedMirror, encodeSyncedMirror, nextMirrorSlot, pickOutboxMirror, pickSyncedMirror, untrustedSyncPoint, type MirrorIdentity } from "../runtime/mirrors";
-import { STORE, type SyncedMirrorEntry, type SyncedRecord } from "../store/schema";
+import { decodeSyncedMirror, encodeSyncedMirror, nextMirrorSlot, pathMovesOf, pickOutboxMirror, pickSyncedMirror, untrustedSyncPoint, type MirrorIdentity } from "../runtime/mirrors";
+import { STORE, type SyncedMirror, type SyncedMirrorEntry, type SyncedRecord } from "../store/schema";
 
 export const SYNCED_FILES: readonly [SideFileName, SideFileName] = ["synced-a.bin", "synced-b.bin"];
 const OUTBOX_FILES: readonly SideFileName[] = ["outbox-a.bin", "outbox-b.bin"];
@@ -64,14 +64,22 @@ async function readSlots(side: SideFilePort, files: readonly SideFileName[] = SY
 
 /**
  * Fresh DB after loss: import the newest valid synced mirror for this identity
- * into an empty `synced` store. Returns the number of records imported.
+ * into an empty `synced` store, and the previous epoch's unpublished renames it
+ * carries into meta (MetaPathMove). Returns the number of records imported.
  */
 export async function importSyncedMirror(o: {
 	readonly db: StorageDb<DiskSchema>; readonly side: SideFilePort; readonly hash: HashPort; readonly identity: MirrorIdentity;
 	readonly pathKey: PathKeyFn; readonly nowMs: number;
 }): Promise<number> {
 	const picked = await pickSyncedMirror(await readSlots(o.side), o.identity, o.hash);
-	if (!picked || picked.mirror.entries.length === 0) return 0;
+	if (!picked) return 0;
+	const moves = pathMovesOf(picked.mirror.moves);
+	if (moves.length > 0) {
+		await o.db.tx([STORE.meta], "readwrite", async (tx) => {
+			for (const m of moves) if (!(await tx.get(STORE.meta, m.key))) tx.put(STORE.meta, m);
+		});
+	}
+	if (picked.mirror.entries.length === 0) return 0;
 	const outbox = await pickOutboxMirror(await readSlots(o.side, OUTBOX_FILES), o.identity, o.hash);
 	const untrusted = new Set(outbox?.mirror.unmirrored ?? []);
 	const recs = picked.mirror.entries.map((e) => untrustedSyncPoint(fromMirrorEntry(e, o.pathKey, o.nowMs), untrusted));
@@ -90,6 +98,8 @@ export interface SyncedMirrorDeps {
 	readonly identity: () => MirrorIdentity;
 	readonly entries: () => Iterable<SyncedRecord>;
 	readonly nsCoversSeq: () => Seq;
+	/** The previous epoch's unpublished renames (EpochBases.renames): they ride the mirror (SyncedMirror.moves). */
+	readonly moves?: () => NonNullable<SyncedMirror["moves"]>;
 	readonly debounceMs?: number;
 	readonly onError?: (e: unknown) => void;
 	/**
@@ -164,8 +174,10 @@ export class SyncedMirrorWriter {
 		const { slot, generation } = nextMirrorSlot(this.gens);
 		const entries = [...this.deps.entries()].map(toMirrorEntry).sort((a, b) => (a.docId < b.docId ? -1 : a.docId > b.docId ? 1 : 0));
 		if (this.deps.before && !(await this.deps.before())) throw new Error("outbox mirror not written");
+		const moves = this.deps.moves?.() ?? [];
 		const bytes = await encodeSyncedMirror({
 			...this.deps.identity(), generation, writtenAtMs: this.deps.clock.now(), nsCoversSeq: this.deps.nsCoversSeq(), entries,
+			...(moves.length > 0 ? { moves } : {}),
 		}, this.deps.hash);
 		await this.deps.side.write(SYNCED_FILES[slot], bytes);
 		this.gens[slot] = generation;

@@ -106,7 +106,7 @@ export class LogEngine {
 			vaultId: opts.vaultId, vaultEpoch: epoch, deviceId: opts.deviceId, clientVersion: opts.clientVersion,
 			...(store ? { storeKey: store.installKey, deviceToken: store.deviceToken, retireKey: store.retireKey } : {}),
 		};
-		const openOpts = { pathBases: opts.pathBases ?? null, docDeletes: opts.docDeletes ?? null, inherit: opts.inherit ?? null, supersedes: opts.supersedes ?? null };
+		const openOpts = { pathBases: opts.pathBases ?? null, docDeletes: opts.docDeletes ?? null, pathMoves: opts.pathMoves ?? null, inherit: opts.inherit ?? null, supersedes: opts.supersedes ?? null };
 		const openedAt = c.mono();
 		// A pending identity is consumed before its store exists, so it can serve no second store (storeIdentity.ts).
 		if (store?.beforeCreate) await store.beforeCreate();

@@ -175,6 +175,19 @@ export interface MetaDocDeletes {
 	readonly update?: Uint8Array;
 }
 /**
+ * A rename of the user's an old epoch's DB knew and had not published (DESIGN §c.12 "Renames"), one record per
+ * source path key: the observed renames in memory, and those kept on a synced record (SyncedEntry.renamedTo). The
+ * new epoch has no synced record to keep them on, so its planner reads them as observed renames: the doc at `from`
+ * moves with the file (planner movedUntracked), not put back beside it. Stored with the new DB's identity, so a
+ * crash or store loss before the move keeps them; dropped once `from` is settled (compose/epochBases.ts).
+ */
+export interface MetaPathMove {
+	readonly key: `pathMove:${string}`;
+	readonly from: VaultPath;
+	readonly to: VaultPath;
+	readonly atMs: number;
+}
+/**
  * The keyring's records as SecretStorage holds them (e2ee-design §6.1): the winners, then the revokes held open.
  * Not secret: every byte of them is in `k`. Kept here too so that a device whose SecretStorage was lost still has
  * them when a reset or restore emptied `k` before any device re-published (§11.5): the RK opens the newest genesis
@@ -202,7 +215,7 @@ export interface MetaPendingIdentity {
 	readonly registered: boolean;
 }
 
-export type MetaRecord = MetaPendingIdentity | MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaKeyring | MetaBlobPut | MetaPathBase | MetaKeyringRecords | MetaDocDeletes;
+export type MetaRecord = MetaPendingIdentity | MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaKeyring | MetaBlobPut | MetaPathBase | MetaKeyringRecords | MetaDocDeletes | MetaPathMove;
 export type MetaKey = MetaRecord["key"];
 
 // ---------------------------------------------------------------------------
@@ -586,4 +599,6 @@ export interface SyncedMirror {
 	readonly writtenAtMs: number;
 	readonly nsCoversSeq: Seq;
 	readonly entries: readonly SyncedMirrorEntry[];
+	/** The previous epoch's unpublished renames (MetaPathMove): recovery stores them again. Absent = none. */
+	readonly moves?: readonly { readonly from: VaultPath; readonly to: VaultPath; readonly atMs: number }[];
 }

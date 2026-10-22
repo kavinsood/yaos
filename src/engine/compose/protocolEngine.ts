@@ -50,7 +50,7 @@ import { idleStatus } from "./statusMerge";
 import { prepareEpochMigration } from "./runtimeOps";
 import { wipeSecrets } from "../../protocol/workerTransport";
 import { StoreEpochError } from "../runtime/engine";
-import type { MetaDocDeletes, MetaPathBase } from "../store/schema";
+import type { MetaDocDeletes, MetaPathBase, MetaPathMove } from "../store/schema";
 import { VaultRuntime, type RestartReason, type RuntimeObserver } from "./vaultRuntime";
 
 /** A device id's shape (relay-wire §2.4): a lineage entry of any other shape is ignored. */
@@ -146,7 +146,7 @@ export class ComposedEngine {
 	/** A runtime of this init swept the lineage's leftover dirs (claimLineageSweep). */
 	private lineageSwept = false;
 	/** Carried into the next runtime after an epoch migration (§c.12). */
-	private migration: { bases: MetaPathBase[]; docDeletes: MetaDocDeletes[] } | null = null;
+	private migration: { bases: MetaPathBase[]; docDeletes: MetaDocDeletes[]; moves: MetaPathMove[] } | null = null;
 	/**
 	 * The relay named an epoch the found store has no DB for (StoreEpochError): the next start mints a new identity
 	 * for the new epoch's store (identity-per-store §4, decision 2) instead of reading the store's. Cleared once a
@@ -296,7 +296,7 @@ export class ComposedEngine {
 						clientVersion: this.options.clientVersion ?? "dev", vaultEpoch: this.knownEpoch, reason,
 						tuning: this.options.tuning, budgets: this.options.budgets, paused: this.paused,
 						tzOffsetMinutes: this.options.tzOffsetMinutes, log: this.options.log, onDiag: this.options.onDiag, observe: this.options.observe,
-						pathBases: this.migration?.bases ?? null, docDeletes: this.migration?.docDeletes ?? null,
+						pathBases: this.migration?.bases ?? null, docDeletes: this.migration?.docDeletes ?? null, pathMoves: this.migration?.moves ?? null,
 					});
 					return { identity, rt };
 				};
@@ -572,7 +572,7 @@ export class ComposedEngine {
 		if (reason === "epoch" && old) {
 			this.migration = await prepareEpochMigration(old).catch((e) => {
 				this.log(`epoch prepare failed: ${String(e)}`);
-				return { bases: [], docDeletes: [] };
+				return { bases: [], docDeletes: [], moves: [] };
 			});
 		}
 		this.rt = null;

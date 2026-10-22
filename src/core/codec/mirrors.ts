@@ -95,6 +95,17 @@ export interface SyncedMirrorData extends MirrorIdentity {
 	readonly writtenAtMs: number;
 	readonly nsCoversSeq: Seq;
 	readonly entries: readonly SyncedMirrorEntryData[];
+	/**
+	 * Format 2: the previous epoch's renames this store has not published yet (MetaPathMove, DESIGN §c.12
+	 * "Renames"; atMs floored to an integer). Absent: none (or format 1).
+	 */
+	readonly moves?: readonly SyncedMirrorMoveData[];
+}
+
+export interface SyncedMirrorMoveData {
+	readonly from: VaultPath;
+	readonly to: VaultPath;
+	readonly atMs: number;
 }
 
 export type MirrorDecodeResult<T> =
@@ -219,6 +230,9 @@ export function encodeSyncedMirror(m: SyncedMirrorData, hash: Sha): Promise<Uint
 		if (e.renamedTo) w.varstring(e.renamedTo.to).varuint(Math.max(0, Math.floor(e.renamedTo.atMs)));
 		if (e.heldHash !== undefined) w.fixed(hashToBytes(e.heldHash), 32);
 	}
+	const moves = m.moves ?? [];
+	w.varuint(moves.length);
+	for (const mv of moves) w.varstring(mv.from).varstring(mv.to).varuint(Math.max(0, Math.floor(mv.atMs)));
 	return seal(w, hash);
 }
 
@@ -249,7 +263,14 @@ export function decodeSyncedMirror(bytes: Uint8Array, hash: Sha): Promise<Mirror
 				...(flags & 1 ? { fileGone: true as const } : {}), ...(renamedTo ? { renamedTo } : {}), ...(heldHash !== undefined ? { heldHash } : {}),
 			});
 		}
-		return { ...id, nsCoversSeq, entries };
+		const moves: SyncedMirrorMoveData[] = [];
+		const nm = version >= 2 ? r.varuint() : 0;
+		for (let i = 0; i < nm; i++) {
+			const from = r.varstring();
+			const to = r.varstring();
+			moves.push({ from, to, atMs: r.varuint() });
+		}
+		return { ...id, nsCoversSeq, entries, ...(moves.length > 0 ? { moves } : {}) };
 	}, [1, MIRROR_FORMAT_VERSION]);
 }
 

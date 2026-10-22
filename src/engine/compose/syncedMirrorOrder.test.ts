@@ -114,3 +114,23 @@ test("recovery: a record's decided delete, kept rename and held content come bac
 	assert.equal(row?.contentHash, rec.contentHash);
 	assert.equal(row?.bodyVersion, null, "still no CRDT sync point (§i.5 step 3)");
 });
+
+test("recovery: the previous epoch's unpublished renames ride the mirror and come back into meta (MetaPathMove), entries or not", async () => {
+	// Sim suite-1 wipe/revoke/roll seed 40 (8 steps): the user's rename the old epoch's record kept, carried over the
+	// migration into the new DB, was lost with that DB's store; the doc came back at the old path beside the file.
+	const identity = { vaultId: "v", vaultEpoch: "e2", deviceId: "dev" } as MirrorIdentity;
+	const hash = createWebHash();
+	const moves = [{ from: "c/c3.canvas" as VaultPath, to: "boards/c5.canvas" as VaultPath, atMs: 1_759_600_000_123 }];
+	for (const entries of [[], [rec]]) {
+		const side = new MemSideFiles();
+		const w = new SyncedMirrorWriter({ side, hash, clock: createWebClock(), identity: () => identity, entries: () => entries, nsCoversSeq: () => 0 as Seq, moves: () => moves, debounceMs: 60_000 });
+		w.markDirty();
+		await w.flush();
+		const storage = new MemStoragePort();
+		const db = await storage.open<DiskSchema>("fresh", DB_SCHEMA_VERSION, STORE_SPECS);
+		assert.equal(await importSyncedMirror({ db, side, hash, identity, pathKey: (p) => p as PathKey, nowMs: 1 }), entries.length);
+		const meta = await db.tx([STORE.meta], "readonly", (tx) => tx.getAll(STORE.meta));
+		db.close();
+		assert.deepEqual(meta.filter((m) => m.key.startsWith("pathMove:")), [{ key: "pathMove:c/c3.canvas", ...moves[0] }], `${entries.length} entries`);
+	}
+});

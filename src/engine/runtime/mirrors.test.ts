@@ -10,7 +10,7 @@ import {
 } from "../store/schema";
 import { CodecError, Writer, concatBytes, hexToBytes } from "../../core/codec/lib0";
 import {
-	decodeOutboxMirror, decodeSyncedMirror, encodeOutboxMirror, encodeSyncedMirror, mirrorFrameSize, nextMirrorSlot,
+	decodeOutboxMirror, decodeSyncedMirror, encodeOutboxMirror, encodeSyncedMirror, mirrorFrameSize, nextMirrorSlot, otherEpochMoves,
 	pickOutboxMirror, pickSyncedMirror, selectMirrorFrames, toMirrorFrame, UNTRUSTED_CONTENT_HASH, unmirroredDocs, untrustedSyncPoint,
 } from "./mirrors";
 import { encodeNsOps } from "../../core/codec/nsOps";
@@ -100,6 +100,11 @@ const FULL_SYNCED: SyncedMirror = {
 		},
 		{ docId: D("doc6"), path: "held.md", kind: "markdown", contentHash: HASH_B, nsTouchSeq: 7, bodyRemoteSeq: 8, blobRev: 0, heldHash: HASH_A },
 	],
+	// Format 2: the previous epoch's renames not published yet (MetaPathMove).
+	moves: [
+		{ from: "Boards/c3.canvas", to: "Ünï/c5.canvas", atMs: 1_759_600_000_456 },
+		{ from: "a.md", to: "b.md", atMs: 0 },
+	],
 };
 
 // ---------------------------------------------------------------------------
@@ -163,6 +168,10 @@ function syncedBody(m: SyncedMirror, forge: Forge = {}): Uint8Array {
 		if (e.renamedTo) w.varstring(e.renamedTo.to).varuint(e.renamedTo.atMs);
 		if (e.heldHash) w.raw(hexToBytes(e.heldHash));
 	});
+	if ((forge.version ?? MIRROR_FORMAT_VERSION) >= 2) {
+		w.varuint(m.moves?.length ?? 0);
+		for (const mv of m.moves ?? []) w.varstring(mv.from).varstring(mv.to).varuint(mv.atMs);
+	}
 	if (forge.trailing) w.raw(forge.trailing);
 	return w.finish();
 }
@@ -327,6 +336,24 @@ describe("outbox mirror codec", () => {
 // Synced mirror codec
 // ---------------------------------------------------------------------------
 
+describe("otherEpochMoves", () => {
+	it("a predecessor's mirror of an older epoch: its kept renames and moves, as the migration would have carried them", async () => {
+		// Sim suite-1 wipe/revoke/roll seed 40 family: a store lost before it migrated leaves its unpublished renames in
+		// a mirror the new epoch's store cannot import (identity mismatch); without them the doc comes back at the old path.
+		const old = await encodeSyncedMirror({ ...FULL_SYNCED, vaultEpoch: "epoch-6" }, sha);
+		const moves = await otherEpochMoves([old, null], ID, sha);
+		assert.deepEqual(moves.map((m) => [m.key, m.from, m.to]).sort(), [
+			["pathMove:a.md", "a.md", "b.md"],
+			["pathMove:boards/c3.canvas", "Boards/c3.canvas", "Ünï/c5.canvas"],
+			["pathMove:boards/old.canvas", "Boards/old.canvas", "Boards/Ünï new.canvas"],
+		].sort());
+		// This epoch's own mirror, another vault's or another dir's: nothing (the first is imported as it is).
+		assert.deepEqual(await otherEpochMoves([await encodeSyncedMirror(FULL_SYNCED, sha)], ID, sha), []);
+		assert.deepEqual(await otherEpochMoves([old], { ...ID, vaultId: "other" as VaultId }, sha), []);
+		assert.deepEqual(await otherEpochMoves([old], { ...ID, deviceId: "dev-B" as DeviceId }, sha), []);
+	});
+});
+
 describe("synced mirror codec", () => {
 	it("round-trips all kinds, unicode paths and large seqs", async () => {
 		const back = await decodeSyncedMirror(await encodeSyncedMirror(FULL_SYNCED, sha), sha);
@@ -358,8 +385,9 @@ describe("synced mirror codec", () => {
 		}
 	});
 
-	it("still reads format 1 (no per-entry flags): the records carry no decided delete, rename or held content", async () => {
-		const v1: SyncedMirror = { ...FULL_SYNCED, entries: FULL_SYNCED.entries.slice(0, 3) };
+	it("still reads format 1 (no per-entry flags, no moves): the records carry no decided delete, rename or held content", async () => {
+		const { moves: _moves, ...rest } = FULL_SYNCED;
+		const v1: SyncedMirror = { ...rest, entries: FULL_SYNCED.entries.slice(0, 3) };
 		assert.deepEqual(await decodeSyncedMirror(withChecksum(syncedBody(v1, { version: 1 })), sha), v1);
 	});
 

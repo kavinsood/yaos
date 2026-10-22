@@ -258,6 +258,16 @@ Kept here until `sim-port` merges; then git history holds them.
   again beside B's, and B's older fields won (A's resize lost). The moved doc now waits `body-empty` as a file at
   the path does, and a lost create body drops the empty doc. Test in `planner.test.ts`; plan
   `renamed-untracked-merged-into-unfilled-body.json`.
+- **SIM-S1-MIGRATION-RENAME** (integrate-3; suite 1 wipe/revoke/roll seed 40, full plan): A, revoked, deleted an
+  edge and renamed the canvas; the record kept the rename (renamedTo). An epoch restore then migrated A, and A's
+  store was lost (mirrors kept). The migration carried bases and deletes but not the rename, and in the new epoch a
+  rename observed while ns was not ready lived in memory only. Either way the renamed file became a new doc, and the
+  doc came back at the old path with the edge. Unpublished renames are now `pathMove:` meta records: the migration
+  stores them, a rename with no synced record to stay on is stored as it is observed, the synced mirror carries
+  them (v2 `moves`), and recovery and inherit (also from an old epoch's mirror) read them back. The planner reads
+  them as observed renames until their source path is settled. Tests in `reconciler.epoch.test.ts`,
+  `epochBases.test.ts`, `syncedMirrorOrder.test.ts`, `mirrors.test.ts`; plans
+  `epoch-migration-drops-unpublished-rename.json`, `unrecorded-rename-lost-with-store-after-migration.json`.
 - **Canvas concurrent record create** (`fix-integrity`, fix-epoch soak `971197958-35`): after an epoch reset C
   re-created a canvas empty, and A and D each merged their file into it before seeing the other's rows. A record
   new to a replica is a new Y.Map, so the two maps competed and A's survived whole; D's synced base kept D's colour

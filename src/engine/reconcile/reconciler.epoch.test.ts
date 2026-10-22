@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
-import type { VaultPath } from "../../core/types";
+import type { ObservedRename, VaultPath } from "../../core/types";
 import { standInPathKey } from "../../core/plan/pathRules";
 import { canvasToMergeText, parseCanvasText } from "../../core/hash/canvasCanonical";
 import { rankCanvasInFileOrder } from "../../core/hash/testkit/canvasRanks";
@@ -273,4 +273,40 @@ test("after a migration, an untracked file renamed before its first merge: the d
 	assert.equal(w.log.text(id), "a\nx\ny\nc\n");
 	assert.equal(w.log.view().remote.get(id)?.path, "m.md");
 	assert.deepEqual(w.conflictCopies(), []);
+});
+
+test("after a migration, a rename the old epoch had not published (MetaPathMove): the doc moves with the file, with no observed rename in memory", async () => {
+	// Sim suite-1 wipe/revoke/roll seed 40 (8 steps): key-missing, the user deleted a record and renamed the canvas;
+	// the old record kept the rename (renamedTo), then an epoch restore and a store loss. The new epoch had no record
+	// to keep it on and memory lost it: the renamed file became a new doc, and the doc came back at the old path.
+	const moved = { from: P("n.md"), to: P("m.md"), atMs: 1 };
+	const w = new World({ pathBases: new Map([[standInPathKey(P("n.md")), "a\nb\nx\ny\n"]]), epochRenames: [moved] });
+	w.vault.userWrite("m.md", "a\nx\ny\n"); // renamed, and "b" deleted, in the old epoch
+	const id = w.log.remoteCreate(P("n.md"), "a\nb\nx\ny\nc\n");
+	await w.boot();
+	await w.sync();
+	assert.equal(w.vault.text("n.md"), null, "the doc is not put back at the old path");
+	assert.equal(w.vault.text("m.md"), "a\nx\ny\nc\n", "the delete kept, the new epoch's line merged");
+	assert.equal(w.log.view().remote.get(id)?.path, "m.md");
+	assert.deepEqual(w.vault.paths().sort(), ["m.md"]);
+	assert.deepEqual(w.conflictCopies(), []);
+});
+
+test("an observed rename with no synced record to stay on is handed to the store (keepUnrecordedRenames); one a record keeps is not", async () => {
+	// Sim suite-1 wipe/revoke/roll seed 40 (9 steps): after the migration the user renamed the untracked canvas while
+	// ns was not ready; memory alone had the rename, the store was lost, and the doc came back at the old path.
+	const kept: ObservedRename[] = [];
+	const w = new World({ pathBases: new Map([[standInPathKey(P("n.md")), "a\nb\n"]]), keptRenames: kept });
+	w.vault.userWrite("s.md", "synced\n");
+	w.log.remoteCreate(P("s.md"), "synced\n");
+	await w.boot();
+	await w.sync();
+	w.vault.userWrite("n.md", "a\nb\n");
+	w.log.remoteCreate(P("n.md"), "a\nb\nc\n");
+	w.log.writeGate = "revoked-epoch"; // the merge that would record n.md is refused: no synced record
+	await w.sync(3).catch(() => undefined);
+	w.vault.userRename("n.md", "m.md");
+	w.vault.userRename("s.md", "t.md");
+	await w.sync(3).catch(() => undefined);
+	assert.deepEqual(kept.map((r) => [r.from, r.to]), [["n.md", "m.md"]], JSON.stringify(kept));
 });

@@ -11,13 +11,13 @@ import { ProtocolFailure } from "../../protocol/errors";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
 import { buildDiagnosticsBundle, DIAGNOSTICS_QUARANTINE_MAX } from "./diagnosticsBundle";
-import { PENDING_DB_NAME_PREFIX, STORE, type MetaDocDeletes, type MetaPathBase } from "../store/schema";
+import { PENDING_DB_NAME_PREFIX, STORE, type MetaDocDeletes, type MetaPathBase, type MetaPathMove } from "../store/schema";
 import type { DeviceId } from "../../core/types";
 import { parseDbName } from "./knownEpoch";
 import { readPending, readStoreIdentity } from "./storeIdentity";
 import { readBase } from "../reconcile/store";
 import { encodeStateAsUpdate } from "../body/yjsCounters";
-import { docDeletesKey, pathBaseKey } from "./epochBases";
+import { docDeletesKey, pathBaseKey, pathMoveKey } from "./epochBases";
 import { KeyringRefusedError } from "../keyring/writeGate";
 import type { VaultRuntime } from "./vaultRuntime";
 import type { RemoteView } from "../reconcile/deps";
@@ -224,9 +224,10 @@ async function diagnostics(rt: VaultRuntime, includePaths: boolean): Promise<Dia
 /**
  * §c.12 steps 1 and 3 on the old runtime: save bound views, snapshot, and read for the new epoch's merges the synced
  * bases by path (the old `baseText` rows that read back as written) and what each old doc deleted (oldDeletes).
- * Both are stored with the new DB's identity (epochBases.ts).
+ * Both are stored with the new DB's identity (epochBases.ts), and so are the user's renames this device had not
+ * published (§c.12 "Renames": observed, or kept on a synced record): the new epoch has no record to keep them on.
  */
-export async function prepareEpochMigration(rt: VaultRuntime): Promise<{ bases: MetaPathBase[]; docDeletes: MetaDocDeletes[] }> {
+export async function prepareEpochMigration(rt: VaultRuntime): Promise<{ bases: MetaPathBase[]; docDeletes: MetaDocDeletes[]; moves: MetaPathMove[] }> {
 	const bound = [...rt.engine.bound.byId.keys()];
 	if (bound.length > 0) {
 		await rt.engine.link.request({ t: "saveViews", docIds: bound }).catch(() => undefined);
@@ -261,7 +262,26 @@ export async function prepareEpochMigration(rt: VaultRuntime): Promise<{ bases: 
 			...(del?.keys ? { deleted: del.keys } : {}),
 		});
 	}
-	return { bases: [...bases.values()], docDeletes };
+	return { bases: [...bases.values()], docDeletes, moves: unpublishedRenames(rt) };
+}
+
+/**
+ * The user's renames the old epoch had not published, by source path key (the latest wins): those a synced record
+ * kept (fileGone, renamedTo: the write gate refused the nsRename, or ns was not ready), and the observed ones in
+ * memory. The new epoch's planner reads them as observed renames, so the doc at the old path moves with its file;
+ * dropped with the old store, the file became a new doc and the doc came back at the old path (sim suite-1
+ * wipe/revoke/roll seed 40: a canvas edited and renamed key-missing, then an epoch restore and a store loss).
+ */
+function unpublishedRenames(rt: VaultRuntime): MetaPathMove[] {
+	const out = new Map<PathKey, MetaPathMove>();
+	const add = (from: VaultPath, to: VaultPath, atMs: number): void => {
+		const k = pathKey(from);
+		const had = out.get(k);
+		if (!had || had.atMs <= atMs) out.set(k, { key: pathMoveKey(k), from, to, atMs });
+	};
+	for (const s of rt.rec.ctx.store.synced.values()) if (s.fileGone && s.renamedTo) add(s.path, s.renamedTo.to, s.renamedTo.atMs);
+	for (const r of rt.rec.ctx.renames) add(r.from, r.to, r.atMs);
+	return [...out.values()];
 }
 
 /**

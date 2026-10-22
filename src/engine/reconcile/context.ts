@@ -134,6 +134,16 @@ export interface ReconcilerDeps {
 	readonly docDeletes?: (docId: DocId) => OldDocDeletes | null;
 	readonly docDeletesApplied?: (docId: DocId) => Promise<void>;
 	/**
+	 * The user's renames the previous epoch's store had not published (§c.12 "Renames", MetaPathMove): read with
+	 * the observed renames until their source path is settled (epochBases.ts). Absent = none.
+	 */
+	readonly epochRenames?: () => readonly ObservedRename[];
+	/**
+	 * Keep observed renames that have no synced record to stay on (off the path of a remote doc with none here: the
+	 * planner's movedUntracked) where a lost store finds them (MetaPathMove, read back through `epochRenames`).
+	 */
+	readonly keepUnrecordedRenames?: (renames: readonly ObservedRename[]) => Promise<void>;
+	/**
 	 * A bound doc's replica already holds `text` (canonical): a save of one of its editors read it, or it is the
 	 * last disk text the replica absorbed (boundDisk). Such a disk side is not an edit: the merge base is the text.
 	 */

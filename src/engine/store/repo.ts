@@ -19,7 +19,7 @@ import { CursorTracker } from "../sync/cursor";
 import { LOCAL_FLAG_UNOPENED } from "../sync/foldRuntime";
 import {
 	DB_SCHEMA_VERSION, INDEX, STORE, STORE_SPECS, dbName, tailRange,
-	type MetaCursor, type MetaIdentity, type MetaDocDeletes, type MetaKeyring, type MetaKeyringRecords, type MetaOutboxOrder, type MetaPathBase, type MetaDaily, type MetaInherit, type OutboxRecord, type OutboxState, type QuarantineRecord,
+	type MetaCursor, type MetaIdentity, type MetaDocDeletes, type MetaKeyring, type MetaKeyringRecords, type MetaOutboxOrder, type MetaPathBase, type MetaPathMove, type MetaDaily, type MetaInherit, type OutboxRecord, type OutboxState, type QuarantineRecord,
 	type SnapshotRecord, type StreamRecord, type SyncedRecord, type TailRecord, type YaosSchema,
 } from "./schema";
 
@@ -202,7 +202,7 @@ export class Repo {
 		storage: StoragePort, id: RepoIdentity, nowMs: number,
 		opts: {
 			recoveredFromMirror?: boolean;
-			pathBases?: readonly MetaPathBase[] | null; docDeletes?: readonly MetaDocDeletes[] | null;
+			pathBases?: readonly MetaPathBase[] | null; docDeletes?: readonly MetaDocDeletes[] | null; pathMoves?: readonly MetaPathMove[] | null;
 			/** A new store's predecessor recovery (MetaIdentity.inherit): recorded only when the DB is created. */
 			inherit?: MetaInherit | null;
 			/** The stores a new store replaces (MetaIdentity.supersedes): recorded only when the DB is created. */
@@ -220,6 +220,7 @@ export class Repo {
 				const order = (await tx.get(STORE.meta, "outboxOrder") as MetaOutboxOrder | undefined) ?? { key: "outboxOrder", next: 1 };
 				if (opts.pathBases) await addPathBases(tx, opts.pathBases);
 				if (opts.docDeletes) await addPathBases(tx, opts.docDeletes);
+				if (opts.pathMoves) await addPathBases(tx, opts.pathMoves);
 				return { outcome: { t: "existing", identity: ident } as OpenOutcome, ident, cursor, next: order.next };
 			}
 			const fresh: MetaIdentity = {
@@ -237,6 +238,7 @@ export class Repo {
 			tx.put(STORE.meta, { key: "outboxOrder", next: 1 });
 			if (opts.pathBases) await addPathBases(tx, opts.pathBases);
 			if (opts.docDeletes) await addPathBases(tx, opts.docDeletes);
+			if (opts.pathMoves) await addPathBases(tx, opts.pathMoves);
 			return { outcome: { t: "fresh" } as OpenOutcome, ident: fresh, cursor, next: 1 };
 		});
 		if (res.outcome.t === "mismatch" || res.cursor === null) return { repo: null, outcome: res.outcome, db };
@@ -348,9 +350,27 @@ export class Repo {
 			return all.filter((r): r is MetaPathBase => r.key.startsWith("pathBase:") && "deflated" in r);
 		});
 	}
-	dropPathBases(keys: readonly (MetaPathBase["key"] | MetaDocDeletes["key"])[]): Promise<void> {
+	dropPathBases(keys: readonly (MetaPathBase["key"] | MetaDocDeletes["key"] | MetaPathMove["key"])[]): Promise<void> {
 		return this.serial("dropPathBases", () => this.db.tx([STORE.meta], "readwrite", async (tx) => {
 			for (const k of keys) tx.delete(STORE.meta, k);
+		}));
+	}
+	/** Every stored old epoch's unpublished rename (MetaPathMove, DESIGN §c.12). Dropped with dropPathBases. */
+	pathMoves(): Promise<MetaPathMove[]> {
+		return this.db.tx([STORE.meta], "readonly", async (tx) => {
+			const all = await tx.getAll(STORE.meta, { lower: "pathMove:", upper: "pathMove;", upperOpen: true });
+			return all.filter((r): r is MetaPathMove => r.key.startsWith("pathMove:") && "to" in r);
+		});
+	}
+	/** Store unpublished renames a recovered synced mirror carried (SyncedMirror.moves); an existing record stays. */
+	addPathMoves(moves: readonly MetaPathMove[]): Promise<void> {
+		if (moves.length === 0) return Promise.resolve();
+		return this.serial("addPathMoves", () => this.db.tx([STORE.meta], "readwrite", (tx) => addPathBases(tx, moves)));
+	}
+	/** Store (or replace) unpublished renames (EpochBases.keep). */
+	putPathMoves(moves: readonly MetaPathMove[]): Promise<void> {
+		return this.serial("putPathMoves", () => this.db.tx([STORE.meta], "readwrite", async (tx) => {
+			for (const m of moves) tx.put(STORE.meta, m);
 		}));
 	}
 	/** Every stored old doc's deletes (MetaDocDeletes, DESIGN §c.12). Dropped with dropPathBases. */
@@ -944,7 +964,7 @@ function stateOrderRange(state: OutboxState): KeyRange {
  * The migration's path bases (MetaPathBase), each kept if one is already there: a migration repeated over an existing
  * new-epoch DB (the old DB not retired yet) neither replaces nor revives anything but a missing base.
  */
-async function addPathBases(tx: Tx, bases: readonly (MetaPathBase | MetaDocDeletes)[]): Promise<void> {
+async function addPathBases(tx: Tx, bases: readonly (MetaPathBase | MetaDocDeletes | MetaPathMove)[]): Promise<void> {
 	for (const b of bases) if (!(await tx.get(STORE.meta, b.key))) tx.put(STORE.meta, b);
 }
 

@@ -5,7 +5,7 @@
  * which posts events after the diskOps result).
  */
 
-import type { BrakeConfig, BrakeReport, DocId, PathKey, SyncedEntry, VaultPath } from "../../../core/types";
+import type { BrakeConfig, BrakeReport, DocId, ObservedRename, PathKey, SyncedEntry, VaultPath } from "../../../core/types";
 import { DEFAULT_BRAKE } from "../../../core/plan/brake";
 import { refHashPort } from "../../../core/hash/testkit/hashRef";
 import type { VaultEvent } from "../../../ports/vault";
@@ -35,6 +35,10 @@ export interface WorldOptions {
 	readonly pathDeleted?: ReadonlyMap<string, readonly string[]>;
 	/** §c.12 what the previous epoch's docs deleted, by docId (ReconcilerDeps.docDeletes); read when asked, emptied as applied. */
 	readonly docDeletes?: Map<string, OldDocDeletes>;
+	/** §c.12 the previous epoch's unpublished renames (ReconcilerDeps.epochRenames, MetaPathMove). */
+	readonly epochRenames?: readonly ObservedRename[];
+	/** Collects what ReconcilerDeps.keepUnrecordedRenames is given. */
+	readonly keptRenames?: ObservedRename[];
 	/** Queue own fold events for the reconciler to take (ReconcilerDeps.takeOwnFold), as the vault runtime does. */
 	readonly deferOwnFold?: boolean;
 }
@@ -90,6 +94,8 @@ export class World {
 				docDeletesApplied: async (d: DocId) => void this.opts.docDeletes!.delete(d),
 			} : {}),
 			...(this.opts.pathDeleted ? { pathDeleted: (key: PathKey) => (this.opts.pathDeleted!.has(key) ? new Set(this.opts.pathDeleted!.get(key)) : null) } : {}),
+			...(this.opts.epochRenames ? { epochRenames: () => this.opts.epochRenames! } : {}),
+			...(this.opts.keptRenames ? { keepUnrecordedRenames: async (r: readonly ObservedRename[]) => void this.opts.keptRenames!.push(...r) } : {}),
 			...(this.opts.deferOwnFold ? { takeOwnFold: () => this.ownQueue.splice(0) } : {}),
 		});
 		this.log.onOwnFold = this.opts.deferOwnFold ? async (events) => void this.ownQueue.push(...events) : (events) => rec.applyOwnFold(events);

@@ -10,21 +10,28 @@
  *    merge ran, the migrated-loser collapse needs a winner not synced, and a doc with a synced record merges
  *    against its own base;
  *  - or the path holds nothing (no remote doc, no synced record, no file): a file written there later is new.
+ * The user's renames the old epoch had not published (MetaPathMove) are the planner's observed renames
+ * (ReconcilerDeps.epochRenames) until their source path is settled as above, or holds no remote doc and no synced
+ * record (the doc moved with the file, or there is none to move).
  * A doc's deletes are retired once applied (the first merge or materialize of the doc here), once the doc has a
  * synced record anyway, or when the new epoch has no live doc of that id (after a reset: new ids).
  */
 
 import * as Y from "yjs";
-import type { DocId, PathKey, SyncedEntry } from "../../core/types";
+import { pathKey } from "../../core/paths/pathKey";
+import type { DocId, ObservedRename, PathKey, SyncedEntry } from "../../core/types";
 import type { HashPort } from "../../ports/crypto";
 import type { OldDocDeletes } from "../reconcile/oldDeletes";
 import type { RemoteView } from "../reconcile/deps";
 import { readBase } from "../reconcile/store";
 import type { Repo } from "../store/repo";
-import type { MetaDocDeletes, MetaPathBase } from "../store/schema";
+import type { MetaDocDeletes, MetaPathBase, MetaPathMove } from "../store/schema";
+import { pathMoveKey } from "../runtime/mirrors";
 
 const PREFIX = "pathBase:";
 const DOC_PREFIX = "docDeletes:";
+const MOVE_PREFIX = "pathMove:";
+export { pathMoveKey };
 
 export function pathBaseKey(k: PathKey): MetaPathBase["key"] {
 	return `${PREFIX}${k}`;
@@ -43,6 +50,7 @@ export class EpochBases {
 		private readonly texts: Map<PathKey, string>,
 		private readonly dels: Map<PathKey, ReadonlySet<string>>,
 		private readonly docDels: Map<DocId, OldDocDeletes>,
+		private readonly moves: Map<PathKey, ObservedRename>,
 	) {
 		for (const k of texts.keys()) this.keys.add(k);
 	}
@@ -73,8 +81,10 @@ export class EpochBases {
 				bad.push(r.key);
 			}
 		}
+		const moves = new Map<PathKey, ObservedRename>();
+		for (const r of await repo.pathMoves()) moves.set(r.key.slice(MOVE_PREFIX.length) as PathKey, { from: r.from, to: r.to, atMs: r.atMs });
 		if (bad.length > 0) await repo.dropPathBases(bad);
-		return new EpochBases(repo, texts, dels, docDels);
+		return new EpochBases(repo, texts, dels, docDels, moves);
 	}
 
 	get(k: PathKey): string | null {
@@ -84,6 +94,28 @@ export class EpochBases {
 	/** Canvas record keys deleted in the old doc at the path (MetaPathBase.deleted); null = none. */
 	deleted(k: PathKey): ReadonlySet<string> | null {
 		return this.dels.get(k) ?? null;
+	}
+
+	/** The old epoch's unpublished renames not retired yet (MetaPathMove): observed renames for the planner. */
+	renames(): readonly ObservedRename[] {
+		return [...this.moves.values()];
+	}
+
+	/**
+	 * Store observed renames no synced record keeps (ReconcilerDeps.keepUnrecordedRenames); returns how many were new.
+	 * Read back as the others (renames()), and retired the same way.
+	 */
+	async keep(renames: readonly ObservedRename[]): Promise<number> {
+		const add: MetaPathMove[] = [];
+		for (const r of renames) {
+			const k = pathKey(r.from);
+			const had = this.moves.get(k);
+			if (had && (had.atMs > r.atMs || (had.to === r.to && had.atMs === r.atMs))) continue;
+			this.moves.set(k, { from: r.from, to: r.to, atMs: r.atMs });
+			add.push({ key: pathMoveKey(k), from: r.from, to: r.to, atMs: r.atMs });
+		}
+		if (add.length > 0) await this.repo.putPathMoves(add);
+		return add.length;
 	}
 
 	/** What the old doc of this id deleted (MetaDocDeletes); null = nothing left to apply. */
@@ -98,8 +130,8 @@ export class EpochBases {
 	}
 
 	/** Retire the bases of settled paths and the deletes of settled docs (module comment); returns how many. Needs the ns view caught up. */
-	async settle(view: RemoteView, synced: Iterable<SyncedEntry>, hasLocal: (k: PathKey) => boolean): Promise<number> {
-		if ((this.keys.size === 0 && this.docDels.size === 0) || !view.nsReady) return 0;
+	async settle(view: Pick<RemoteView, "remote" | "remoteByPathKey" | "nsReady">, synced: Iterable<SyncedEntry>, hasLocal: (k: PathKey) => boolean): Promise<number> {
+		if ((this.keys.size === 0 && this.docDels.size === 0 && this.moves.size === 0) || !view.nsReady) return 0;
 		const at = new Map<PathKey, DocId[]>();
 		const syncedDocs = new Set<DocId>();
 		for (const s of synced) {
@@ -121,14 +153,26 @@ export class EpochBases {
 			if (r?.state === "live" && !r.pendingLocal && docs.length === 1 && docs[0] === w) done.push(k);
 		}
 		const doneDocs = [...this.docDels.keys()].filter((d) => syncedDocs.has(d) || view.remote.get(d)?.state !== "live");
-		if (done.length === 0 && doneDocs.length === 0) return 0;
-		await this.repo.dropPathBases([...done.map(pathBaseKey), ...doneDocs.map(docDeletesKey)]);
+		// A move's source: settled (the one doc synced there is the committed winner: the file came back, or another
+		// doc took the path), or nothing left there to move (no remote doc and no synced record).
+		const syncedAt = new Map<PathKey, DocId[]>();
+		for (const s of synced) if (!s.fileGone && this.moves.has(s.pathKey)) syncedAt.set(s.pathKey, [...(syncedAt.get(s.pathKey) ?? []), s.docId]);
+		const doneMoves = [...this.moves.keys()].filter((k) => {
+			const docs = syncedAt.get(k) ?? [];
+			const w = view.remoteByPathKey.get(k);
+			if (w === undefined) return docs.length === 0;
+			const r = view.remote.get(w);
+			return r?.state === "live" && !r.pendingLocal && docs.length === 1 && docs[0] === w;
+		});
+		if (done.length === 0 && doneDocs.length === 0 && doneMoves.length === 0) return 0;
+		await this.repo.dropPathBases([...done.map(pathBaseKey), ...doneDocs.map(docDeletesKey), ...doneMoves.map(pathMoveKey)]);
 		for (const k of done) {
 			this.keys.delete(k);
 			this.texts.delete(k);
 			this.dels.delete(k);
 		}
 		for (const d of doneDocs) this.docDels.delete(d);
-		return done.length + doneDocs.length;
+		for (const k of doneMoves) this.moves.delete(k);
+		return done.length + doneDocs.length + doneMoves.length;
 	}
 }

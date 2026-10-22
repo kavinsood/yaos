@@ -717,6 +717,17 @@ The engine detects a change when `session.vaultEpoch ≠ identity.vaultEpoch`, o
        doc has new item ids, and the base holds only the text after the delete. Nothing tells deleted text a peer's
        file still had from text typed in the new epoch, so it comes back. Nor a delete in a doc this device adopts
        without a job (its file already equal to the new epoch's text).
+   - **Renames.** The user's renames the old store had not published (observed ones in memory, and those a synced
+     record kept, `renamedTo`) have no record to stay on in the new epoch, and the runtime restart drops memory. Step
+     3 stores them too (`pathMove:<pathKey of from>`: from, to, atMs). The new epoch's planner reads them as observed
+     renames (`ReconcilerDeps.epochRenames`), so the doc at the old path moves with the file (§f.6 `movedUntracked`)
+     and is not put back there beside it (sim suite-1 wipe/revoke/roll seed 40). The synced mirror carries them
+     (v2 `moves`), so a store lost before the move recovers them; a store lost before it migrated leaves them in its
+     old epoch's mirror, which the new store reads for them alone (`runtime/inherit.ts`, `otherEpochMoves`). A rename
+     the new epoch observes off a path with no synced record (off a remote doc's path, or any while ns is not ready)
+     is stored the same way (`ReconcilerDeps.keepUnrecordedRenames`): memory alone had it, and a store lost before ns
+     was ready put the doc back beside its file. Retired as a base is (the one doc synced at the source is its
+     committed winner), or once the source holds no remote doc and no synced record.
 5. Drops the old outbox. Its edits are on disk, so the scan re-derives them. Before step 3 reads the bases, every doc
    with own outbox body records is merged into its file against the replica as it is
    (`Reconciler.mergeStrandedEdits`): an edit typed into an editor that died before its save is in the replica only,
@@ -1726,6 +1737,7 @@ varuint generation, varuint writtenAtMs, varuint nsCoversSeq, varuint count,
 count × { varstring docId, varstring path, u8 kindCode, 32B contentHash, varuint nsTouchSeq, varuint bodyRemoteSeq, varuint blobRev,
           u8 flags (v2: bit0 fileGone, bit1 renamedTo, bit2 heldHash),
           [bit1] varstring renamedTo.to, varuint renamedTo.atMs, [bit2] 32B heldHash },
+[v2] varuint moveCount, moveCount × { varstring from, varstring to, varuint atMs },
 32B sha256
 ```
 
@@ -1737,6 +1749,8 @@ count × { varstring docId, varstring path, u8 kindCode, 32B contentHash, varuin
   are what the store alone knows of a file this device could not publish yet; recovered without them, the moved file
   read as a new doc and the old one came back at its path (sim suite-1 wipe/revoke/roll seeds 40 and 112). Version 1
   still decodes (no marks).
+- **Moves** (v2): the previous epoch's renames this store has not published (§c.12 "Renames", `pathMove:` meta
+  records). Recovery stores them again; written at once when a runtime starts with any, and when one is retired.
 - **Written at once**, not a debounce later, when a pass changes a record's marks (src/engine/compose/vaultRuntime.ts
   `runPass`, also when the write gate stopped the pass), and when the outbox mirror newly lists a doc as unmirrored
   (`MirrorWriter.onUnmirrored`): that doc's record is then all recovery has of it here.

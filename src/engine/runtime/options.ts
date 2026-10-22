@@ -8,7 +8,7 @@ import type { ContentHash, DeviceId, DocId, VaultEpoch, VaultId } from "../../co
 import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
 import type { SideFilePort } from "../../ports/vault";
-import type { MetaDocDeletes, MetaInherit, MetaPathBase } from "../store/schema";
+import type { MetaDocDeletes, MetaInherit, MetaPathBase, MetaPathMove } from "../store/schema";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import { DEFAULT_CHECKPOINT_TUNING, type CheckpointTuning } from "../body/checkpoints";
 import type { TextChanges } from "../body/textChanges";
@@ -215,6 +215,8 @@ export interface EngineOptions {
 	readonly pathBases?: readonly MetaPathBase[] | null;
 	/** The abandoned epoch's docs' deletes by docId (DESIGN §c.12 "Deletes"); written to meta with the identity. */
 	readonly docDeletes?: readonly MetaDocDeletes[] | null;
+	/** The abandoned epoch's unpublished renames (DESIGN §c.12 "Renames"); written to meta with the identity. */
+	readonly pathMoves?: readonly MetaPathMove[] | null;
 	/** Apply + adopt other devices' provisional frames on bound docs (DESIGN §d.5). Default true. */
 	readonly provisionalBroadcast?: boolean;
 	readonly tuning?: Partial<EngineTuning>;

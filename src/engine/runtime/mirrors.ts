@@ -21,12 +21,13 @@
  */
 
 import { NS_STREAM, streamClass, streamDocId } from "../../core/types";
-import type { ContentHash, DocId, StreamName } from "../../core/types";
+import type { ContentHash, DocId, PathKey, StreamName } from "../../core/types";
+import { pathKey } from "../../core/paths/pathKey";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import type { HashPort } from "../../ports/crypto";
 import { CodecError, utf8Encode } from "../../core/codec/lib0";
 import * as codec from "../../core/codec/mirrors";
-import type { OutboxMirror, OutboxMirrorFrame, OutboxRecord, SyncedMirror, SyncedMirrorEntry } from "../store/schema";
+import type { MetaPathMove, OutboxMirror, OutboxMirrorFrame, OutboxRecord, SyncedMirror, SyncedMirrorEntry } from "../store/schema";
 
 export type MirrorIdentity = codec.MirrorIdentity;
 
@@ -77,6 +78,16 @@ export async function decodeOutboxMirror(bytes: Uint8Array, hash: HashPort): Pro
 	// Copy sealed: a view would pin the whole side-file buffer, and IndexedDB's
 	// structured clone of a view stores its entire underlying ArrayBuffer.
 	return { ...r.mirror, frames: r.mirror.frames.map((f) => ({ ...f, sealed: f.sealed.slice() })) };
+}
+
+/** The meta key of the unpublished rename off path key `k` (MetaPathMove, DESIGN §c.12 "Renames"). */
+export function pathMoveKey(k: PathKey): MetaPathMove["key"] {
+	return `pathMove:${k}`;
+}
+
+/** A synced mirror's moves (SyncedMirror.moves) as the meta records recovery stores. */
+export function pathMovesOf(moves: SyncedMirror["moves"]): MetaPathMove[] {
+	return (moves ?? []).map((m) => ({ key: pathMoveKey(pathKey(m.from)), from: m.from, to: m.to, atMs: m.atMs }));
 }
 
 export function encodeSyncedMirror(m: SyncedMirror, hash: HashPort): Promise<Uint8Array> {
@@ -132,6 +143,27 @@ export function pickSyncedMirror(
 	hash: HashPort,
 ): Promise<{ mirror: SyncedMirror; slot: number } | null> {
 	return pickSlot(files, identity, (b) => decodeSyncedMirror(b, hash));
+}
+
+/**
+ * The user's renames a synced mirror of another (older) epoch of this vault and dir holds unpublished: its records'
+ * kept renames (fileGone, renamedTo) and its own moves (§c.12 "Renames"). A store lost before it migrated leaves
+ * only these of them; the new epoch's store reads them as the migration would have carried them (inherit.ts).
+ */
+export async function otherEpochMoves(
+	files: readonly (Uint8Array | null)[],
+	identity: MirrorIdentity,
+	hash: HashPort,
+): Promise<MetaPathMove[]> {
+	let best: SyncedMirror | null = null;
+	for (const bytes of files) {
+		const m = bytes ? await decodeSyncedMirror(bytes, hash) : null;
+		if (!m || m.vaultId !== identity.vaultId || m.deviceId !== identity.deviceId || m.vaultEpoch === identity.vaultEpoch) continue;
+		if (!best || m.writtenAtMs > best.writtenAtMs) best = m;
+	}
+	if (!best) return [];
+	const kept = best.entries.flatMap((e) => (e.fileGone && e.renamedTo ? [{ from: e.path, to: e.renamedTo.to, atMs: e.renamedTo.atMs }] : []));
+	return pathMovesOf([...(best.moves ?? []), ...kept]);
 }
 
 function validGeneration(g: number | null): number | null {

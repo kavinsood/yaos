@@ -176,7 +176,7 @@ export class Reconciler {
 		const view = ctx.log.view();
 		const freshDocIds = this.freshIds(freshIdBudget(ctx.store.synced, ctx.local, view.remote, (d) => view.docsWithPendingBody.has(d) || view.restoreDuty.has(d)));
 		// A snapshot: renames observed while this plan runs (its awaits) are for the next plan, not dropped with these.
-		const renames = [...ctx.renames];
+		const renames = [...ctx.renames, ...(ctx.deps.epochRenames?.() ?? [])];
 		const input: PlannerInput = {
 			scope, remote: view.remote, remoteByPathKey: view.remoteByPathKey, local: ctx.local, localComplete: ctx.localComplete,
 			synced: ctx.store.synced, renames, docsWithPendingBody: view.docsWithPendingBody, nsCoversSeq: view.nsCoversSeq,
@@ -211,6 +211,16 @@ export class Reconciler {
 			const s = o.op === "syncedDrop" ? ctx.store.synced.get(o.docId) : o.op === "syncedPut" ? ctx.store.synced.get(o.entry.docId) : undefined;
 			if (s && (o.op === "syncedDrop" || (o.op === "syncedPut" && o.entry.pathKey !== s.pathKey))) vacated.push(s.pathKey);
 		}
+		// An observed rename off a remote doc's path with no synced record here (its file untracked: after an epoch
+		// migration, or a store recovered without the record) lives in memory alone: a lost store dropped it, the
+		// renamed file became a new doc and the doc came back at the old path (sim suite-1 wipe/revoke/roll seed 40).
+		// While ns is not ready the remote paths are not known yet: every rename off a path with no record.
+		const recorded = new Set([...ctx.store.synced.values()].map((s) => s.pathKey));
+		const unrecorded = renames.filter((r) => {
+			const k = ctx.pk(r.from);
+			return !recorded.has(k) && (!view.nsReady || view.remoteByPathKey.has(k));
+		});
+		if (unrecorded.length > 0) await ctx.deps.keepUnrecordedRenames?.(unrecorded);
 		const run = await runPlan(this.env, plan.ops);
 		// Observed renames stay until inference could use them (it is off while ns is not ready).
 		if (ctx.localComplete && view.nsReady) {
@@ -272,7 +282,7 @@ export class Reconciler {
 			const owner = view.remoteByPathKey.get(l.pathKey);
 			return owner === undefined || missingIds.has(owner);
 		});
-		const renames = [...ctx.renames];
+		const renames = [...ctx.renames, ...(ctx.deps.epochRenames?.() ?? [])];
 		for (const s of synced) if (s.fileGone && s.renamedTo) renames.push({ from: s.path, to: s.renamedTo.to, atMs: s.renamedTo.atMs });
 		const moved = new Map(inferRenames(missing, fresh, renames, ctx.localComplete, ctx.pk).map((rn) => [rn.docId, rn.to]));
 		const ops: PlannerOp[] = [];

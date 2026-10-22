@@ -29,9 +29,9 @@ import type { SideFileName, SideFilePort } from "../../ports/vault";
 import { resolveRefContent } from "../body/refs";
 import { openEnvelope, sealFrame } from "../ingest/envelope";
 import { descName, listLocal, partName, readLocal } from "../snapshots/localStore";
-import type { FrameOrigin, MetaInherit, OutboxMirrorFrame, OutboxRecord, SyncedRecord } from "../store/schema";
+import type { FrameOrigin, MetaInherit, MetaPathMove, OutboxMirrorFrame, OutboxRecord, SyncedRecord } from "../store/schema";
 import type { EngineCtx } from "./context";
-import { pickOutboxMirror, pickSyncedMirror, untrustedSyncPoint } from "./mirrors";
+import { otherEpochMoves, pathMovesOf, pickOutboxMirror, pickSyncedMirror, untrustedSyncPoint } from "./mirrors";
 
 const OUTBOX: readonly SideFileName[] = ["outbox-a.bin", "outbox-b.bin"];
 const SYNCED: readonly SideFileName[] = ["synced-a.bin", "synced-b.bin"];
@@ -64,9 +64,13 @@ export async function inheritFromLineage(c: EngineCtx, inh: MetaInherit, side: (
 	const vaultEpoch = c.repo.identity.vaultEpoch;
 	const dirs = inh.dirs.filter((d) => d !== c.self);
 	let outbox: { dir: DeviceId; frames: readonly OutboxMirrorFrame[] } | null = null;
-	let synced: { dir: DeviceId; recs: SyncedRecord[] } | null = null;
+	let synced: { dir: DeviceId; recs: SyncedRecord[]; moves: MetaPathMove[] } | null = null;
 	// Every dir's list, not only the source's: the synced mirror may come from an older dir than the outbox frames.
 	const untrusted = new Set<DocId>();
+	const moves = new Map<string, MetaPathMove>();
+	const addMoves = (list: readonly MetaPathMove[]): void => {
+		for (const m of list) if ((moves.get(m.key)?.atMs ?? -1) <= m.atMs) moves.set(m.key, m);
+	};
 	for (const dir of dirs) {
 		const id = { vaultId, vaultEpoch, deviceId: dir };
 		const ob = await pickOutboxMirror(await readPair(side(dir), OUTBOX), id, c.ports.hash);
@@ -74,12 +78,17 @@ export async function inheritFromLineage(c: EngineCtx, inh: MetaInherit, side: (
 		if (!outbox && ob) outbox = { dir, frames: ob.mirror.frames };
 		if (!synced) {
 			const picked = await pickSyncedMirror(await readPair(side(dir), SYNCED), id, c.ports.hash);
-			if (picked) synced = { dir, recs: picked.mirror.entries.map((e) => syncedRecordOf(e, c.now())) };
+			if (picked) synced = { dir, recs: picked.mirror.entries.map((e) => syncedRecordOf(e, c.now())), moves: pathMovesOf(picked.mirror.moves) };
 		}
+		// A predecessor lost before it migrated to this epoch: its unpublished renames, as the migration carries them.
+		addMoves(await otherEpochMoves(await readPair(side(dir), SYNCED), id, c.ports.hash));
 	}
-	if (synced && untrusted.size > 0) synced = { dir: synced.dir, recs: synced.recs.map((r) => untrustedSyncPoint(r, untrusted)) };
+	if (synced && untrusted.size > 0) synced = { ...synced, recs: synced.recs.map((r) => untrustedSyncPoint(r, untrusted)) };
 	const { records, skipped } = outbox ? await reissue(c, outbox.dir, outbox.frames) : { records: [], skipped: 0 };
 	const syncedN = await c.repo.tInherit(records, synced?.recs ?? []);
+	// The previous epoch's unpublished renames the predecessors kept (§c.12 "Renames"): they are this store's too.
+	addMoves(synced?.moves ?? []);
+	await c.repo.addPathMoves([...moves.values()]);
 	let snapshots = 0;
 	for (const dir of dirs) snapshots += await copySnapshots(side(dir), c.opts.sideFiles ?? null, (e) => c.diag("inherit-snapshot-failed", { error: String(e) }));
 	c.diag("inherited", { from: outbox?.dir ?? null, frames: records.length, skipped, synced: syncedN, untrusted: untrusted.size, snapshots, fenced: inh.fenced });
