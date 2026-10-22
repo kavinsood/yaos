@@ -594,11 +594,10 @@ export class VaultRuntime {
 		if (this.syncedSignature() !== syncedBefore || r.ok > 0) this.mirror.markDirty();
 		if (scope.t === "full") {
 			this.lastFullAtMs = this.o.ports.clock.now();
+			const moves = this.bases.renames().length;
 			const settled = await this.bases.settle(this.port.view(), this.rec.ctx.store.synced.values(), (k) => this.rec.ctx.local.has(k));
-			if (settled > 0) {
-				this.diag(`epoch bases: ${settled} path(s) settled, ${this.bases.keys.size} left`);
-				this.mirror.markDirty(); // a settled move leaves the mirror (SyncedMirror.moves)
-			}
+			if (settled > 0) this.diag(`epoch bases: ${settled} path(s) settled, ${this.bases.keys.size} left`);
+			if (this.bases.renames().length !== moves) this.mirror.markDirty(); // a retired move leaves the mirror (SyncedMirror.moves)
 			if (r.brake === null && this.listingComplete) await this.pruneBlobQueue();
 			this.requestCfg();
 			if (this.settings.snapshots.enabled) void this.snaps.maybeDaily().catch((e) => this.diag(`daily snapshot failed: ${String(e)}`));
