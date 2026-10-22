@@ -267,7 +267,7 @@ s.test("streams routes: exact method and path (moved from streams-relay)", async
 			["GET", `${v}/ws/streams?streamsVersion=1`, { headers: { Upgrade: "websocket" } }, 200],
 			["GET", `${v}/streams/feed`, { headers: bearer(world.owner) }, 200],
 			["GET", `${v}/streams/read?stream=ns`, { headers: bearer(world.owner) }, 200],
-			["PUT", `${v}/streams/checkpoint?stream=ns&coversSeq=1&expectedCoversSeq=0`,
+			["PUT", `${v}/streams/checkpoint?stream=ns&coversSeq=1&expectedCoversSeq=0&vaultEpoch=${world.vault.host.load()!.meta.vaultGeneration}`,
 				{ headers: bearer(world.owner), body: "x" }, 200],
 		];
 		for (const [method, path, init, status] of routed) {
