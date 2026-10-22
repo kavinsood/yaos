@@ -232,7 +232,7 @@ export class Maintenance {
 
 	/**
 	 * The b: / c: streams whose doc is dead (body/retire.ts deadReason), with why. The ns fold's completeness is
-	 * checked (FoldRuntime.gap reads the ns tail) only when some stream's doc has no committed entry.
+	 * checked (FoldRuntime.gap reads the ns tail) only when some stream's doc has a pruned stub and no committed entry.
 	 */
 	async deadStreams(): Promise<{ readonly rec: StreamRecord; readonly why: DeadReason }[]> {
 		const c = this.c;
@@ -242,6 +242,8 @@ export class Maintenance {
 			if ((r.cls !== "body" && r.cls !== "canvas") || !r.docId) continue;
 			const e = c.ns.entry(r.docId);
 			if (e && e.state !== "merged") continue;
+			// No entry and no pruned stub: not provably dead (deadReason), kept.
+			if (!e && !c.ns.state.pruned.has(r.docId)) continue;
 			if (!e) absent = true;
 			cands.push(r);
 		}
@@ -258,7 +260,7 @@ export class Maintenance {
 		for (const r of cands) {
 			const rec = c.repo.stream(r.stream);
 			if (!rec) continue;
-			const why = deadReason(rec, c.ns.entry(r.docId!), fold, pending);
+			const why = deadReason(rec, c.ns.entry(r.docId!), c.ns.state.pruned.get(r.docId!), fold, pending);
 			if (why) out.push({ rec, why });
 		}
 		return out;

@@ -1,12 +1,15 @@
 /**
  * Retired streams (DESIGN §b.5 "retired", §c.9, §d.9): the relay rows and local records of dead docs.
  *
- * A doc is dead when no reader will ever materialize its `b:` / `c:` stream again:
+ * A doc is dead when no reader will ever materialize its `b:` / `c:` stream again, on positive evidence only:
  *  - merged: its committed ns entry is a merged alias (final: ops on it are redirected, nothing revives it);
- *  - pruned: it has no committed ns entry, and the fold provably saw every ns row up to the stream's last row
- *    (FoldCompleteness), so a create of it would be folded by now. Its create, if it ever committed, was then
- *    deleted (or merged) and pruned; or it never committed (junk rows of a create the fold ignored). A live create's
- *    body rows never go before the create (§e.1), so the create seq is below the stream's last row.
+ *  - pruned: it has no committed ns entry but the committed state's pruned-delete stub (NsFoldState.pruned): the
+ *    fold folded its create, its delete and the prune (docIds are never reused, so nothing revives it), and the fold
+ *    provably saw every ns row up to the stream's last row (FoldCompleteness).
+ * Absence is not evidence. A doc with no entry and no stub is kept, whatever the fold saw: its create may not be
+ * folded yet (a body row can reach the relay before its create's ns row: sim suite-1 seed 264 retired such a body
+ * and lost the doc), its stub may have aged out of PRUNED_STUB_CAP, or it was a merged alias pruned (they leave no
+ * stub). Keeping such a stream costs relay space, never content.
  * A deleted doc is not dead: its body stays for a restore (§c.7) and its stream is checkpointed as any other.
  *
  * Writer (maintenance.ts, bounded per tick): a dead stream with rows beyond the relay's checkpoint gets a
@@ -28,7 +31,7 @@
 import { CheckpointEncoding } from "../../core/envelope";
 import { FOLD_RULES_VERSION } from "../../core/limits";
 import { encodeCheckpointContent } from "../../core/codec/contents";
-import type { DeviceId, DocId, NsEntry, NsFoldEvent, Seq, StreamName } from "../../core/types";
+import type { DeviceId, DocId, NsEntry, NsFoldEvent, NsPrunedStub, Seq, StreamName } from "../../core/types";
 import type { RelaySession } from "../../ports/relay";
 import { sealCheckpoint } from "../ingest/envelope";
 import type { StreamRecord } from "../store/schema";
@@ -51,12 +54,17 @@ export interface FoldCompleteness {
 	readonly vaultSeq: Seq;
 }
 
-/** Why the stream's doc is dead, or null (alive, or not provably dead yet). */
+/**
+ * Why the stream's doc is dead, or null (alive, or not provably dead). `entry`: the committed ns entry; `stub`: the
+ * committed state's pruned-delete stub of the doc (NsFoldState.pruned).
+ */
 export function deadReason(
-	rec: Pick<StreamRecord, "cls" | "docId" | "remoteHeadSeq">, entry: NsEntry | undefined, fold: FoldCompleteness, pendingCreate: (docId: DocId) => boolean,
+	rec: Pick<StreamRecord, "cls" | "docId" | "remoteHeadSeq">, entry: NsEntry | undefined, stub: NsPrunedStub | undefined,
+	fold: FoldCompleteness, pendingCreate: (docId: DocId) => boolean,
 ): DeadReason | null {
 	if ((rec.cls !== "body" && rec.cls !== "canvas") || !rec.docId) return null;
 	if (entry) return entry.state === "merged" ? "merged" : null;
+	if (!stub) return null;
 	if (!fold.complete || fold.vaultSeq < rec.remoteHeadSeq || pendingCreate(rec.docId)) return null;
 	return "pruned";
 }

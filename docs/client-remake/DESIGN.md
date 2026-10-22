@@ -276,12 +276,18 @@ There is no separate invariant checker: the strict decoder is the snap index's V
 
 **`retired`**. An empty state at coversSeq = the stream's `lastSeq`: a checkpoint at `lastSeq` retires the relay
 stream (server H7: every segment and the open rows go, gcSeq = lastSeq; the head row and the small checkpoint stay).
-It is written only for the `b:`/`c:` stream of a **dead** doc (`src/engine/body/retire.ts:55` `deadReason`):
+It is written only for the `b:`/`c:` stream of a **dead** doc, on positive evidence (`src/engine/body/retire.ts`
+`deadReason`):
 - **merged**: the committed entry is a merged alias (final; ops on it are redirected);
-- **pruned**: no committed entry, and the fold provably saw every ns row up to the stream's last row: the ns stream
-  is caught up and not frozen, the fold has no gap (`FoldRuntime.gap`), the vault cursor accounts for every seq up
-  to that row, and no own create of the doc is pending. A live create's body rows never precede the create (§e.1),
-  so a doc that still has a create would be folded by then.
+- **pruned**: no committed entry but the committed state's pruned-delete stub (§c.9, `NsFoldState.pruned`; docIds
+  are never reused, so nothing revives it), and the fold provably saw every ns row up to the stream's last row: the
+  ns stream is caught up and not frozen, the fold has no gap (`FoldRuntime.gap`), the vault cursor accounts for
+  every seq up to that row, and no own create of the doc is pending.
+
+Absence is not evidence: a doc with no entry and no stub is never retired. Its create may not be folded yet (a body
+row can commit before its create's ns row, e.g. a create refused and re-sent: sim suite-1 seed 264 retired such a
+canvas body and lost the canvas), its stub may have aged out of `PRUNED_STUB_CAP`, or it was a merged alias pruned
+(they leave no stub). Such a stream stays on the relay and the device: a cost, never a loss.
 
 A deleted doc is not dead: its body stays for a restore (§c.7) and its stream is checkpointed like any other.
 The ingest gate takes a `retired` checkpoint only on `b:`/`c:` and only with an empty state (`kind-not-allowed` /
@@ -538,8 +544,9 @@ path (example E8).
     asserts <= 3.75 MiB). A 40000-note vault is over the cap without any stubs (OR-3).
   - With `TOMBSTONE_CAP`, a device behind by up to ~40000 prunes still finds every base: in an entry or a stub.
 - Later ops on pruned docIds are `unknown-docid`.
-- The pruned docs' `b:`/`c:` streams are retired (§b.5, §d.9): the device whose frame pruned them puts the `retired`
-  checkpoint, every device then drops their local records.
+- The pruned deleted docs' `b:`/`c:` streams are retired while their stub lasts (§b.5, §d.9): the device whose
+  frame pruned them puts the `retired` checkpoint, every device then drops their local records. A pruned merged
+  alias (no stub) keeps its stream unless it was retired while its merged entry stood.
 - `TOMBSTONE_CAP` and `TOMBSTONE_PRUNE_HYSTERESIS` are fold rules: every device folds with the same values.
   `EngineTuning.nsPrune` (`src/engine/runtime/options.ts:57`) carries them for the sim only (one draw per run for
   every device and the oracle, `src/sim/run.ts` `pruneWorld`); production never passes engine tuning.
@@ -1514,7 +1521,7 @@ The planner does no destructive work until ns is caught up (§f.2).
     vault seqs). There is at most one settle put per candidate.
   - cfg and snap use the same candidate rule.
 - **`retired`** (§b.5; the maintenance step `retire`, `src/engine/runtime/maintenance.ts:263`, after checkpoint duty).
-  - For the caught-up `b:`/`c:` streams of dead docs (merged aliases, pruned docs; `deadStreams`, maintenance.ts:230)
+  - For the caught-up `b:`/`c:` streams of dead docs (merged aliases, pruned docs with a stub; `deadStreams`)
     that hold rows beyond the relay's checkpoint (`remoteCheckpointCoversSeq < remoteHeadSeq`).
   - `coversSeq` = the caught-up record's `remoteHeadSeq` (its `lastSeq`); CAS on the known checkpoint seq
     (`writeRetired`, retire.ts:102). Outcomes follow the checkpoint table (`applyOutcome`), but a retire does not

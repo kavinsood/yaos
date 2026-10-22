@@ -40,10 +40,11 @@
  *                      idle window or a link abort), and the idle window never cut a
  *                      call that kept moving (a slow one)
  *
- *   retired            every dead doc's b: / c: stream with rows (no committed ns entry: pruned or never
- *                      created; or a merged alias) is retired on the relay (gcSeq = lastSeq: nothing beyond
+ *   retired            every provably dead doc's b: / c: stream with rows (a merged alias, or no committed ns
+ *                      entry but a pruned-delete stub) is retired on the relay (gcSeq = lastSeq: nothing beyond
  *                      its checkpoint) and no running device holds a record of it (stream, snapshot, tail,
- *                      quarantine; DESIGN §b.5 "retired", checkRetired)
+ *                      quarantine); and no doc with a live or deleted entry has a retired checkpoint (DESIGN §b.5
+ *                      "retired", checkRetired)
  *   identity           one deviceId per store (identity-per-store §1.3, §5.2): no two devices ever ran as the
  *                      same deviceId (a clone gets its own), and every state dir a device's engines read, listed,
  *                      wrote or removed is one of its own stores' (a copied or synced folder's foreign dirs are
@@ -73,6 +74,8 @@ import { MAX_NS_FRAME_BYTES, NS_DEDUPE_RING, TAIL_HARD_ROWS } from "../core/limi
 import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type DeviceId, type StreamName } from "../core/types";
 import type { SnapshotRecord, TailRecord } from "../engine/store/schema";
 import { gateRow } from "../engine/sync/ingestRow";
+import { gate } from "../engine/ingest/gate";
+import { CheckpointEncoding } from "../core/envelope";
 import { NsRuntime } from "../engine/sync/nsRuntime";
 import type { NsFoldRules } from "../core/ns/fold";
 import { CfgRuntime } from "../engine/sync/cfgRuntime";
@@ -377,10 +380,15 @@ export function checkCheckpoints(devs: readonly SimDevice[], net: SimNet): Viola
 }
 
 /**
- * Invariant "retired" (DESIGN §b.5 "retired", §c.9; body/retire.ts), at quiescence: every b: / c: stream with rows
- * whose doc is dead in the devices' ns fold (no committed entry: pruned, or never created; or a merged alias) is
- * retired on the relay (gcSeq = lastSeq: nothing beyond its checkpoint, any encoding), and no running device holds
- * a record of it (stream record, snapshot, tail rows, quarantine records). `isDown`: devices not running now.
+ * Invariant "retired" (DESIGN §b.5 "retired", §c.9; body/retire.ts), at quiescence, both ways:
+ *  - every b: / c: stream with rows whose doc is provably dead in the devices' ns fold (a merged alias, or no
+ *    committed entry but a pruned-delete stub) is retired on the relay (gcSeq = lastSeq: nothing beyond its
+ *    checkpoint, any encoding), and no running device holds a record of it (stream record, snapshot, tail rows,
+ *    quarantine records). A doc with no entry and no stub (an aged-out stub, a pruned merged alias, junk rows of an
+ *    ignored create) may keep its stream: absence is not evidence (retire.ts deadReason);
+ *  - no stream of a doc with a live or deleted entry carries a `retired` checkpoint: retiring it destroyed the rows
+ *    of a doc that is not dead (a body retired before its create folded, suite-1 seed 264).
+ * `isDown`: devices not running now.
  */
 export async function checkRetired(devs: readonly SimDevice[], net: SimNet, isDown: (i: number) => boolean): Promise<Violation[]> {
 	const out: Violation[] = [];
@@ -394,7 +402,14 @@ export async function checkRetired(devs: readonly SimDevice[], net: SimNet, isDo
 		const docId = cls === "body" || cls === "canvas" ? streamDocId(stream) : null;
 		if (!docId) continue;
 		const e = ns.entry(docId);
-		if (e && e.state !== "merged") continue;
+		if (e && e.state !== "merged") {
+			const ck = net.relay.checkpoint(stream);
+			if (!ck) continue;
+			const g = await gate(ref.vrt!.log.c.gateCtx, { t: "checkpoint", stream, coversSeq: ck.coversSeq, payload: ck.bytes });
+			if (g.ok && g.t === "checkpoint" && g.checkpoint.encoding === CheckpointEncoding.retired) bad(`${stream} (${e.state}) has a retired checkpoint at ${ck.coversSeq}: a doc that is not dead`);
+			continue;
+		}
+		if (!e && !ns.state.pruned.has(docId)) continue;
 		const rows = net.relay.rows(stream, { includeGc: true });
 		const last = rows[rows.length - 1]?.seq ?? 0;
 		if (last === 0) continue;
