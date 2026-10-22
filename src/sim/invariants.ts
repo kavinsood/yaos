@@ -58,11 +58,14 @@
  *   5 (outbox/cursor)  no outbox record in any state (held / adoptable / poisoned too),
  *                      vault cursor at the relay head (checkOutboxAndCursor; the rest of 5
  *                      is in "clean" and "checkpoint")
- *   6 bounds           sampled after every step and heal tick: resident docs <= budget + 1,
- *                      resident bytes <= budget + one doc, local tail <= TAIL_HARD_ROWS per
- *                      stream, ns dedupe rings <= NS_DEDUPE_RING, tombstones <= the run's tombstone cap
- *                      (checkBounds). At sim scale the residency budgets (24..400 docs) are
- *                      not approached; the keystroke-path encode counter is keystrokeBench's.
+ *   6 bounds           sampled after every step and heal tick: unpinned (not bound, no job's pin)
+ *                      resident docs <= budget + 1 and their bytes <= budget + one doc (bound and
+ *                      pinned replicas are never evicted and may go past the budget, DESIGN §d.1);
+ *                      no clean replica resident while the device is over budget, pinned ones
+ *                      included (evictions happen); local tail <= TAIL_HARD_ROWS per stream, ns
+ *                      dedupe rings <= NS_DEDUPE_RING, tombstones <= the run's tombstone cap
+ *                      (checkBounds). randomTuning draws budgets down to 2 docs / 64 KiB; the
+ *                      keystroke-path encode counter is keystrokeBench's.
  */
 
 import { encodeNsFoldV1 } from "../core/codec/nsFoldV1";
@@ -769,8 +772,14 @@ export function checkOutboxAndCursor(devs: readonly SimDevice[], net: SimNet): V
 // --- 6 resource bounds -----------------------------------------------------------------------
 
 /**
- * Invariant 6 (DESIGN §l.3), sampled after every step and heal tick: resident docs <= maxResidentDocs + 1,
- * resident bytes <= maxResidentBytes + the largest resident doc, every stream's local tail <= TAIL_HARD_ROWS,
+ * Invariant 6 (DESIGN §l.3), sampled after every step and heal tick. Residency: unpinned resident docs (bound === 0,
+ * pins === 0) <= maxResidentDocs + 1 and their bytes <= maxResidentBytes + the largest of them (the doc a load just
+ * added); bound and pinned handles are never evicted (DESIGN §d.1) and are not held to the budget. And evictions
+ * happen: while all resident docs (pinned included) are over either budget, no clean handle (HandleManager.isClean:
+ * unbound, unpinned, builder empty) is resident. The engine evicts before and after a load, on unpin and unbind,
+ * after applied rows and on every maintenance tick, and the sim samples between steps, so no transient is excused:
+ * a loading doc is not registered yet, a dirty or pinned one (open frame, merge, read, compaction) is not clean.
+ * Also every stream's local tail <= TAIL_HARD_ROWS,
  * the ns fold's per-device dedupe ring <= NS_DEDUPE_RING and its tombstone pool <= TOMBSTONE_CAP.
  * (No encodeStateAsUpdate on the keystroke path: keystrokeBench.test.ts, not the sim.)
  */
@@ -782,10 +791,26 @@ export function checkBounds(devs: readonly SimDevice[]): Violation[] {
 		if (!c || c.stopped) continue;
 		const h = c.handles;
 		if (h) {
-			if (h.count > c.budgets.maxResidentDocs + 1) bad(`${d.name}: ${h.count} resident docs, budget ${c.budgets.maxResidentDocs}`);
-			let largest = 0;
-			for (const x of h.all()) largest = Math.max(largest, x.bytesEstimate);
-			if (h.bytes - largest > c.budgets.maxResidentBytes) bad(`${d.name}: ${h.bytes} resident bytes, budget ${c.budgets.maxResidentBytes}`);
+			const { maxResidentDocs, maxResidentBytes } = c.budgets;
+			// Bound and pinned handles are never evicted (DESIGN §d.1) and may go past the budget: counted apart.
+			let free = 0;
+			let freeBytes = 0;
+			let largestFree = 0;
+			let evictable = 0;
+			for (const x of h.all()) {
+				if (x.bound > 0 || x.pins > 0) continue;
+				free++;
+				freeBytes += x.bytesEstimate;
+				largestFree = Math.max(largestFree, x.bytesEstimate);
+				if (h.isClean(x)) evictable++;
+			}
+			if (free > maxResidentDocs + 1) bad(`${d.name}: ${free} unpinned resident docs, budget ${maxResidentDocs}`);
+			if (freeBytes - largestFree > maxResidentBytes) bad(`${d.name}: ${freeBytes} unpinned resident bytes, budget ${maxResidentBytes}`);
+			// Evictions happen: over budget (pinned handles included) no clean handle stays resident.
+			const total = h.bytes;
+			if (evictable > 0 && (h.count > maxResidentDocs || total > maxResidentBytes)) {
+				bad(`${d.name}: ${evictable} evictable docs resident over budget (${h.count} docs, ${total} bytes; budget ${maxResidentDocs}, ${maxResidentBytes})`);
+			}
 		}
 		for (const r of c.repo?.streams() ?? []) if (r.tailRows > TAIL_HARD_ROWS) bad(`${d.name}: ${r.stream} tail ${r.tailRows} rows > ${TAIL_HARD_ROWS}`);
 		const st = c.ns?.state;

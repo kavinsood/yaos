@@ -5,7 +5,8 @@
  *
  * load = one Y.transact(LOAD): snapshot, every tail row (refs resolved), then
  * every own non-poisoned outbox record of the stream in order. O(doc), once per
- * residency. Clean-only LRU eviction within maxResidentDocs / maxResidentBytes.
+ * residency. Clean-only LRU eviction within maxResidentDocs / maxResidentBytes: before a load (room for it) and
+ * after it (its bytes), on unpin and unbind, after applied rows (growth) and on every maintenance tick.
  */
 
 import * as Y from "yjs";
@@ -164,6 +165,8 @@ export class HandleManager {
 		this.handles.set(stream, h);
 		this.loads++;
 		this.hooks.onLoaded(h);
+		// The room made before the load did not know its bytes: evict for them now (not the new handle, the caller's).
+		this.enforceBudget(0, h);
 		return h;
 	}
 
@@ -181,12 +184,12 @@ export class HandleManager {
 		this.hooks.onEvict(h);
 	}
 
-	/** Evict clean handles, LRU first, until within budget (`extra` = slots to make room for). */
-	enforceBudget(extra = 0): void {
+	/** Evict clean handles, LRU first, until within budget (`extra` = slots to make room for; `keep` is not evicted). */
+	enforceBudget(extra = 0, keep?: Handle): void {
 		const overDocs = () => this.handles.size + extra > this.budgets.maxResidentDocs;
 		const overBytes = () => this.bytes > this.budgets.maxResidentBytes;
 		if (!overDocs() && !overBytes()) return;
-		const clean = [...this.handles.values()].filter((h) => this.isClean(h)).sort((a, b) => a.lastAccessMono - b.lastAccessMono);
+		const clean = [...this.handles.values()].filter((h) => h !== keep && this.isClean(h)).sort((a, b) => a.lastAccessMono - b.lastAccessMono);
 		for (const h of clean) {
 			if (!overDocs() && !overBytes()) break;
 			this.drop(h.stream);

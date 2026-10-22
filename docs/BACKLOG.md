@@ -111,21 +111,8 @@ Each has a minimized plan in `src/sim/open-repros/` (README there: replay with `
 replayed by the regressions test). All checked still failing on `integrate-3` (2026-10-22); "base" = also failing on
 `client-remake-next` 6a1fb3e5 before the reclaim / generators / governance merges.
 
-No data-loss failure open on `integrate-3`. Three non-data-loss failures stay open: one resurrection (no text lost),
-one liveness timeout and one resource bound.
-
-### SOAK-BOUND-RESIDENT-BYTES: two big bound notes go past a small resident byte budget
-
-- **Repro.** `bound-big-notes-past-resident-byte-budget.json` (soak 944223017 #218, CONFLICT_FAULTS tuned big
-  small-cap, 3 devices, 127 steps; base, identical).
-- **What happens.** B has two big notes open in editors: 1.2 MB and 2.35 MB of replica against a tuned
-  `maxResidentBytes` of 264 KB. Bound handles are pinned and never evicted (DESIGN §d.1 "bound", "goes over budget
-  when none is clean"). Invariant 6 allows the budget plus the largest resident doc, so the second bound note fails
-  it.
-- **Not data loss.** Both handles are clean apart from being bound: builders empty, nothing in the outbox.
-- **Why open.** The design allows a bound replica over budget, but the invariant does not exempt bound handles.
-  Either the invariant counts bound handles apart, which relaxes it, or the engine refuses to bind past the budget.
-  For the owner.
+No data-loss failure open on `integrate-3`. Two non-data-loss failures stay open: one resurrection (no text lost)
+and one liveness timeout.
 
 ### SOAK-FLOOD-RETIRE-BACKLOG: a flood's dead streams take longer to retire than the heal horizon
 
@@ -158,6 +145,16 @@ one liveness timeout and one resource bound.
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SOAK-BOUND-RESIDENT-BYTES** (`fix-resident`, soak 944223017 #218, invariant 6 "B: 3561321 resident bytes,
+  budget 264275"): a check mistake, not an engine one. Two big notes open in editors went past a 264 KB budget; bound
+  replicas are pinned and never evicted (DESIGN §d.1), but invariant 6 held them to the budget plus one doc. Owner
+  decision: correct the check. Invariant 6 now holds only unpinned replicas to the budget (+1 doc) and adds the check
+  that matters, that evictions happen: no clean replica resident while the device is over budget, pinned ones
+  included. That check found two real gaps, fixed: the room a load made did not know its bytes (a bind loading a big
+  note left clean replicas resident past the budget), and rows grew clean replicas past it; either waited for the next
+  maintenance tick, which backs off when idle. A load now evicts again once loaded (not the doc itself), and applied
+  rows evict after the apply. Plan `src/sim/regressions/bound-big-notes-past-resident-byte-budget.json`, tests in
+  `src/engine/runtime/residency.test.ts` and `src/sim/coverage.test.ts` (eviction disabled is reported).
 - **SIM-GATED-RESIDENCY** (`fix-refold`, soak seed 2006566456, invariant 6 "5 resident docs, budget 3"): an engine
   bound violation, not a tolerance issue. While C waited revoked-epoch for its QR, each pass's merge jobs applied the
   disk diff to the replica and then failed in `commitEdits` on the write gate; the edit stayed in the frame builder,

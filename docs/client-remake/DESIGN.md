@@ -909,13 +909,15 @@ cold ──load──▶ resident ──bind──▶ bound
   - Eviction just drops the `Y.Doc`. Everything it holds is already in IDB.
 - **Budgets.** `maxResidentDocs` and `maxResidentBytes` per device class (§i.2).
   - A load never waits: it first evicts clean handles, LRU first, and goes over budget when none is clean
-    (`HandleCache.enforceBudget`, `src/engine/body/handles.ts`).
+    (`HandleCache.enforceBudget`, `src/engine/body/handles.ts`). Once loaded it evicts again for the doc's bytes
+    (never the doc just loaded). Applied rows that grow resident replicas evict after the apply; unpin, unbind and
+    every maintenance tick evict too.
   - While the write gate is shut (e2ee-design §9.3) a merge job edits nothing: `BodyHandle.assertWritable` throws
     before the first edit (the commit would be refused anyway, and the file still holds the change for the pass after
     the gate opens). Otherwise every file merged while key-missing would leave an unframed edit in its builder and
     its replica unevictable, past the budget.
   - `memory-pressure` is declared (`src/ports/platform.ts:26`) but no host source raises it, and
-    `HandleCache.evictAllClean` (`src/engine/body/handles.ts:196-197`) is called only by tests. Nothing runs.
+    `HandleCache.evictAllClean` (`src/engine/body/handles.ts:199-200`) is called only by tests. Nothing runs.
 
 ### d.2 Bound views: the worker replica is the only replica
 
@@ -3214,8 +3216,12 @@ After healing (all faults off, all online, run until every queue is idle and no 
    honest device writes passes V1 + V2.
 5. **Clean state.** Outbox empty, no `held` or `adoptable` records, cursors at head, no frozen docs unless a malicious
    frame was injected, no open intents.
-6. **Resource bounds held throughout:** resident docs/bytes ≤ budget (+1 doc), tail ≤ hard rows, live queue ≤ bound,
-   no `encodeStateAsUpdate` on the keystroke path (instrumented counter).
+6. **Resource bounds held throughout** (sampled after every step and heal tick, `checkBounds`):
+   - Unpinned resident docs/bytes ≤ budget (+1 doc). Bound and pinned replicas are never evicted (§d.1) and may go
+     past the budget, so they are counted apart.
+   - Evictions happen: while the device is over either budget (pinned replicas included) no clean replica is
+     resident.
+   - Tail ≤ hard rows, live queue ≤ bound, no `encodeStateAsUpdate` on the keystroke path (instrumented counter).
 7. **No blobs on the log** (`checkLogCarriesNoBlobs`, `src/sim/invariants.ts:124-132`, run by `src/sim/run.ts:251`):
    no foreign stream on the relay log, no ns / cfg / snap / k row over `MAX_NS_FRAME_BYTES`, no `b:`/`c:` stream for
    an attachment doc. Sim devices get the net's `SimBlobStore` (`SimNet.blobs`, `blobsAvailable`, `blobPort()`,

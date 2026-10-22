@@ -464,6 +464,8 @@ export class EngineCtx {
 			if (ck || rows.length > 0) await this.docs.applyToHandle(h, rows, ck);
 			this.docs.checkDoc(h);
 		}
+		// The rows grew resident replicas (and a hole check may have loaded one): evict for them (DESIGN §d.1).
+		if (bodies.size > 0) this.handles.enforceBudget();
 		// Own receipts are the only rows that change nothing here (§d.7).
 		const changed = s.tailPut.filter((r) => r.deviceId !== this.self || !s.skip.has(r.seq)).map((r) => r.stream);
 		if (read && (read.done || read.checkpointState)) changed.push(read.stream);

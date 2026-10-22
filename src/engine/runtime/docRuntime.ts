@@ -209,6 +209,7 @@ export class DocRuntime {
 		h.unresolvedRefs = 0;
 		await this.applyToHandle(h, rows);
 		this.checkDoc(h);
+		this.c.handles.enforceBudget(); // the rows grew the replica
 	}
 
 	/** One resolution attempt of a ref row; its outcome counts towards the §10.2 quarantine of the doc. */

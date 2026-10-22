@@ -33,3 +33,26 @@ test("invariant 6: a resident doc over the budget is reported (sampled during th
 	});
 	assert.ok(r.violations.some((v) => v.inv === "bounds" && v.detail.startsWith("A: ") && v.detail.includes("resident docs")), JSON.stringify(r.violations));
 });
+
+test("invariant 6: a clean replica kept resident over the budget (eviction broken) is reported; working eviction is not", async () => {
+	const run = async (broken: boolean) => {
+		let set = false;
+		const r = await runSim({
+			seed: 4, devices: 2, faults: null, steps: 30,
+			observe: (label, devs) => {
+				const c = devs[0]?.vrt?.log.c;
+				if (label !== "5" || !c) return;
+				// A one-doc budget from here on, enforced at once (nothing in the engine reacts to a budget change).
+				// Broken: eviction disabled, so the replicas of notes A opened and closed stay resident, clean, past it.
+				(c.budgets as { maxResidentDocs: number }).maxResidentDocs = 1;
+				if (broken) c.handles.enforceBudget = () => undefined;
+				else c.handles.enforceBudget();
+				set = true;
+			},
+		});
+		assert.ok(set);
+		return r.violations.filter((v) => v.inv === "bounds" && v.detail.startsWith("A: ") && v.detail.includes("evictable docs resident over budget"));
+	};
+	assert.deepEqual(await run(false), [], "working eviction");
+	assert.notDeepEqual(await run(true), [], "eviction disabled");
+});
