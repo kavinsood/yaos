@@ -11,7 +11,7 @@ import { CFG_STREAM, NS_STREAM, type ConfigRelPath, type StreamName, type VaultP
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import type { ReadRequest, RelayPort } from "../../ports/relay";
-import { startTestEngine, until, createDoc, sleep } from "./testHarness";
+import { startTestEngine, until, createDoc } from "./testHarness";
 
 const APP = "app.json" as ConfigRelPath;
 
@@ -157,7 +157,8 @@ test("frameNo: a session whose ns/cfg reads fail stays catching-up with ns sends
 		({ engine: a2 } = await startTestEngine({ relay: failingNsReads(relay, failing), deviceId: "dev-a2" })); // IDB lost: a new store
 		await until(() => a2!.c.session !== null, 3_000, "session up");
 		await createDoc(a2, "three.md" as VaultPath, "3");
-		await sleep(300);
+		// Its ns create is built (in the outbox): what follows shows it held, not yet made.
+		await until(() => [...a2!.c.outbox.values()].some((r) => r.stream === NS_STREAM), 3_000, "ns frame built");
 		assert.equal(a2.status().phase, "catching-up", "ns not read: not live");
 		assert.equal(a2.c.sender.nsWindowOpen, false, "ns not read: ns sends closed");
 		assert.equal(relay.rows(NS_STREAM).filter((r) => r.deviceId === "dev-a2").length, 0, "nothing sent before the reads");

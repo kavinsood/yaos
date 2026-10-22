@@ -1,11 +1,13 @@
 /**
  * Phone bootstrap bench: one Android phone over adb, against the vault a bootBench run seeded (same relay, same
  * shape), so the phone's numbers sit next to bootBench's fresh Node devices. Per run, on the phone's bench vault
- * folder: stop Obsidian, revoke the previous run's device, wipe the folder (everything but .obsidian, plus the
+ * folder: stop Obsidian, revoke the previous run's pairing, wipe the folder (everything but .obsidian, plus the
  * plugin's data.json), push the current build, reopen Obsidian on the vault, mint a pairing code and open the setup
- * link. The only manual step is the Pair tap. Timed on the laptop, by polling the folder over adb: Pair (data.json
- * holds an identity) -> first file -> every seeded file. A new pairing is a new device id and the store is per device
- * (store/schema.ts: yaos2:<vault>:<epoch>:<device>), so every run bootstraps from an empty IndexedDB.
+ * link, then press its Pair button over DevTools (a tap on the phone if that fails). The only manual step is
+ * unlocking the phone if it is locked: the bench wakes the screen and keeps it on while on USB until it exits. Timed
+ * on the laptop, by polling the folder over adb: Pair (data.json holds an identity) -> first file -> every seeded
+ * file. A new pairing is a new grant and a new store (identity-per-store; a device id per store before it), so every
+ * run bootstraps from an empty IndexedDB.
  *
  * One-time on the phone: USB debugging on, an empty Obsidian vault named --vault, community plugins on. The first
  * run refuses a folder holding anything outside .obsidian, then marks it (.obsidian/plugins/yaos/.bench) as wipeable.
@@ -21,7 +23,9 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Report, sleep } from "./engineKit";
 import { contextPath, DEFAULT_LOG_DIR, devicePairingCode, revokeDevice, type OnboardDevice, type OnboardedVault } from "./onboard";
-import { attribute, cpuSummary, PhoneProfile } from "./phoneProfile";
+import { attribute, cpuInWindow, pageEvaluate, PhoneProfile, timeline } from "./phoneProfile";
+import { installRecordKey } from "../../src/host/installRecord";
+import { LOCAL_SETTINGS_KEY } from "../../src/host/localSettings";
 
 function arg(name: string, fallback: string): string {
 	const i = process.argv.indexOf(`--${name}`);
@@ -38,6 +42,8 @@ const DIR = arg("dir", `/sdcard/Documents/${VAULT_NAME}`);
 const PLUGIN = arg("plugin", new URL("../../dist/yaos-client/yaos", import.meta.url).pathname);
 const OPEN_WAIT_MS = Number(arg("open-wait-s", "10")) * 1000;
 const PAIR_TIMEOUT_MS = 5 * 60_000;
+/** How long a run waits for the phone to be unlocked before it opens Obsidian. */
+const UNLOCK_TIMEOUT_MS = 30 * 60_000;
 const FILES_TIMEOUT_MS = 20 * 60_000;
 const PKG = "md.obsidian";
 const PLUGIN_DIR = `${DIR}/.obsidian/plugins/yaos`;
@@ -65,15 +71,30 @@ const shOk = (cmd: string) => sh(`${cmd} >/dev/null 2>&1 && echo y || echo n`) =
 const countFiles = () => Number(sh(`find ${q(DIR)} -type f ! -path ${q(`${DIR}/.obsidian/*`)} | wc -l`)) || 0;
 
 /** The plugin's data.json identity, parsed here; the token never leaves this function's caller. */
-function phoneIdentity(): { deviceId: string } | null {
+/**
+ * The identity the pair flow stored in data.json: a pairing grant (identity-per-store, current client) or an enrolled
+ * device (builds before it, so an older build can still be benched). SECRET: grantSecret; never logged.
+ */
+type PhoneIdentity = { readonly t: "grant"; readonly host: string; readonly vaultId: string; readonly grantSecret: string } | { readonly t: "device"; readonly deviceId: string };
+
+function phoneIdentity(): PhoneIdentity | null {
 	const text = sh(`cat ${q(`${PLUGIN_DIR}/data.json`)} 2>/dev/null`);
 	if (!text) return null;
 	try {
-		const id = (JSON.parse(text) as { identity?: { deviceId?: unknown; vaultId?: unknown } | null }).identity;
-		return id && typeof id.deviceId === "string" ? { deviceId: id.deviceId } : null;
+		const id = (JSON.parse(text) as { identity?: Record<string, unknown> | null }).identity;
+		if (!id) return null;
+		if (typeof id.grantSecret === "string" && typeof id.host === "string" && typeof id.vaultId === "string") return { t: "grant", host: id.host, vaultId: id.vaultId, grantSecret: id.grantSecret };
+		return typeof id.deviceId === "string" ? { t: "device", deviceId: id.deviceId } : null;
 	} catch {
 		return null; // mid-write
 	}
+}
+
+/** Revokes a run's pairing on the server: a grant leaves with its own secret (pairing.ts leaveGrant), a device is revoked by the owner. */
+async function revokeIdentity(vault: OnboardedVault, id: PhoneIdentity): Promise<void> {
+	if (id.t === "device") return revokeDevice(vault, id.deviceId);
+	const res = await fetch(`${id.host.replace(/\/+$/, "")}/vault/${encodeURIComponent(id.vaultId)}/auth/grant`, { method: "DELETE", headers: { Authorization: `Grant ${id.grantSecret}` } });
+	if (res.status !== 200 && res.status !== 401) throw new Error(`grant leave failed ${res.status}`);
 }
 
 function deviceInfo(): Record<string, string> {
@@ -134,12 +155,15 @@ async function laptopRtt(): Promise<{ capabilitiesMs: number; cfRay: string | nu
 
 // ---- one run ---------------------------------------------------------------------------------------------------
 
-/** Stops Obsidian, revokes the device the folder is paired as, and empties the folder for a fresh pairing. */
+/**
+ * Stops Obsidian, revokes the device the folder is paired as, and empties the folder for a fresh pairing: the notes,
+ * data.json and the plugin's `state/` (the stores' mirror dirs, which a new store would otherwise inherit from).
+ */
 async function reset(vault: OnboardedVault): Promise<void> {
 	sh(`am force-stop ${PKG}`);
 	const prev = phoneIdentity();
-	if (prev) await revokeDevice(vault, prev.deviceId).catch((e: unknown) => console.log(`revoke of the previous device failed: ${String(e)}`));
-	sh(`cd ${q(DIR)} && find . -mindepth 1 -maxdepth 1 ! -name .obsidian -exec rm -rf {} + ; rm -f ${q(`${PLUGIN_DIR}/data.json`)}`);
+	if (prev) await revokeIdentity(vault, prev).catch((e: unknown) => console.log(`revoke of the previous pairing failed: ${String(e)}`));
+	sh(`cd ${q(DIR)} && find . -mindepth 1 -maxdepth 1 ! -name .obsidian -exec rm -rf {} + ; rm -rf ${q(`${PLUGIN_DIR}/data.json`)} ${q(`${PLUGIN_DIR}/state`)}`);
 	if (countFiles() !== 0) throw new Error(`${DIR} still holds files after the wipe`);
 }
 
@@ -167,16 +191,95 @@ async function devtoolsPage(): Promise<string> {
 	return page.webSocketDebuggerUrl;
 }
 
+/** The screen stays on while the phone is on USB for the bench (restored at exit): a dozing phone shows no pair modal. */
+let stayOn: string | null = null;
+function keepAwake(): void {
+	if (stayOn === null) stayOn = sh("settings get global stay_on_while_plugged_in") || "0";
+	sh("svc power stayon usb");
+	sh("input keyevent KEYCODE_WAKEUP");
+}
+function restoreAwake(): void {
+	if (stayOn !== null) sh(`settings put global stay_on_while_plugged_in ${q(stayOn)}`);
+}
+const locked = () => /isKeyguardShowing=true|mDreamingLockscreen=true/.test(sh("dumpsys window | grep -E 'isKeyguardShowing|mDreamingLockscreen'"));
+
+/** Wakes the screen and waits (asking once) until the keyguard is gone. */
+async function unlocked(): Promise<void> {
+	keepAwake();
+	if (!locked()) return;
+	console.log("the phone is locked: unlock it (the screen stays on while the bench runs)");
+	const t = performance.now();
+	while (locked()) {
+		if (performance.now() - t > UNLOCK_TIMEOUT_MS) throw new Error("the phone stayed locked for 30 min");
+		await sleep(1000);
+		sh("input keyevent KEYCODE_WAKEUP");
+	}
+	console.log("unlocked");
+}
+
+/** Presses the pair modal's "Pair" button over DevTools (pairModal.ts); false when it did not appear within 20 s. */
+async function pressPair(): Promise<boolean> {
+	const click = `(() => { const b = [...document.querySelectorAll(".modal button")].find((e) => e.textContent.trim() === "Pair"); if (!b) return false; b.click(); return true; })()`;
+	const t = performance.now();
+	while (performance.now() - t < 20_000) {
+		try {
+			if (await pageEvaluate(await devtoolsPage(), click)) return true;
+		} catch {
+			// DevTools socket not up yet
+		}
+		await sleep(500);
+	}
+	return false;
+}
+
+/**
+ * Makes the phone a fresh install of the bench vault, as a new phone would be: deletes this vault's YAOS stores
+ * (IndexedDB `yaos3:<vaultId>:…`, `yaos3-pending:<vaultId>:…`) and, in Obsidian's localStorage, the install record
+ * (installRecord.ts: install key and store lineage) and the local settings (localSettings.ts), with the plugin
+ * unloaded so nothing holds them open. The folder wipe leaves all of them: the next pairing then reopened the previous
+ * run's store, whose device the bench had just revoked (an unpinned engine does not replace a revoked store), or a new
+ * store recovered from the lineage's mirror dir against the wiped folder (integration-notes §7.4). Scoped to the bench
+ * vault's id: other vaults' stores on the phone (one WebView origin) are not touched.
+ */
+async function freshInstall(vaultId: string): Promise<void> {
+	const expr = `(async () => {
+		if (app.vault.getName() !== ${JSON.stringify(VAULT_NAME)}) return "Obsidian has another vault open: " + app.vault.getName();
+		await app.plugins.disablePlugin("yaos");
+		const ours = (n) => typeof n === "string" && (n.startsWith("yaos3:") || n.startsWith("yaos3-pending:")) && n.split(":")[1] === ${JSON.stringify(vaultId)};
+		const names = (await indexedDB.databases()).map((d) => d.name).filter(ours);
+		for (const n of names) await new Promise((res, rej) => { const r = indexedDB.deleteDatabase(n); r.onsuccess = res; r.onerror = () => rej(r.error); r.onblocked = () => rej(new Error("blocked: " + n)); });
+		app.saveLocalStorage(${JSON.stringify(LOCAL_SETTINGS_KEY)}, null);
+		app.saveLocalStorage(${JSON.stringify(installRecordKey(vaultId))}, null);
+		await app.plugins.enablePlugin("yaos");
+		return names.length;
+	})()`;
+	let last: unknown = null;
+	for (let i = 0; i < 20; i++) {
+		try {
+			last = await pageEvaluate(await devtoolsPage(), expr);
+			break;
+		} catch (e) {
+			last = e; // DevTools or the app not up yet
+			await sleep(500);
+		}
+	}
+	if (typeof last !== "number") throw new Error(`fresh install failed: ${String(last)}`);
+	console.log(`  fresh install: ${last} store DB(s) of the bench vault deleted, install record and local settings cleared`);
+}
+
 async function oneRun(vault: OnboardedVault, files: number, k: number): Promise<Run> {
+	await unlocked();
 	await reset(vault);
 	installPlugin();
 	sh(`am start -a android.intent.action.VIEW -d ${q(`obsidian://open?vault=${encodeURIComponent(VAULT_NAME)}`)}`);
 	await sleep(OPEN_WAIT_MS);
+	await freshInstall(vault.vaultId);
 	const prof = PROFILE ? await PhoneProfile.attach(await devtoolsPage(), (l) => console.log(`  profile: ${l}`)) : null;
 	const code = await devicePairingCode(HOST, vault.vaultId, vault.devices[0]!.deviceToken);
 	const link = `obsidian://yaos?action=setup&host=${encodeURIComponent(HOST)}&pairingCode=${encodeURIComponent(code)}&suite=0`;
 	sh(`am start -a android.intent.action.VIEW -d ${q(link)}`);
-	console.log(`run ${k + 1}/${RUNS}: tap Pair on the phone`);
+	if (await pressPair()) console.log(`run ${k + 1}/${RUNS}: pressed Pair over DevTools`);
+	else console.log(`run ${k + 1}/${RUNS}: tap Pair on the phone`);
 
 	const tLink = performance.now();
 	while (!phoneIdentity()) {
@@ -195,6 +298,8 @@ async function oneRun(vault: OnboardedVault, files: number, k: number): Promise<
 	let polls = 0;
 	let lastLog = t0;
 	while (filesMs === null) {
+		// Yield between the (synchronous) adb polls: with --profile, DevTools traffic (attaches, drains) is handled here.
+		await sleep(0);
 		n = countFiles();
 		polls++;
 		const at = performance.now() - t0;
@@ -219,29 +324,31 @@ async function oneRun(vault: OnboardedVault, files: number, k: number): Promise<
 async function profileOf(prof: PhoneProfile, wall0: number, run: Run, k: number): Promise<unknown> {
 	const offset = await prof.clockOffsetMs();
 	await sleep(1000);
-	const threads = await prof.finish();
+	const threads = await prof.finish(offset);
 	const at = (ms: number) => wall0 + offset + ms;
 	const first = run.firstFileMs ?? 0;
 	const end = run.filesMs ?? first;
-	const windows = {
-		toFirstFile: attribute(threads, [at(0), at(first)]),
-		firstToAll: attribute(threads, [at(first), at(end)]),
-		all: attribute(threads, [at(0), at(end)]),
-	};
+	const wins = { toFirstFile: [at(0), at(first)], firstToAll: [at(first), at(end)], all: [at(0), at(end)] } as const;
+	const windows = Object.fromEntries(Object.entries(wins).map(([w, win]) => [w, attribute(threads, [win[0], win[1]])]));
 	const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
 	const base = join(DEFAULT_LOG_DIR, `client-e2e-phone-profile-${LABEL.replace(/[^a-z0-9.-]/gi, "_")}-${stamp}-run${k + 1}`);
-	const cpu: Record<string, unknown> = {};
+	const cpu: Record<string, Record<string, unknown>> = {};
 	for (const t of threads) {
-		if (t.profile) {
-			writeFileSync(`${base}-${t.thread}.cpuprofile`, JSON.stringify(t.profile));
-			cpu[t.thread] = cpuSummary(t.profile);
-		}
+		if (t.chunks.length === 0) continue;
+		writeFileSync(`${base}-${t.thread}.cpuchunks.json`, JSON.stringify(t.chunks));
+		cpu[t.thread] = Object.fromEntries(Object.entries(wins).map(([w, win]) => [w, cpuInWindow(t.chunks, [win[0], win[1]])]));
 	}
-	writeFileSync(`${base}-events.json`, JSON.stringify({ wall0, offset, run, threads: threads.map((t) => ({ thread: t.thread, url: t.url, hook: t.hook, events: t.events })) }));
-	const threadInfo = threads.map((t) => ({ thread: t.thread, url: t.url.slice(0, 80), hook: t.hook, events: t.events.length }));
-	console.log(JSON.stringify({ threads: threadInfo, windows: Object.fromEntries(Object.entries(windows).map(([w, a]) => [w, { windowMs: a.windowMs, split: a.split, busyMs: a.busyMs }])) }, null, 1));
+	// The startup stall: everything from 1 s before the pair was seen (the poll lags it) to the first file.
+	const startup = timeline(threads, [at(-1000), at(first)], at(0));
+	writeFileSync(`${base}-events.json`, JSON.stringify({ wall0, offset, run, threads: threads.map((t) => ({ thread: t.thread, url: t.url, hook: t.hook, goneAtMs: t.goneAtMs, events: t.events })) }));
+	writeFileSync(`${base}-startup.txt`, startup.join("\n") + "\n");
+	const threadInfo = threads.map((t) => ({ thread: t.thread, url: t.url.slice(0, 80), hook: t.hook, events: t.events.length, chunks: t.chunks.length, gone: t.goneAtMs === null ? null : r1(t.goneAtMs - at(0)) }));
+	const busy = Object.fromEntries(Object.entries(cpu).map(([t, w]) => [t, Object.fromEntries(Object.entries(w).map(([n, c]) => [n, (c as { busyMs: number }).busyMs]))]));
+	console.log(JSON.stringify({ threads: threadInfo, cpuBusyMs: busy, windows: Object.fromEntries(Object.entries(windows).map(([w, a]) => [w, { windowMs: a.windowMs, split: a.split, busyMs: a.busyMs }])) }, null, 1));
+	console.log(`startup timeline (ms from pair seen, ${startup.length} lines):`);
+	for (const l of startup.slice(0, 120)) console.log(`  ${l}`);
 	console.log(`profile files: ${base}-*`);
-	return { offsetMs: r1(offset), threads: threadInfo, windows, cpu };
+	return { offsetMs: r1(offset), threads: threadInfo, windows, cpu, startup };
 }
 
 // ---- main ------------------------------------------------------------------------------------------------------
@@ -281,7 +388,7 @@ try {
 	}
 	sh(`am force-stop ${PKG}`);
 	const last = phoneIdentity();
-	if (last) await revokeDevice(vault, last.deviceId).catch((e: unknown) => console.log(`final revoke failed: ${String(e)}`));
+	if (last) await revokeIdentity(vault, last).catch((e: unknown) => console.log(`final revoke failed: ${String(e)}`));
 
 	const ms = runs.map((r) => r.filesMs).filter((v): v is number => v !== null);
 	console.log(`\nphone, files on disk (ms): ${ms.join(" / ") || "-"}`);
@@ -290,5 +397,6 @@ try {
 	fatal = e instanceof Error ? (e.stack ?? e.message) : String(e);
 	R.check("run completed", false, fatal);
 }
+restoreAwake();
 const [, failed] = R.write(DEFAULT_LOG_DIR, "client-e2e-phone", LABEL, HOST, vault, fatal);
 process.exit(failed === 0 ? 0 : 1);

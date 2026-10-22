@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { SimRelay } from "../../sim/relay";
-import { OPEN_FRAME_MAX_MS } from "../../core/limits";
-import { converged, sleep, startTestEngine, until, createDoc, docText, editDoc, renameDoc } from "./testHarness";
+import { converged, startTestEngine, until, createDoc, docText, editDoc, renameDoc } from "./testHarness";
 
 test("engine: two engines converge on ns + body through SimRelay", async () => {
 	const relay = new SimRelay();
@@ -48,7 +47,7 @@ test("engine: a no-op editor change (retain only) produces no frame and keeps th
 		assert.equal(a.boundText(id), "world");
 		assert.equal(a.applyEditorChanges(id, [6]), false, "changes over another length do not fit");
 		assert.equal(a.applyEditorChanges(id, [5]), true);
-		await sleep(OPEN_FRAME_MAX_MS + 200);
+		// Idle covers an open frame (isIdle), so a no-op that reached the builder would have closed and sent by now.
 		await converged([a]);
 		assert.equal(relay.rows(stream).length, rows0, "no body row for a no-op change");
 		assert.deepEqual(a.c.repo.stream(stream)?.bodyVersion, v0, "body version unchanged");

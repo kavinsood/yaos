@@ -2132,7 +2132,10 @@ e2ee-design §18.4).
   `src/host/bundleSource.ts:24-27`), so the engine is in `main.js` once, and in the worker `host/entry.ts` starts
   only the engine (`src/host/entry.ts:22-29`; integration-notes §4 D2). The host starts it with
   `new Worker(URL.createObjectURL(new Blob([script], {type: "text/javascript"})))` (`src/host/plugin.ts:46-47`).
-  - Startup: construct the worker, `ping`, and expect a `pong` within `STARTUP_PING_TIMEOUT_MS` (5 s); then `init`.
+  - Startup: construct the worker, `ping`, and expect a `pong` within `STARTUP_PING_TIMEOUT_MS` (5 s); a miss sends
+    another ping with twice the deadline, `STARTUP_PING_ATTEMPTS` (4) pings in all (5 + 10 + 20 + 40 s); then `init`.
+    A worker that throws while loading is a transport failure, reported at once; a silent one is still loading (a
+    phone parsing `main.js`, a debugger attached).
   - IDB is opened inside the worker. If it is unavailable there (risk OR-1), init answers `storage-lost` and the
     engine stops (§g.4).
   - `PlatformInfo.workerSupported` is the platform fact (`Worker` and Blob URLs exist). Nothing probes or overrides it.
@@ -2220,7 +2223,7 @@ transferred buffers.
   never retryable.
 - **Worker failure is terminal** (host/engineHost.ts). Each of these stops the engine for that runtime:
   - the worker cannot be constructed (no `Worker` or Blob URLs, `main.js` is not the bundle, the constructor throws);
-  - no startup `pong` within `STARTUP_PING_TIMEOUT_MS`;
+  - no answer to any of the `STARTUP_PING_ATTEMPTS` startup pings (75 s in all);
   - a worker `error` / `messageerror` event, or any other transport failure;
   - no liveness `pong` to `PING_MISSES_FATAL` (2) pings in a row, `PING_TIMEOUT_MS` (15 s) each. One miss only sends
     the next ping at once: after the app was frozen in the background, the overdue timeout can fire before the engine
@@ -2533,9 +2536,12 @@ Further caps:
 1. Open a fresh DB under the same name. On a WebKit connection loss, try reopening first.
 2. Import the outbox mirror: same `clientFrameId`s, `order`s and states (a legacy `sent` → pending), and `outboxOrder.next =
    max + 1`.
-3. Import the synced mirror as `SyncedEntry` with `hasBase = false` and `bodyVersion = null` (marks and held edits,
-   with their texts, as mirrored; §f.6 "Held edits"). With `bodyVersion =
-   null` the planner compares content instead: `Rc := streams.textHash ≠ S.contentHash`. A doc the outbox mirror
+3. Import the synced mirror as `SyncedEntry` with `hasBase = false`, `bodyVersion = null` and `blobRev = 0` (marks and
+   held edits, with their texts, as mirrored; §f.6 "Held edits"). With `bodyVersion = null` the planner compares
+   content instead: `Rc := streams.textHash ≠ S.contentHash`. `blobRev = 0` is the same for an attachment (rev
+   unknown; committed revs are ≥ 1): the store never saw these files on its own disk, so a missing one is
+   re-materialized, never read as a user delete (an imported rev matched the relay's and sent `nsDelete` for every
+   device: a wiped folder recovered against an old mirror lost 8 attachments, 2026-10-21). A doc the outbox mirror
    lists as unmirrored (§e.4) gets `contentHash = UNTRUSTED_CONTENT_HASH` (all zeros, no text's hash): its file reads
    as changed, neither side matches the synced content, and the merge keeps the replica's text with the disk text as
    a no-base conflict copy. Never the remote text over a disk edit whose frames died with the store.
@@ -2586,7 +2592,9 @@ row, nothing pending) is `lostCreateBody` (below).
 
 **Store revoked by the server** (removed in the console, retired; phase `revoked` from a 401). With a valid grant the
 install registers a successor first; then the runtime stops (its outbox goes to its mirror), the store is deleted and
-the successor starts and recovers from the old store's dir as above (the fence finds it gone). A refusal keeps the
+the successor starts and recovers from the old store's dir as above (the fence finds it gone). An unpinned device
+(gate closed: only the key reader runs, §12.4) whose store is refused is replaced the same way, then reads `k` as the
+successor. A refusal keeps the
 store: a revoked grant needs a re-pair (phase `revoked`, its notice), a passing one (network, daily limit) is
 retried after a minute or the server's Retry-After.
 

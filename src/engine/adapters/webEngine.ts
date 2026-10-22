@@ -78,5 +78,7 @@ export function createWebEngine(transport: EngineTransport, o: WebEngineOptions 
 			};
 			return { relay, storage, clock, random, crypto, hash, blob, probeBlob: () => probeHttpBlob(blobOpts), identity };
 		},
+		// Pinned suite 0 in place (applyPin): the identity adapter replaces the unpinned device's suite-1 one.
+		repin: (config, ports) => (config.crypto.suite === 0 ? { ...ports, crypto: createNoopCrypto(ports.hash) } : ports),
 	});
 }

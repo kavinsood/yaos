@@ -158,6 +158,8 @@ export interface ReconcilerDeps {
 	 * not wait out a long plan. Stopping between jobs is a subset of crashing between them (DESIGN §f.2).
 	 */
 	readonly stopping?: () => boolean;
+	/** diskMaterialize jobs the plan runner runs at once (Budgets.diskOpConcurrency); 1 when absent. */
+	readonly diskConcurrency?: number;
 }
 
 export const BRAKE_WINDOW_MS = 10 * 60_000;

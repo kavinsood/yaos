@@ -8,6 +8,7 @@ import { buildInitConfig } from "../host/runtimeSupport";
 import { SIM_SETTINGS } from "../sim/device";
 import type { VaultId } from "../core/types";
 import { startWorkerEngine } from "./workerMain";
+import { REAL_DEADLINE_FLOOR_MS } from "./runtime/testHarness";
 
 function channel(): { worker: WorkerLike; scope: WorkerScopeLike; close(): void } {
 	const ch = new MessageChannel();
@@ -48,14 +49,14 @@ test("worker entry answers ping before init, inits on IndexedDB and accepts obse
 		for (const w of waiters.splice(0)) w();
 	});
 	const waitFor = async (pred: (m: EngineToMain) => boolean): Promise<EngineToMain> => {
-		const deadline = Date.now() + 3_000;
+		const deadline = Date.now() + REAL_DEADLINE_FLOOR_MS; // bounds a failing test only; a message ends the wait
 		for (;;) {
 			const hit = inbox.find(pred);
 			if (hit) return hit;
 			if (Date.now() > deadline) throw new Error(`timeout; got ${inbox.map((m) => m.t).join(",")}`);
 			await new Promise<void>((r) => {
 				waiters.push(r);
-				setTimeout(r, 50);
+				setTimeout(r, 50); // re-check the deadline
 			});
 		}
 	};

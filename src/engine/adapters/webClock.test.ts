@@ -14,15 +14,20 @@ describe("webClock", () => {
 		}
 	});
 
-	it("setTimer fires once; clearTimer cancels", async () => {
+	it("setTimer fires once, at its delay; clearTimer cancels", (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
 		const clock = createWebClock();
 		const fired: string[] = [];
 		clock.setTimer(5, () => fired.push("a"));
 		const b = clock.setTimer(5, () => fired.push("b"));
 		clock.clearTimer(b);
 		clock.clearTimer(9999);
-		await new Promise((r) => setTimeout(r, 30));
+		t.mock.timers.tick(4);
+		assert.deepEqual(fired, []);
+		t.mock.timers.tick(1);
 		assert.deepEqual(fired, ["a"]);
+		t.mock.timers.tick(60_000);
+		assert.deepEqual(fired, ["a"], "once; the cleared timer never fires");
 	});
 
 	it("yieldNow resolves after a macrotask", async () => {

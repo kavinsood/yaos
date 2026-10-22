@@ -44,6 +44,8 @@ export interface WorldOptions {
 	readonly keptRenames?: ObservedRename[];
 	/** Queue own fold events for the reconciler to take (ReconcilerDeps.takeOwnFold), as the vault runtime does. */
 	readonly deferOwnFold?: boolean;
+	/** ReconcilerDeps.diskConcurrency; default 4, the product's on every class but constrained. */
+	readonly diskConcurrency?: number;
 }
 
 export const DB = "yaos2-test";
@@ -105,6 +107,7 @@ export class World {
 			...(this.opts.epochRenames ? { epochRenames: () => this.opts.epochRenames! } : {}),
 			...(this.opts.keptRenames ? { keepUnrecordedRenames: async (r: readonly ObservedRename[]) => void this.opts.keptRenames!.push(...r) } : {}),
 			...(this.opts.deferOwnFold ? { takeOwnFold: () => this.ownQueue.splice(0) } : {}),
+			diskConcurrency: this.opts.diskConcurrency ?? 4,
 		});
 		this.log.onOwnFold = this.opts.deferOwnFold ? async (events) => void this.ownQueue.push(...events) : (events) => rec.applyOwnFold(events);
 		this.rec = rec;

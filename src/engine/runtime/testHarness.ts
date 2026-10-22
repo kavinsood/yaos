@@ -189,8 +189,15 @@ export async function drive<T>(p: Promise<T>, clock?: VirtualClock, horizonMs = 
 }
 
 /**
- * Poll until `pred` holds (or throw after timeoutMs). Real clock: every 10 ms.
- * Virtual clock: after every timer (clock.runUntil; an async pred is awaited
+ * Real clock: the least deadline `until` waits, whatever the caller's timeoutMs. A deadline only decides how long a
+ * failing test takes to fail, never what a passing one races: short caps (2-3 s) flaked when a loaded machine (load
+ * ~70) ran the client suite 7x slower. Virtual time keeps the caller's timeoutMs (it is exact there).
+ */
+export const REAL_DEADLINE_FLOOR_MS = 60_000;
+
+/**
+ * Poll until `pred` holds (or throw after the deadline). Real clock: every 10 ms, deadline
+ * max(timeoutMs, REAL_DEADLINE_FLOOR_MS). Virtual clock: after every timer (clock.runUntil; an async pred is awaited
  * between steps), timeoutMs of virtual time.
  */
 export async function until(pred: () => boolean | Promise<boolean>, timeoutMs = 5_000, what = "condition", clock?: VirtualClock): Promise<void> {
@@ -207,11 +214,21 @@ export async function until(pred: () => boolean | Promise<boolean>, timeoutMs = 
 		}
 	}
 	const start = Date.now();
+	const limit = Math.max(timeoutMs, REAL_DEADLINE_FLOOR_MS);
 	for (;;) {
 		if (await pred()) return;
-		if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${what}`);
+		if (Date.now() - start > limit) throw new Error(`timed out (${limit} ms) waiting for ${what}`);
 		await sleep(10);
 	}
+}
+
+/**
+ * Until `n` maintenance ticks of `e` have run start to end: the barrier for "nothing happens" asserts about
+ * timer-driven work (rolls, checkpoints, compaction) and anything a pump timer armed before them.
+ */
+export async function maintenanceTicks(e: LogEngine, n: number, clock?: VirtualClock): Promise<void> {
+	const t0 = e.maint.stats.ticks;
+	await until(() => e.maint.stats.ticks > t0 + n, 5_000, `${n} maintenance ticks`, clock);
 }
 
 /** Every engine idle, and their doc lists / texts equal. */

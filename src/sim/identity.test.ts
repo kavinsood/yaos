@@ -20,8 +20,9 @@ import { parseDbName } from "../engine/compose/knownEpoch";
 import { DB_SCHEMA_VERSION, PENDING_DB_NAME_PREFIX, STORE, STORE_SPECS } from "../engine/store/schema";
 import type { YS } from "../engine/store/repo";
 import { sanitizeInstallRecord } from "../host/installRecord";
+import { settleWith } from "../engine/keyring/testkit/simWait";
 import { VirtualClock } from "./clock";
-import { SimDevice } from "./device";
+import { SIM_SETTINGS, SimDevice } from "./device";
 import { SIM_GRANT_DAILY_REGISTRATIONS, SIM_GRANT_LIVE_DEVICES, SimNet } from "./net";
 
 const DAY_MS = 86_400_000;
@@ -123,6 +124,38 @@ test("IndexedDB loss: the next store has a new identity; it fences the old one, 
 	assert.ok(stateDirs(a).has(a.deviceId), "the new store mirrors to its own dir");
 	assert.equal(files(a), files(b), "converged");
 	assert.ok(b.vault.hasFile("offline.md"));
+});
+
+test("IndexedDB loss with files missing from the folder: recovery deletes nothing (DESIGN §i.5), the files come back", async () => {
+	// A store recovered from a mirror has never seen these files on its own disk: a missing one is not a user delete,
+	// for an attachment (blobRev imported unknown) as for a note (bodyVersion null). Before, the attachment's mirror
+	// rev matched the relay's and the planner sent nsDelete for every device (a phone bench run lost 8 attachments).
+	const settings = () => ({ ...SIM_SETTINGS, syncAttachments: true, maxAttachmentBytes: 1 << 20 });
+	const clock = new VirtualClock();
+	clock.onError = (e) => {
+		throw e;
+	};
+	const net = new SimNet(clock);
+	const [a, b] = ["A", "B"].map((name) => new SimDevice({ name, clock, net, settings })) as [SimDevice, SimDevice];
+	const png = new Uint8Array([137, 80, 78, 71, 1, 2, 3, 4, 5]);
+	a.vault.userWrite("note.md", "hello\n");
+	a.vault.externalWrite("att/pic.png", png);
+	for (const d of [a, b]) void d.start();
+	await clock.advance(30_000);
+	assert.ok(b.vault.hasFile("att/pic.png") && b.vault.hasFile("note.md"), "B synced both");
+	const first = a.deviceId;
+	a.crashApp({ wipe: true });
+	await clock.advance(1_000);
+	a.vault.userDelete("att/pic.png");
+	a.vault.userDelete("note.md");
+	void a.restartApp();
+	await clock.advance(60_000);
+	assert.notEqual(a.deviceId, first, "recovered as a new store");
+	assert.deepEqual(record(a).predecessors, [first]);
+	for (const d of [a, b]) {
+		assert.deepEqual(d.vault.bytesOf("att/pic.png"), png, `${d.name} has the attachment`);
+		assert.equal(d.vault.textOf("note.md"), "hello\n", `${d.name} has the note`);
+	}
 });
 
 test("clone: a vault folder copied onto another device runs as its own identity, never touches the source's dir, and all converge", async () => {
@@ -282,6 +315,27 @@ test("store removed in the console: the install registers a successor, which rec
 	}
 	assert.equal((await a.storage.listDatabases()).filter((n) => parseDbName(n)?.vaultEpoch).length, 1, "the revoked store's DB is gone");
 	assert.ok(!stateDirs(a).has(first), "and its dir, once the successor's mirrors were written");
+});
+
+test("store removed in the console, the device unpinned (data.json lost its pin): the key reader registers a successor too", async () => {
+	// identity-per-store §4 "Store revoked by the server" before the gate opens: an unpinned engine runs only the
+	// KeyReader, which read device-revoked and stopped for good (phone bench, 2026-10-21: the pin never landed).
+	const { clock, net, devs } = world(["A"]);
+	const [a] = devs as [SimDevice];
+	void a.start();
+	await clock.advance(15_000);
+	const first = a.deviceId;
+	a.crashApp();
+	a.pinData = {};
+	net.removeDevice(first);
+	void a.restartApp();
+	await clock.advance(60_000);
+	assert.notEqual(a.deviceId, first, "a successor identity");
+	assert.equal(net.identities.state(a.deviceId), "live");
+	const last = a.ui.statuses.at(-1);
+	assert.equal(last?.phase, "key-missing", JSON.stringify(last?.notices));
+	assert.equal(last?.e2ee?.keyMissing, "no-pin", "a working reader: it can take the pin");
+	assert.deepEqual(await settleWith(clock, a.runtime.command({ t: "pinSuite0", source: "link" })), { t: "ok" });
 });
 
 test("store removed in the console with its pairing revoked: no successor; the store stays and the device asks for a re-pair", async () => {

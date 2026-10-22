@@ -81,6 +81,11 @@ export class DocRuntime {
 	causalPending(stream: StreamName): boolean {
 		return this.causal.has(stream);
 	}
+	/** The delay of `stream`'s armed ref retry; null: none armed, or one running now. */
+	refRetryDelay(stream: StreamName): number | null {
+		const st = this.refRetry.get(stream);
+		return st && st.timer !== null ? st.delayMs : null;
+	}
 
 	/** Engine stop: drop every timer this module owns. */
 	dispose(): void {

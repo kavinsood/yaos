@@ -14,8 +14,6 @@ import { createIdbStoragePort } from "./idbStorage";
 type KvSchema = { readonly kv: { readonly record: { readonly k: StorageKey; readonly v?: unknown }; readonly key: StorageKey; readonly indexes: never } };
 const KV = { kv: { keyPath: "k", indexes: {} } } as const;
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
 async function rejectsWith(p: Promise<unknown>, failure: StorageFailure): Promise<StorageError> {
 	try {
 		await p;
@@ -165,14 +163,19 @@ describe("createIdbStoragePort (fake-indexeddb)", () => {
 		const { open } = setup();
 		const db = await open();
 		const lost: StorageFailure[] = [];
-		const unsubscribe = db.onLost((f) => lost.push(f));
+		let fired!: () => void;
+		const firedOnce = new Promise<void>((r) => (fired = r));
+		const unsubscribe = db.onLost((f) => {
+			lost.push(f);
+			fired();
+		});
 		const removed: StorageFailure[] = [];
 		db.onLost((f) => removed.push(f))();
 		// fake-indexeddb's types.d.ts declares the parameter as `typeof FDBDatabase` (the constructor), but the
 		// function takes a database instance: the call is right and the library's declaration is wrong.
 		// @ts-expect-error an IDBDatabase instance where the mistyped declaration wants its constructor
 		forceCloseDatabase(rawOf(db));
-		await sleep(5);
+		await firedOnce;
 		assert.deepEqual(lost, ["connection-lost"]);
 		assert.deepEqual(removed, []);
 		await rejectsWith(count(db), "connection-lost");
@@ -200,7 +203,7 @@ describe("createIdbStoragePort (fake-indexeddb)", () => {
 		stubborn.onversionchange = () => undefined; // never closes
 		await rejectsWith(port.open<KvSchema>("kv", 2, KV), "unknown");
 		stubborn.close(); // the queued open now proceeds; we abort its upgrade
-		await sleep(10);
+		// Opens of one name run in order (the connection queue), so this one waits for that upgrade to end.
 		const raw = await rawOpen(factory, "kv");
 		assert.equal(raw.version, 1);
 		assert.equal(raw.objectStoreNames.contains("kv"), false);

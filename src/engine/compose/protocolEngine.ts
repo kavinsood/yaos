@@ -60,6 +60,11 @@ export interface CreateEngineOptions {
 	readonly carrier: "worker" | "inline";
 	/** Engine ports for one init. Throwing (store cannot open) answers init with `storage-lost`. */
 	makePorts(config: EngineInitConfig): EnginePorts | Promise<EnginePorts>;
+	/**
+	 * The ports of `config` (now pinned suite 0) from those makePorts built unpinned: only the crypto adapter differs
+	 * (an unpinned device holds the suite-1 adapter to judge `k`). Absent: applyPin is refused and main restarts.
+	 */
+	readonly repin?: (config: EngineInitConfig, ports: EnginePorts) => EnginePorts;
 	readonly clientVersion?: string;
 	readonly tuning?: Partial<EngineTuning>;
 	readonly budgets?: Partial<Budgets>;
@@ -507,6 +512,7 @@ export class ComposedEngine {
 			reconnectBaseMs: this.options.tuning?.reconnectBaseMs,
 			onChange: () => this.postStatus(),
 			onKeyed: (): Promise<boolean> => this.onKeyed(reader),
+			onRevoked: () => this.onStoreRevoked(),
 			log: this.options.log,
 		});
 		this.reader = reader;
@@ -530,6 +536,32 @@ export class ComposedEngine {
 		await this.startRuntime("retry");
 		this.postStatus();
 		return true;
+	}
+
+	/**
+	 * Main pinned suite 0 (after this engine's pinSuite0 `ok`) and saved it: the gate opens in this process, the reader
+	 * stops and the VaultRuntime starts, as onKeyed does for suite 1. Saves main's engine restart (a new worker, the
+	 * bundle, IndexedDB, capabilities and a second connect) on every suite-0 pairing.
+	 */
+	private async applyPin(): Promise<EngineResultValue> {
+		const config = this.config;
+		const ports = this.ports;
+		const repin = this.options.repin;
+		if (!config || !ports || config.crypto.suite !== null || !repin || this.disposed) {
+			throw new ProtocolFailure({ code: "bad-request", message: "this engine cannot apply a pin in place", retryable: false });
+		}
+		const next: EngineInitConfig = { ...config, crypto: { suite: 0 } };
+		this.reader?.stop();
+		this.reader = null;
+		this.ports = repin(next, ports);
+		this.config = next;
+		this.keyring = new HostKeyring(this.link, next.crypto);
+		this.gate = await PinGate.open(next.crypto, this.ports, this.gateKeys());
+		this.log("pinned suite 0: starting the vault runtime");
+		this.knownEpoch = await findKnownEpoch(this.ports.storage, next.vaultId, next.installKey).catch(() => undefined);
+		if (!this.disposed && !this.rt && !this.starting) await this.startRuntime("retry");
+		this.postStatus();
+		return { t: "ok" };
 	}
 
 	/** `atLeastMs`: the server's Retry-After (a registration refused for the day). */
@@ -777,6 +809,8 @@ export class ComposedEngine {
 			case "refreshGrant":
 				await this.refreshGrant();
 				return { t: "ok" };
+			case "applyPin":
+				return this.applyPin();
 			case "createSnapshot":
 			case "listSnapshots":
 			case "snapshotFiles":
@@ -826,10 +860,11 @@ export class ComposedEngine {
 	 * retired). The install's grant registers a successor first; only then is the runtime stopped (its outbox goes to
 	 * its mirror), its store deleted and a new runtime started, which recovers from the old store's dir as from any
 	 * lost store (§5.2; the fence finds it gone). A refusal keeps the store and the phase: a revoked grant needs a
-	 * re-pair (its notice says so); a passing one (network, daily limit) is retried.
+	 * re-pair (its notice says so); a passing one (network, daily limit) is retried. A key reader (gate closed, no
+	 * runtime) whose store was refused is replaced the same way: a new reader starts on the successor's identity.
 	 */
 	onStoreRevoked(): void {
-		if (this.replacing || this.disposed || !this.rt) return;
+		if (this.replacing || this.disposed || (!this.rt && !this.reader)) return;
 		this.replacing = true;
 		void this.replaceRevoked().then(() => undefined, (e: unknown) => this.log(`successor start failed: ${String(e)}`)).finally(() => {
 			this.replacing = false;
@@ -854,7 +889,7 @@ export class ComposedEngine {
 			if (refused && needsRepair(refused.reason)) return;
 			this.replaceTimer = ports.clock.setTimer(Math.max(refused?.retryAfterMs ?? 0, REVOKED_RETRY_MS), () => {
 				this.replaceTimer = null;
-				if (this.rt?.status().phase === "revoked") this.onStoreRevoked();
+				if ((this.rt ? this.rt.status().phase : this.reader?.phase()) === "revoked") this.onStoreRevoked();
 			});
 		}
 	}
@@ -876,12 +911,23 @@ export class ComposedEngine {
 			return { error };
 		}
 		if (this.disposed || this.identity?.creds.deviceId !== old) return null;
-		await this.restart(reason, async () => {
+		const deleteStores = async (): Promise<void> => {
 			const n = await deleteStoreDbs(ports.storage, config.vaultId, config.installKey);
 			this.knownEpoch = undefined;
 			this.log(`${reason === "revoked" ? "revoked" : "rebuilt"} store replaced: ${n} store(s) deleted`);
-		});
+		};
+		if (this.reader) await this.restartReader(deleteStores);
+		else await this.restart(reason, deleteStores);
 		return null;
+	}
+
+	/** replaceStore for a key reader (gate closed, no runtime, no store open): a new reader on the successor identity. */
+	private async restartReader(beforeStart: () => Promise<void>): Promise<void> {
+		this.reader?.stop();
+		this.reader = null;
+		await beforeStart();
+		if (!this.disposed) await this.startRuntime("revoked");
+		this.postStatus();
 	}
 
 	/**

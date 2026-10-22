@@ -12,36 +12,39 @@ Section letters (§x.y) refer to [DESIGN](client-remake/DESIGN.md).
 
 ## 1. Being fixed now
 
-### PERF-BOOT: fresh-device bootstrap takes ~50 s on a phone
+### PERF-BOOT: fresh-device bootstrap takes ~32 s on a phone
 
-**A fresh Android phone needs ~50 s (median 49.6 s, n = 3) to bootstrap a 1022-file vault.** The Node harness does
-the same vault in ~2.7 s ([integration-notes](client-remake/integration-notes.md) §7.3, `e2e/client/phoneBench.ts`).
+**A fresh Android phone needs ~32 s (median, n = 7) to bootstrap a 1022-file vault; ~41 s before `perf-boot`.** The
+Node harness does the same vault in ~2.7 s ([integration-notes](client-remake/integration-notes.md) §7.3, §7.4;
+`e2e/client/phoneBench.ts`, which now pairs on its own).
 
-**Where the time goes, profiled on the device:**
-- **The ~43 s steady phase is Obsidian's native file bridge.** A DataAdapter call is in flight 94% of the time,
-  back to back and mostly one at a time.
-  - About 5.4 bridge calls per file: Obsidian's `create` (`exists` + `write`), Obsidian's metadata `read`, and two
-    of YAOS's own: the `absent` precondition's `exists` (`src/host/obsidianVault.ts` `check`) and the engine reading
-    each file back after writing it (`src/host/diskExecutor.ts` `readVault`, `readBinary`).
-  - IndexedDB can account for at most ~6% of this phase.
-- **~7.2 s before the first file are spent in the worker and on the network, not yet attributed.**
+**Landed (`perf-boot`, 1cc63f58), -9 s (-22%), measured A/B on the phone:**
+- independent files written concurrently (`Budgets.diskOpConcurrency`, 4; constrained 2), in the host's DiskExecutor
+  and the plan runner's materialize window;
+- YAOS's `exists` before each create removed: `vault.create` checks the disk itself;
+- the startup ping retries 5 + 10 + 20 + 40 s before the fatal (was fatal after 5 s); worker errors still end it at
+  once.
 
-**Next, measured on the phone after each step:**
-1. **Write independent files concurrently.**
-   - The bridge serves 4 calls in flight 2-3x faster than one at a time.
-   - The plan runner materializes in order today (§f.2).
-2. **Drop YAOS's two bridge calls per created file:**
-   - the pre-create `exists`: `vault.create` already throws when the path exists, and the catch re-checks;
-   - the read-back after our own write: the engine knows the bytes it wrote.
+**Where the ~32 s goes now (§7.4):**
+- **~29 s: Obsidian's native file bridge, saturated.** A call is in flight all of it, ~6 deep; 4 calls per file, all
+  Obsidian's: `create` (`exists` + `write`), its metadata cache's `readBinary`, its File recovery plugin's `read`.
+  More concurrency only raises per-call latency (~139 calls/s against ~125 serial). Not CPU: main 7 s busy, the
+  engine 6 s.
+- **~3 s pair -> first file** (was ~3.8 s, of which ~1-2 s was the `suite=0` pin's fixed 1 s retry and the engine
+  restart after it; landed below).
 
-   Together these are ~21 s of the 55 s of summed bridge time.
-3. **Attribute the 7.2 s.**
-   - Export the engine's diagnostics phase timeline over DevTools at the end of a run.
-   - Get the worker hooks working (they recorded nothing in the profile run).
-4. **One transaction per catch-up batch** instead of three per file: hygiene, worth ≤ ~2.6 s here.
+**Landed after (fe457402): the `suite=0` pin without the retry and the restart.** One engine per pairing; pair ->
+first file median 3.8 -> 2.9 s (integration-notes §7.4).
 
-**Found on the way:** `STARTUP_PING_TIMEOUT_MS` (5 s, `src/host/engineHost.ts`) is fatal and not retried. A phone
-that takes longer than 5 s to start the worker stops syncing until "Restart sync engine".
+**Next:**
+1. **The feed apply before the first file:** two `streams,meta` write transactions, ~0.8-1.1 s on the phone.
+2. **Fewer bridge calls per file needs Obsidian's side:** writing through the adapter would skip `create`'s `exists`
+   (a quarter of the calls) but bypasses the vault's own bookkeeping; not without a design. File recovery's `read` is
+   the user's plugin.
+3. **One transaction per catch-up batch** instead of three per file: hygiene; IndexedDB is not on the critical path.
+
+(The "second engine at the last file" of earlier profile runs was this pin restart, recorded late by a blocked bench
+loop: integration-notes §7.4.)
 
 ## 2. Smaller open items
 

@@ -19,6 +19,7 @@ import { testVaultId } from "../../host/keys/testkit/vaultIds";
 import { createWebCryptoSuite1, type Suite1Crypto } from "../adapters/webCryptoSuite1";
 import { Keyring, type KeyringChange } from "../keyring/keyring";
 import { settleWith } from "../keyring/testkit/simWait";
+import { until } from "../runtime/testHarness";
 import { K, VAULT, genesis, roll } from "../keyring/testkit/world";
 import { HostKeyring } from "./hostKeyring";
 import type { HostLink } from "./hostLink";
@@ -105,7 +106,7 @@ test("a store that fails after the keyring was disposed (stop while keyringChang
 	let fail: ((e: Error) => void) | null = null;
 	const a = await Keyring.open({ mode: "suite1", vaultId: VAULT, kc, records: [g], persist: () => new Promise<void>((_, reject) => void (fail = reject)) });
 	const ingested = a.ingest(rows([1, g], [2, r2]));
-	for (let i = 0; i < 2_000 && !fail; i++) await new Promise((r) => setTimeout(r, 1));
+	await until(() => fail !== null, 5_000, "keyringChanged in flight");
 	assert.ok(fail, "keyringChanged is in flight");
 	a.dispose();
 	(fail as (e: Error) => void)(new Error("store failed"));

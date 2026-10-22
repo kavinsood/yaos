@@ -99,12 +99,16 @@ export async function inheritFromLineage(c: EngineCtx, inh: MetaInherit, side: (
 	return { from: outbox?.dir ?? null, frames: records.length, skipped, synced: syncedN, snapshots };
 }
 
-/** A synced mirror entry as recovery imports it (§i.5 step 3); compose/syncedMirror.ts fromMirrorEntry. */
-function syncedRecordOf(e: { readonly docId: SyncedRecord["docId"]; readonly path: SyncedRecord["path"]; readonly kind: SyncedRecord["kind"]; readonly contentHash: SyncedRecord["contentHash"]; readonly nsTouchSeq: number; readonly blobRev: number; readonly fileGone?: true; readonly renamedTo?: SyncedRecord["renamedTo"]; readonly held?: SyncedMirrorEntry["held"] }, nowMs: number, texts: HeldTextRecord | undefined): SyncedRecord {
+/**
+ * A synced mirror entry as recovery imports it (§i.5 step 3); compose/syncedMirror.ts fromMirrorEntry. `blobRev` 0 is
+ * unknown, as `bodyVersion` null is for a text: this store never saw the file on its disk, so a missing one is not a
+ * user delete (the planner re-materializes it) and a changed one is a no-base conflict. Nothing is destroyed.
+ */
+function syncedRecordOf(e: { readonly docId: SyncedRecord["docId"]; readonly path: SyncedRecord["path"]; readonly kind: SyncedRecord["kind"]; readonly contentHash: SyncedRecord["contentHash"]; readonly nsTouchSeq: number; readonly fileGone?: true; readonly renamedTo?: SyncedRecord["renamedTo"]; readonly held?: SyncedMirrorEntry["held"] }, nowMs: number, texts: HeldTextRecord | undefined): SyncedRecord {
 	const held = recoveredHeld(e.held, texts);
 	return {
 		docId: e.docId, path: e.path, pathKey: pathKey(e.path), kind: e.kind, contentHash: e.contentHash, fingerprint: "" as DiskFingerprint,
-		size: -1, mtimeMs: 0, bodyVersion: null, blobRev: e.blobRev, nsTouchSeq: e.nsTouchSeq, hasBase: false, syncedAtMs: nowMs,
+		size: -1, mtimeMs: 0, bodyVersion: null, blobRev: 0, nsTouchSeq: e.nsTouchSeq, hasBase: false, syncedAtMs: nowMs,
 		...(e.fileGone ? { fileGone: true as const } : {}), ...(e.renamedTo ? { renamedTo: e.renamedTo } : {}), ...(held ? { held } : {}),
 	};
 }

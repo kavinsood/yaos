@@ -24,7 +24,7 @@ import { rawAppend } from "../keyring/testkit/engines";
 import { genesis } from "../keyring/testkit/world";
 import { applyChanges, type TextChanges } from "../body/textChanges";
 import type { LogEngine } from "./engine";
-import { converged, sleep, startTestEngine, testPorts, testStorage, until, createDoc, docText, editDoc } from "./testHarness";
+import { converged, startTestEngine, testPorts, testStorage, until, createDoc, docText, editDoc } from "./testHarness";
 
 const BUDGETS = { maxResidentBytes: 1024 * 1024 * 1024, maxResidentDocs: 64 };
 
@@ -100,7 +100,7 @@ test("oversize-local: an update > MAX_INLINE_UPDATE_BYTES with no blob store fre
 		assert.equal(rec.frozenReason, "oversize-local");
 		assert.deepEqual(frozen, ["oversize-local"]);
 		assert.ok(a.status().notices.some((n) => n.code === "frozen:oversize-local"));
-		await sleep(100);
+		await relay.settled(); // no frame left in the relay's group commit either
 		assert.equal(relay.head(), head0, "nothing appended");
 		assert.equal(a.c.outbox.size, 0);
 		assert.equal(await docText(a, id), "keep;", "replica = durable state (unsent update discarded)");
@@ -230,20 +230,23 @@ test("suite 1: tampered at rest -> retried with backoff, then the doc freezes bl
 		await editDoc(a, id, (t) => t.insert(t.length, big));
 		const sb = b.streamOf(id);
 		await until(() => b.c.repo.stream(sb)?.frozen === 1, 10_000, "b frozen");
+		// A lower bound on real time: load only makes it longer, so it cannot fail for want of CPU.
 		assert.ok(Date.now() - t0 >= 300, "not before blobQuarantineMinMs");
 		assert.equal(b.c.repo.stream(sb)!.frozenReason, "blob-corrupt");
 		assert.ok(b.status().notices.some((n) => n.code === "frozen:blob-corrupt"));
 		assert.equal(await docText(b, id), "seed;", "nothing applied");
 		// The same bytes under a key that is not KCV-checked: never deterministic, so c keeps retrying unfrozen.
 		const gets = store.gets;
-		await sleep(600);
+		await until(() => store.gets >= gets + 2, 10_000, "c still retrying"); // two more attempts (b is frozen: c's)
 		assert.equal(c.c.repo.stream(c.streamOf(id))!.frozen, 0);
-		assert.ok(store.gets > gets, "still retried");
 		assert.equal(await docText(c, id), "seed;");
 		// Repaired at rest: c resolves on its own timer; b only after the user releases the doc.
 		store.mode = "ok";
 		await until(async () => (await docText(c, id)) === "seed;" + big, 5_000, "c resolved");
-		await sleep(500);
+		// b's chance to resolve on its own: the wake runs every armed ref retry now. A frozen doc has none.
+		b.retryBlobsNow();
+		await until(() => b.isIdle(), 5_000, "b idle");
+		assert.equal(b.c.docs.refRetryDelay(sb), null, "no retry armed on a frozen doc");
 		assert.equal(b.c.repo.stream(sb)!.frozen, 1, "frozen stays frozen until released");
 		assert.deepEqual(await b.releaseQuarantine(sb), { passed: 0, dismissed: 0 });
 		await until(async () => (await docText(b, id)) === "seed;" + big, 5_000, "b resolved after release");
@@ -270,7 +273,7 @@ test("suite 1: an absent blob is retried with backoff and never quarantined; it 
 		const big = "w".repeat(MAX_INLINE_UPDATE_BYTES + 100_000);
 		await editDoc(a, id, (t) => t.insert(t.length, big));
 		await until(() => store.gets >= 6, 10_000, "several attempts");
-		await sleep(400);
+		await until(() => store.gets >= 8, 10_000, "and two more"); // past BLOB_QUARANTINE_RETRIES for a deterministic failure
 		assert.equal(b.c.repo.stream(b.streamOf(id))!.frozen, 0, "absent: not deterministic");
 		assert.equal(await docText(b, id), "seed;");
 		store.mode = "ok";
@@ -295,12 +298,11 @@ test("network back: retryBlobsNow runs an unresolved ref at once instead of at i
 		store.mode = "absent";
 		const big = "n".repeat(MAX_INLINE_UPDATE_BYTES + 100_000);
 		await editDoc(a, id, (t) => t.insert(t.length, big));
-		await until(() => store.gets >= 1, 10_000, "first attempt");
-		await sleep(200);
+		const sb = b.streamOf(id);
+		await until(() => b.c.docs.refRetryDelay(sb) === 60_000, 10_000, "first attempt failed: a retry armed at the base backoff");
 		const first = store.gets;
 		b.retryBlobsNow();
-		await until(() => store.gets > first, 5_000, "the wake retries");
-		await sleep(200);
+		await until(() => b.c.docs.refRetryDelay(sb) === 120_000, 5_000, "the wake's attempt failed: re-armed, doubled");
 		assert.equal(store.gets, first + 1, "one attempt per wake, no loop; the next waits out the (doubled) backoff");
 		assert.equal(await docText(b, id), "seed;");
 		store.mode = "ok";

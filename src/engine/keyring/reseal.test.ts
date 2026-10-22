@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { decodeOuter } from "../../core/codec/envelope";
 import { KEYRING_STREAM, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
-import { converged, until, createDoc, docText, editDoc } from "../runtime/testHarness";
+import { converged, maintenanceTicks, until, createDoc, docText, editDoc } from "../runtime/testHarness";
 import { keyMissing, live, rawAppend, start, stored, type Dev } from "./testkit/engines";
 import { K, RK_A, genesis } from "./testkit/world";
 
@@ -48,7 +48,7 @@ describe("revoke re-seal (§14.2 step 4) in the engine", () => {
 			const sRot = lastK(relay);
 			relay.setConnectFailure(null);
 			await until(() => keyMissing(y!) === "revoked-epoch" && y!.engine.status().vaultSeq >= sRot, 8_000, "y read the revoke");
-			await new Promise((r) => setTimeout(r, 200));
+			await maintenanceTicks(y.engine, 3);
 			assert.deepEqual(rowsPast(relay, "dev-y", sRot), [], "nothing sent under K_1 past S_rot, nothing while key-less");
 			assert.equal(await y.engine.installKeyQr(2, k2Of(x!).slice()), "verified");
 			await converged([x!.engine, y.engine], 8_000);

@@ -4,6 +4,12 @@
  * - Batches are queued per lane (LANE: openNote, background); at every op
  *   boundary the executor takes the next op of the oldest openNote batch, else
  *   of the oldest background batch. Order inside one batch is always preserved.
+ * - Up to budgets.diskOpConcurrency ops run at once, each from a different batch
+ *   (Obsidian's mobile file bridge serves concurrent calls 2-3x faster than
+ *   serial ones, integration-notes §7.3). An op waits while it shares a docId or
+ *   a path (case-folded, or a path's ancestor folder) with a running op or with
+ *   the next op of an earlier batch still waiting, so ops on one path keep the
+ *   order of their batches.
  * - Work runs in slices of budgets.mainSliceMs, yielding a macrotask between
  *   slices so the editor stays responsive.
  * - Every op carries a WritePrecondition, passed to VaultPort, which checks it
@@ -34,7 +40,7 @@ export interface DiskExecutorDeps {
 	readonly isBoundPath: (path: string) => boolean;
 	/** Post a bound path's unsent editor edits; true when there were any (trash then refuses). */
 	readonly flushBoundPath?: (path: string) => boolean;
-	readonly budgets: () => Pick<Budgets, "mainSliceMs">;
+	readonly budgets: () => Pick<Budgets, "mainSliceMs" | "diskOpConcurrency">;
 }
 
 const BOUND_GUARDED = new Set(["materialize", "merge", "restore", "snapshot-restore"]);
@@ -47,7 +53,14 @@ interface Batch {
 	readonly failedDocs: Set<string>;
 	readonly failedPaths: Set<string>;
 	next: number;
+	/** An op of this batch is running. */
+	busy: boolean;
 	resolve(results: DiskOpResult[]): void;
+}
+
+interface Claim {
+	readonly docId: string | null;
+	readonly paths: readonly string[];
 }
 
 function foldKey(path: string): string {
@@ -67,14 +80,30 @@ function opPaths(op: DiskOp): string[] {
 	}
 }
 
+function claimOf(op: DiskOp): Claim {
+	return { docId: op.t === "removeEmptyFolder" ? null : op.docId, paths: opPaths(op).map(foldKey) };
+}
+
+function nested(a: string, b: string): boolean {
+	return a === b || a.startsWith(b + "/") || b.startsWith(a + "/");
+}
+
+function overlaps(a: Claim, b: Claim): boolean {
+	if (a.docId !== null && a.docId === b.docId) return true;
+	return a.paths.some((p) => b.paths.some((q) => nested(p, q)));
+}
+
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
 export class DiskExecutor {
 	private readonly queue: Batch[] = [];
+	private readonly inflight = new Map<Promise<void>, Claim>();
 	private seq = 0;
 	private running = false;
+	/** Wakes a drain waiting on running ops: a new batch may start in a free slot. */
+	private wake: (() => void) | null = null;
 	private sliceStart = 0;
 	/** Ops executed (not skipped), for tests and status. */
 	executed = 0;
@@ -89,22 +118,45 @@ export class DiskExecutor {
 
 	run(lane: Lane, ops: readonly DiskOp[]): Promise<DiskOpResult[]> {
 		return new Promise<DiskOpResult[]>((resolve) => {
-			const batch: Batch = { lane, seq: this.seq++, ops, results: [], failedDocs: new Set(), failedPaths: new Set(), next: 0, resolve };
+			const batch: Batch = { lane, seq: this.seq++, ops, results: [], failedDocs: new Set(), failedPaths: new Set(), next: 0, busy: false, resolve };
 			if (ops.length === 0) {
 				resolve([]);
 				return;
 			}
 			this.queue.push(batch);
 			if (!this.running) void this.drain();
+			else this.wake?.();
 		});
 	}
 
-	private pick(): Batch | null {
-		let best: Batch | null = null;
-		for (const b of this.queue) {
-			if (!best || b.lane < best.lane || (b.lane === best.lane && b.seq < best.seq)) best = b;
+	/** The batches whose next op may start now, in pick order (lane, then seq), at most `room` of them. */
+	private startable(room: number): Batch[] {
+		const order = [...this.queue].sort((a, b) => a.lane - b.lane || a.seq - b.seq);
+		const held: Claim[] = [...this.inflight.values()];
+		const out: Batch[] = [];
+		for (const b of order) {
+			if (out.length >= room) break;
+			if (b.next >= b.ops.length) continue;
+			const c = claimOf(b.ops[b.next] as DiskOp);
+			if (!b.busy && !held.some((h) => overlaps(h, c))) out.push(b);
+			held.push(c);
 		}
-		return best;
+		return out;
+	}
+
+	private start(batch: Batch): void {
+		const op = batch.ops[batch.next] as DiskOp;
+		batch.next++;
+		batch.busy = true;
+		const task: Promise<void> = this.execOne(batch, op).then((result) => {
+			batch.results.push(result);
+			batch.busy = false;
+			if (batch.next >= batch.ops.length) {
+				this.queue.splice(this.queue.indexOf(batch), 1);
+				batch.resolve(batch.results);
+			}
+		}).finally(() => this.inflight.delete(task));
+		this.inflight.set(task, claimOf(op));
 	}
 
 	private async drain(): Promise<void> {
@@ -112,15 +164,12 @@ export class DiskExecutor {
 		this.sliceStart = this.deps.clock.monotonic();
 		try {
 			for (;;) {
-				const batch = this.pick();
-				if (!batch) break;
-				const op = batch.ops[batch.next] as DiskOp;
-				batch.next++;
-				batch.results.push(await this.execOne(batch, op));
-				if (batch.next >= batch.ops.length) {
-					this.queue.splice(this.queue.indexOf(batch), 1);
-					batch.resolve(batch.results);
-				}
+				const room = Math.max(1, this.deps.budgets().diskOpConcurrency) - this.inflight.size;
+				if (room > 0) for (const b of this.startable(room)) this.start(b);
+				if (this.inflight.size === 0) break;
+				const woken = new Promise<void>((resolve) => (this.wake = resolve));
+				await Promise.race([...this.inflight.keys(), woken]);
+				this.wake = null;
 				if (this.deps.clock.monotonic() - this.sliceStart >= this.deps.budgets().mainSliceMs) {
 					await this.deps.clock.yieldNow();
 					this.sliceStart = this.deps.clock.monotonic();

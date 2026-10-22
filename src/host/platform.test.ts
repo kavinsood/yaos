@@ -40,14 +40,18 @@ test("lifecycle events come from visibilitychange, pagehide, freeze/resume, onli
 	assert.equal(seen.length, 7);
 });
 
-test("browser clock timers fire and clear; monotonic never decreases", async () => {
+test("browser clock timers fire and clear; monotonic never decreases", (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const c = browserClock();
 	let fired = 0;
 	const h = c.setTimer(5, () => fired++);
 	c.clearTimer(h);
 	c.setTimer(1, () => fired += 10);
 	const m1 = c.monotonic();
-	await new Promise((r) => setTimeout(r, 20));
+	assert.equal(fired, 0);
+	t.mock.timers.tick(1);
 	assert.equal(fired, 10);
+	t.mock.timers.tick(60_000);
+	assert.equal(fired, 10, "the cleared timer never fires");
 	assert.ok(c.monotonic() >= m1);
 });

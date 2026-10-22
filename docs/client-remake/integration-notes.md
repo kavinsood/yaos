@@ -907,8 +907,8 @@ Sweeps at 90c717e7:
 
 **Every number in §7.0-§7.2 comes from the Node harness, not from a device.** The clients run in Node on a laptop
 with `fake-indexeddb` and a simulated vault, so local storage and disk work cost almost nothing. On a real phone
-(§7.3), a fresh device takes **~50 s** to bootstrap the 1022-file vault that the harness bootstraps in ~2.7 s, on the
-same relay at the same hour. Read the harness numbers as relay and protocol costs, not as what a user waits for.
+(§7.3, §7.4), a fresh device takes **~32 s** (~41 s before `perf-boot`; ~50 s as first measured, with a slower
+bench) to bootstrap the 1022-file vault that the harness bootstraps in ~2.7 s, on the same relay. Read the harness numbers as relay and protocol costs, not as what a user waits for.
 
 Harness: `e2e/client/fullClients.ts` (from the full-client e2e branch,
 f0b7c63 / 8939943). Each client is a complete `HostRuntime` over the
@@ -1087,7 +1087,7 @@ tail end is local work: ~3 storage tx per note (catch-up apply, reconcile read, 
 localTree commit; 3083 tx, 1.8 s of tx time on fake-indexeddb), the same
 cost that bounds the local run. Deployed is now within ~0.3 s of local in the
 harness. That per-note local work is nearly free on fake-indexeddb and is not
-free on a device: on a phone the same vault takes ~50 s (§7.3).
+free on a device: on a phone the same vault takes ~32 s (§7.3, §7.4).
 
 **Edit to peer.** The relay commits a group after 300 ms idle (1500 ms max),
 and a peer projects an edit of a note it does not have open to disk only on
@@ -1281,9 +1281,14 @@ built with `YAOS_KEEP_NAMES=1`. The instrumentation does not shift the total, wh
   | Call | n | p50 ms | sum s | Issued by |
   |---|---|---|---|---|
   | `write` | 1040 | 16.2 | 18.2 | Obsidian's `vault.create` |
-  | `read` | 997 | 12.9 | 13.9 | Obsidian (its metadata cache reading each new note) |
-  | `readBinary` | 1001 | 10.8 | 11.8 | YAOS: `diskExecutor.readVault`, the engine reading each file back after writing it |
-  | `exists` | 2184 | 2.9 | 9.2 | YAOS's `absent` precondition (`obsidianVault.check`), plus Obsidian's own inside `create` |
+  | `read` | 997 | 12.9 | 13.9 | Obsidian's File recovery core plugin (`vault.read` of each created file) |
+  | `readBinary` | 1001 | 10.8 | 11.8 | Obsidian's metadata cache (`vault.readBinary` + hash of each new note) |
+  | `exists` | 2184 | 2.9 | 9.2 | ~1000 YAOS's `absent` precondition (`obsidianVault.check`), ~1000 Obsidian's own inside `create`, the rest on `mkdir` paths |
+
+  Corrected 2026-10-21 (from obsidian.asar 1.14.4 app.js): the first version of this table gave `readBinary` to
+  YAOS's read-back and `read` to the metadata cache. YAOS issues only the `absent` precondition's `exists` (~4.5 s
+  summed), removed in perf-boot (1cc63f58). The other ~4 calls per file are Obsidian's, so only concurrency can cut
+  them.
   | `mkdir` | 124 | 8.8 | 1.2 | `createFolder` |
   | `writeBinary` | 26 | 24.6 | 0.7 | attachments |
 
@@ -1300,18 +1305,86 @@ built with `YAOS_KEEP_NAMES=1`. The instrumentation does not shift the total, wh
   - `write` levels off at ~20 ms per call beyond 4-8 in flight;
   - absolute times standalone are noisier than inside the bootstrap: Obsidian works in the background.
 
-Open gaps in the probe:
-- **The engine worker's hooks stayed empty.** The worker was hooked while running, and its CPU profile was not
-  captured either.
-- **The obvious fix for that fails.** Attaching new workers paused, so the hooks go in before any code runs, stalled
-  the engine past `STARTUP_PING_TIMEOUT_MS` (5 s, `src/host/engineHost.ts:33`), and the plugin stopped with "the sync
-  engine did not answer within 5 s of starting". That failure is fatal and not retried, so a phone slow enough to
-  start the worker in over 5 s would stop syncing the same way.
+Why the engine worker's hooks stayed empty (found 2026-10-21, see §7.4): the bench, not the phone. Its file-count
+loop polled adb with `execFileSync` and never awaited, so Node's event loop, and with it every DevTools message, was
+blocked for the whole bootstrap: attaches were handled late (dead sessions), no drain ran, and the engine's events were
+lost when it was replaced at the end. The DevTools socket going unread also slowed the phone, so the 7.2 s
+pre-first-file figure of the profile run is inflated.
 
 Raw logs: `experiments/logs/client-e2e-boot-phone-base-20261020T224337Z.json`,
 `client-e2e-phone-phone-base-20261020T225908Z.json` (the three runs), and
 `client-e2e-phone-phone-base-20261020T232527Z.json` with `client-e2e-phone-profile-phone-base-20261020T232637Z-run1-*`
 (the profile: events and .cpuprofile per thread).
+
+### 7.4 Concurrent disk ops and one bridge call fewer (branch `perf-boot`, 2026-10-21)
+
+What changed (1cc63f58): `Budgets.diskOpConcurrency` (4; constrained 2) ops in flight in the host's DiskExecutor and
+the plan runner's materialize window, never two on one doc, path or ancestor folder; the `absent` precondition's
+`adapter.exists` dropped (`vault.create` checks itself); the startup ping retried 5+10+20+40 s before the fatal.
+
+**Method.** The phoneBench harness changed during this work: it now presses Pair over DevTools instead of waiting for
+a tap, and yields between polls. It times both builds faster than the §7.3 runs did (the tapped runs of the same
+perf-boot build: 35.0 / 35.0 / 43.9 s), so §7.3's 49.6 s is not the baseline here. Both builds were run with the same
+harness on the same afternoon, 3 runs each, then 4 more of each alternating (baseline, perf-boot, ...):
+
+| Build | Every file on disk (s), sorted | Median | First file (s), median |
+|---|---|---|---|
+| baseline (5aecbc65) | 34.8, 38.1, 39.6, 41.2, 53.9, 54.5, 59.8 | 41.2 | 5.9 |
+| perf-boot (1cc63f58) | 31.2, 31.8, 32.0, 32.2, 32.9, 44.8, 50.4 | 32.2 | 3.6 |
+
+- **~9 s faster (median 41.2 -> 32.2 s, -22%).** perf-boot was faster in each of the 4 alternating pairs (by 9.7,
+  9.4, 8.3, 3.0 s). The phone drifts: the slow runs on both sides coincide with slow adb polls (170-190 ms instead of
+  ~100 ms), the phone being busier or warmer, so medians and pairs are the figures to read, not single runs.
+- **Not the 21 s first estimated.** That figure assumed two of the per-file calls were YAOS's; one was (§7.3
+  correction), and the bridge saturates.
+
+**Where the time goes now** (profile run, 31.9 s, `client-e2e-phone-profile-phone-base-20261021T094600Z-run1-*`):
+- **Steady phase (28.8 s): the bridge is saturated.** A call is in flight all of it, ~6 deep on average. 4.0 calls per
+  file (5.4 before; `exists` 2184 -> 1155). Per-call latency rose with depth (p50 `exists` 2.9 -> 40 ms, `write` 16 ->
+  48 ms, `read` 13 -> 39 ms): ~139 calls/s against ~125 serial. Under the real mixed load the bridge does not give
+  the 2-3x of the single-call microbenchmark; most of the gain is the calls removed.
+- What is left per file is Obsidian's: `create` (`exists` + `write`), the metadata cache's `readBinary` (679 of
+  1000: it coalesces), File recovery's `read`. Main-thread CPU 7.3 s busy, the engine worker 5.9 s: not CPU-bound.
+- **Pair -> first file, ~3 s, now attributed** (startup timeline, `...-startup.txt`; times from the poll seeing the
+  identity in data.json, which lags the write by ~0.1 s):
+  - -0.1 s engine 1 starts (ping, init, ready in 0.16 s); the setup link's `pinSuite0 "link"` arrives before the
+    session has read `k` and fails transient; `sendRetrying` (`src/host/ui/keyActions.ts`) sleeps a fixed 1 s;
+  - +1.1 s the pin lands and **the engine restarts** with the pinned config (pluginController `pinAfter`);
+  - engine 2 from +1.3 s: capabilities 67 ms, socket open 98 ms, IndexedDB open and reads, ready at +1.8 s; feed
+    apply (two `streams,meta` write transactions, 0.76 s); first `diskOps` at +3.0 s.
+  - So a fresh pairing over a `suite=0` link paid ~1-2 s for the retry and the restart.
+
+**The pin without the retry and the restart** (fe457402; 3 runs + a profile run, 2026-10-21, a freshly seeded vault):
+the KeyReader holds `pinSuite0 "link"` until `k` is read, a refused send is retried on the next host change instead of
+after 1 s, and after the pin main sends `applyPin`: the same engine swaps in the identity crypto adapter and starts its
+VaultRuntime. One `yaos-engine` worker per run (the profile: never detached). Timeline (`...T190738Z-run1-startup.txt`):
+the pin's first send is refused at -0.3 s (the KeyReader not up yet), resent at +0.19 s on the next status, `ok` at
++0.51 s once `k` is read; `applyPin` at +0.52 s; runtime ready at +1.17 s (was +2.81 s); first `diskOps` at +2.94 s (was
++4.03 s). Pair -> first file, median 3.8 -> 2.9 s. What is left before the first file is mostly the feed apply's
+`streams,meta` write transactions (1.09 s). Whole runs: 35.5 / 31.6 / 43.6 s (profile run 37.3 s); run 3 slowed from
+20 s on along with the bench's adb polls (149 ms against 107 ms), the phone after ~20 min of back-to-back runs, not
+the startup this changes.
+
+**Bench hygiene found on the way:** the folder wipe left the plugin's stores (IndexedDB), its install record
+(localStorage) and the stores' mirror dirs (`.obsidian/plugins/yaos/state`), so the next pairing reopened the previous
+run's store, whose grant the bench had just revoked (an unpinned engine stays `revoked`: `onStoreRevoked` needs a
+VaultRuntime), or inherited from its mirror. phoneBench now deletes all of it for the bench vault (the stores, the
+install record `yaos-install-<vaultId hex>`, the local settings) before each pairing. The runs above are on a newly
+seeded vault: the old one lost 8 attachments on the relay, and that was a client bug. One ns frame (seq 1026, the
+author's frameNo 1, authorNsSeq 1025) deleted them, sent by the run whose new store inherited the previous store's
+synced mirror against the wiped folder: recovery imported each attachment's `blobRev` as it was, so "synced, now
+missing" read as a user delete, while notes (`bodyVersion = null`) were re-materialized. Fixed: recovery imports
+`blobRev = 0` (DESIGN §i.5 step 3), and a key reader whose store is revoked registers a successor like a runtime
+(§i.5 "Store revoked by the server"); sim tests in `src/sim/identity.test.ts`.
+
+Not a second engine: earlier profile runs showed a second `yaos-engine` worker "at the last file". It was the same
+pin restart at +1.3 s, recorded late: the bench's blocking poll loop kept the DevTools socket from being read until
+the run ended (§7.3). With the loop yielding, the timeline above places it at the pin. One engine per vault runs
+after it.
+
+Raw logs (`experiments/logs/`): `client-e2e-phone-phone-base-20261021T094655Z.json` (perf-boot, 3 runs),
+`...T095007Z.json` (baseline, 3 runs), `...T095344Z` to `...T100231Z` (the alternating runs, one each), and the profile
+`...T094502Z.json` with `client-e2e-phone-profile-phone-base-20261021T094600Z-run1-*`.
 
 ## 8. Bundle
 

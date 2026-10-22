@@ -120,6 +120,23 @@ test("applyLinkE2ee: no matching record yet is pending; suite=0 retries while k 
 	assert.deepEqual(clock.slept, [1000, 1000]);
 });
 
+test("applyLinkE2ee: suite=0 sent before the engine runs is retried when the host changes, not on a timer", async () => {
+	const host = new FakeUiHost({ identity: identityFor(VAULT) });
+	let running = false;
+	host.handler = () => {
+		if (!running) throw new Error("YAOS is not running.");
+		return { t: "ok" };
+	};
+	// Timers never fire: only a host change can start the second attempt.
+	const done = applyLinkE2ee(host, VAULT, { suite: 0 }, { setTimer: () => 0, clearTimer: () => {} });
+	await new Promise((r) => setTimeout(r, 0));
+	assert.equal(host.commands.length, 1);
+	running = true;
+	host.emit(); // the engine came up
+	assert.equal(await done, "suite0");
+	assert.equal(host.commands.length, 2);
+});
+
 test("applyLinkE2ee: a definitive refusal is shown plainly and not retried; a moved identity is refused", async () => {
 	const host = new FakeUiHost({ identity: identityFor(VAULT) });
 	host.handler = () => { throw new Error("refused: this device has read an encryption key record for the vault"); };

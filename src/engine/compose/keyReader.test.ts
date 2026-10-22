@@ -88,6 +88,19 @@ async function cleanUp(clock: VirtualClock, d: SimDevice): Promise<Cleaned> {
 	return r;
 }
 
+test("pinSuite0 {link} sent as the engine starts, before k is read, waits for the read and answers ok", async () => {
+	const clock = new VirtualClock();
+	const net = new SimNet(clock, { linkMs: 2_000 });
+	const u = new SimDevice({ name: "U", clock, net, pin: null });
+	void u.start();
+	// The KeyReader is up (it posts key-missing "no-pin" before its first read); k's read takes a few 2 s links.
+	await wait(clock, "the reader runs", () => missing(u, "no-pin"));
+	const sent = clock.now();
+	const pin = u.runtime.command({ t: "pinSuite0", source: "link" });
+	assert.deepEqual(await settleWith(clock, pin), { t: "ok" }, "not refused as not read to head");
+	assert.ok(clock.now() - sent >= 2_000, `answered once k was read (${clock.now() - sent} ms)`);
+});
+
 test("pinSuite0 {link} is refused once k shows a record, and enableE2ee / pinSuite0 {create} off the creation path", async () => {
 	const clock = new VirtualClock();
 	const net = new SimNet(clock);

@@ -13,9 +13,10 @@ import type { RelaySession } from "../../ports/relay";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebHash } from "../adapters/webHash";
 import { sealFrame } from "../ingest/envelope";
-import { SimRelay } from "../../sim/relay";
+import { SIM_IDLE_ONLY_GROUP_COMMIT, SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
-import { converged, faultyCrypto, sleep, startTestEngine, until, createDoc, docText, editDoc } from "./testHarness";
+import { VirtualClock } from "../../sim/clock";
+import { converged, drive, faultyCrypto, sleep, startTestEngine, until, createDoc, docText, editDoc } from "./testHarness";
 
 const VAULT = "vault-test" as VaultId;
 const noop = createNoopCrypto(createWebHash());
@@ -25,8 +26,8 @@ const noop = createNoopCrypto(createWebHash());
  */
 const QUICK_FREEZE = { causalRetryMs: 60, causalRetries: 2, provisionalAdoptMs: 60 };
 
-async function live(...es: LogEngine[]): Promise<void> {
-	await until(() => es.every((e) => e.status().phase === "live"), 3_000, "live");
+async function live(es: LogEngine[], clock?: VirtualClock): Promise<void> {
+	await until(() => es.every((e) => e.status().phase === "live"), 3_000, "live", clock);
 }
 
 /** A raw relay member that appends hand-built frames (a buggy or malicious peer). */
@@ -51,7 +52,7 @@ test("quarantine: unknown-key rows freeze the doc, V still advances; releaseQuar
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", crypto: fc });
 	try {
-		await live(a, b);
+		await live([a, b]);
 		const id = await createDoc(a, "q.md", "base;");
 		await converged([a, b]);
 		const stream = a.streamOf(id);
@@ -91,7 +92,7 @@ test("quarantine: disallowed Yjs type from a peer freezes every reader; release 
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
 	const x = await rawDevice(relay);
 	try {
-		await live(a, b);
+		await live([a, b]);
 		const id = await createDoc(a, "evil.md", "fine;");
 		await converged([a, b]);
 		const stream = a.streamOf(id);
@@ -144,14 +145,17 @@ test("quarantine: disallowed Yjs type from a peer freezes every reader; release 
 });
 
 test("causal hole: missing structs -> re-read causalRetries times -> freeze causal-hole; the missing row thaws it, no release", async () => {
-	const relay = new SimRelay();
-	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: QUICK_FREEZE });
-	const x = await rawDevice(relay);
+	// Virtual time: the retry periods are exact, so "no re-freeze" below covers real periods, not a guess (DESIGN §d.6).
+	const clock = new VirtualClock();
+	const run = <T>(p: Promise<T>): Promise<T> => drive(p, clock);
+	const relay = new SimRelay({ clock });
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: QUICK_FREEZE, clock });
+	const x = await run(rawDevice(relay));
 	try {
-		await live(a);
-		const id = await createDoc(a, "hole.md", "doc;");
-		await until(() => a.isIdle(), 3_000, "idle");
-		await docText(a, id); // resident: the check stage runs at apply time
+		await live([a], clock);
+		const id = await run(createDoc(a, "hole.md", "doc;"));
+		await until(() => a.isIdle(), 3_000, "idle", clock);
+		await run(docText(a, id)); // resident: the check stage runs at apply time
 		const stream = a.streamOf(id);
 		const src = new Y.Doc();
 		const t = src.getText("text");
@@ -163,8 +167,8 @@ test("causal hole: missing structs -> re-read causalRetries times -> freeze caus
 		sink = u2;
 		t.insert(2, "c"); // depends on u1's structs
 		const reads0 = a.c.docs.stats.causalReads;
-		await x.send(stream, u2[0]!);
-		await until(() => a.c.repo.stream(stream)?.frozen === 1, 3_000, "frozen causal-hole");
+		await run(x.send(stream, u2[0]!));
+		await until(() => a.c.repo.stream(stream)?.frozen === 1, 3_000, "frozen causal-hole", clock);
 		assert.equal(a.c.repo.stream(stream)!.frozenReason, "causal-hole");
 		assert.equal(a.c.docs.stats.causalReads - reads0, 2, "re-read causalRetries times before freezing");
 		assert.ok(a.status().notices.some((n) => n.code === "frozen:causal-hole"));
@@ -172,58 +176,75 @@ test("causal hole: missing structs -> re-read causalRetries times -> freeze caus
 		assert.equal(a.c.repo.cursor.vaultSeq, relay.head());
 
 		const h0 = relay.head();
-		await x.send(stream, u1[0]!);
+		await run(x.send(stream, u1[0]!));
 		// The relay group-commits: wait for the row to commit, then for a to ingest it.
-		await until(() => relay.head() > h0 && a.c.repo.cursor.vaultSeq === relay.head() && a.c.live.idle, 3_000, "u1 ingested");
-		await until(() => a.c.repo.stream(stream)?.frozen === 0, 3_000, "thawed by the missing row");
+		await until(() => relay.head() > h0 && a.c.repo.cursor.vaultSeq === relay.head() && a.c.live.idle, 3_000, "u1 ingested", clock);
+		await until(() => a.c.repo.stream(stream)?.frozen === 0, 3_000, "thawed by the missing row", clock);
 		assert.ok(!a.status().notices.some((n) => n.code === "frozen:causal-hole"));
-		const text = await docText(a, id);
+		const text = await run(docText(a, id));
 		assert.ok(text.includes("abc") && text.includes("doc;"), text);
-		await sleep(200);
+		await sleep(10 * QUICK_FREEZE.causalRetryMs, clock); // ten retry periods
 		assert.equal(a.c.repo.stream(stream)!.frozen, 0, "no re-freeze once the hole is filled");
 	} finally {
 		x.close();
-		await a.stop();
+		await run(a.stop());
 	}
 });
 
 test("causal hole filled before the retries run out: no freeze", async () => {
-	const relay = new SimRelay();
-	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { causalRetryMs: 150, causalRetries: 3, provisionalAdoptMs: 225 } });
-	const x = await rawDevice(relay);
+	// Virtual time: the missing row arrives 60 ms after the hole was ingested, inside the 3 x 150 ms of retries, exactly
+	// (on a real clock a loaded machine could deliver it after the retries ran out). The relay commits each row 20 ms
+	// after it goes quiet: with the default group commit (>= 1 s between commits) both rows committed together and the
+	// engine never saw a hole.
+	const tuning = { causalRetryMs: 150, causalRetries: 3, provisionalAdoptMs: 225 };
+	const clock = new VirtualClock();
+	const run = <T>(p: Promise<T>): Promise<T> => drive(p, clock);
+	const relay = new SimRelay({ clock, groupCommit: { ...SIM_IDLE_ONLY_GROUP_COMMIT, idleMs: 20 } });
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning, clock });
+	const x = await run(rawDevice(relay));
 	try {
-		await live(a);
-		const id = await createDoc(a, "heal.md", "");
-		await until(() => a.isIdle(), 3_000, "idle");
-		await docText(a, id);
+		await live([a], clock);
+		const id = await run(createDoc(a, "heal.md", ""));
+		await until(() => a.isIdle(), 3_000, "idle", clock);
+		await run(docText(a, id));
 		const stream = a.streamOf(id);
 		const src = new Y.Doc();
 		const ups: Uint8Array[] = [];
 		src.on("update", (u: Uint8Array) => ups.push(u));
 		src.getText("text").insert(0, "12");
 		src.getText("text").insert(2, "3");
-		await x.send(stream, ups[1]!);
-		await sleep(60);
-		await x.send(stream, ups[0]!);
-		await until(async () => (await docText(a, id)) === "123", 3_000, "hole filled");
-		await sleep(600);
+		const reads0 = a.c.docs.stats.causalReads;
+		const h0 = relay.head();
+		await run(x.send(stream, ups[1]!));
+		await until(() => relay.head() > h0 && a.c.repo.cursor.vaultSeq === relay.head(), 3_000, "hole ingested", clock);
+		assert.equal(await run(docText(a, id)), "", "the dependent row alone applies nothing: a hole");
+		await sleep(60, clock);
+		await run(x.send(stream, ups[0]!));
+		await until(async () => (await docText(a, id)) === "123", 3_000, "hole filled", clock);
+		// A freeze would thaw on the fill too (CAUSAL-FREEZE), so the end state alone cannot show "never froze": the
+		// freeze comes with the causalRetries-th re-read, which never ran.
+		assert.ok(a.c.docs.stats.causalReads - reads0 < tuning.causalRetries, `re-reads ${a.c.docs.stats.causalReads - reads0}`);
+		await sleep(4 * tuning.causalRetryMs, clock); // past every retry the hole had armed
 		assert.equal(a.c.repo.stream(stream)!.frozen, 0);
 		assert.ok(!a.status().notices.some((n) => n.code.startsWith("frozen:")));
 	} finally {
 		x.close();
-		await a.stop();
+		await run(a.stop());
 	}
 });
 
 test("causal hole while offline: retries without a session do not count, no freeze; back online it re-reads then freezes", async () => {
-	const relay = new SimRelay();
-	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: QUICK_FREEZE });
-	const x = await rawDevice(relay);
+	// Virtual time: "ten retry periods offline" is exact, not a sleep the engine may not have run in.
+	const clock = new VirtualClock();
+	const run = <T>(p: Promise<T>): Promise<T> => drive(p, clock);
+	const relay = new SimRelay({ clock });
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: QUICK_FREEZE, clock });
+	const x = await run(rawDevice(relay));
 	try {
-		await live(a);
-		const id = await createDoc(a, "off.md", "doc;");
-		await until(() => a.isIdle(), 3_000, "idle");
-		await docText(a, id);
+		await live([a], clock);
+		const id = await run(createDoc(a, "off.md", "doc;"));
+		await until(() => a.isIdle(), 3_000, "idle", clock);
+		await run(docText(a, id));
 		const stream = a.streamOf(id);
 		const src = new Y.Doc();
 		const ups: Uint8Array[] = [];
@@ -231,19 +252,19 @@ test("causal hole while offline: retries without a session do not count, no free
 		src.getText("text").insert(0, "ab");
 		src.getText("text").insert(2, "c");
 		const h0 = relay.head();
-		await x.send(stream, ups[1]!);
-		await until(() => relay.head() > h0 && a.c.repo.cursor.vaultSeq === relay.head(), 3_000, "hole ingested");
+		await run(x.send(stream, ups[1]!));
+		await until(() => relay.head() > h0 && a.c.repo.cursor.vaultSeq === relay.head(), 3_000, "hole ingested", clock);
 		a.disconnect();
 		const reads0 = a.c.docs.stats.causalReads;
-		await sleep(600); // ten causalRetryMs (60 ms) periods, causalRetries = 2
+		await sleep(10 * QUICK_FREEZE.causalRetryMs, clock); // ten retry periods, causalRetries = 2
 		assert.equal(a.c.repo.stream(stream)!.frozen, 0, "offline: no freeze");
 		assert.equal(a.c.docs.stats.causalReads, reads0, "offline: no read counted");
-		await a.reconnect();
-		await until(() => a.c.repo.stream(stream)?.frozen === 1, 3_000, "frozen after reads online");
+		await run(a.reconnect());
+		await until(() => a.c.repo.stream(stream)?.frozen === 1, 3_000, "frozen after reads online", clock);
 		assert.equal(a.c.docs.stats.causalReads - reads0, 2);
 	} finally {
 		x.close();
-		await a.stop();
+		await run(a.stop());
 	}
 });
 
@@ -252,7 +273,7 @@ test("oversize-remote: valid rows pushing the text past MAX_DOC_TEXT_CHARS freez
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
 	const x = await rawDevice(relay);
 	try {
-		await live(a);
+		await live([a]);
 		const id = await createDoc(a, "huge.md", "");
 		await until(() => a.isIdle(), 3_000, "idle");
 		await docText(a, id);
@@ -283,7 +304,7 @@ test("quarantine: reader-dependent rows are retried automatically on the next se
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", crypto: fc });
 	try {
-		await live(a, b);
+		await live([a, b]);
 		const id = await createDoc(a, "r.md", "base;");
 		await converged([a, b]);
 		const stream = a.streamOf(id);
@@ -321,7 +342,7 @@ test("quarantine: a release whose snapshot predates a later row keeps the doc fr
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", crypto: fc });
 	try {
-		await live(a, b);
+		await live([a, b]);
 		const id = await createDoc(a, "s.md", "base;");
 		await converged([a, b]);
 		const stream = a.streamOf(id);
@@ -349,7 +370,7 @@ test("quarantine: a reader-dependent row this reader opens by the time it is sto
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", crypto: fc });
 	try {
-		await live(a, b);
+		await live([a, b]);
 		const id = await createDoc(a, "t.md", "base;");
 		await converged([a, b]);
 		// Bound on b: subscribed, so a's row arrives live (an unbound doc's rows are skipped and read: tReadPage).
@@ -392,7 +413,7 @@ test("quarantine: rows a catch-up page quarantined move the body version once re
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", crypto: fc });
 	try {
-		await live(a, b);
+		await live([a, b]);
 		const id = await createDoc(a, "u.md", "base;");
 		await converged([a, b]);
 		const stream = a.streamOf(id);

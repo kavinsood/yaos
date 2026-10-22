@@ -24,12 +24,14 @@ interface SetupOptions {
 	/** The state dirs the clone check finds (absent: no scan wired). */
 	readonly stateDirs?: () => Promise<readonly StoreDirActivity[]>;
 	readonly local?: Map<string, unknown>;
+	/** SimDevice's pinInPlace (default: the engine applies a suite-0 pin without a restart). */
+	readonly pinInPlace?: boolean;
 }
 
 function setup(initial: YaosPluginData = defaultPluginData("A"), o: SetupOptions = {}) {
 	const clock = new VirtualClock();
 	const net = new SimNet(clock, { linkMs: 10 });
-	const dev = new SimDevice({ name: "A", clock, net });
+	const dev = new SimDevice({ name: "A", clock, net, ...(o.pinInPlace === undefined ? {} : { pinInPlace: o.pinInPlace }) });
 	dev.secrets.available = o.secretsAvailable ?? true;
 	const saved: StoredPluginData[] = [];
 	const notices: string[] = [];
@@ -244,14 +246,25 @@ test("a key-less join: create and enableE2ee need the creation marker; a QR key 
 	assert.equal(w.dev.secrets.writes, 0, "an unverified key is not stored");
 	assert.equal(w.saved.length, 0, "and pins nothing");
 	assert.equal(w.dev.engineStarts, 1);
-	// §12.4 (ii): k read to head on this session and empty, keyringSeen unset: the engine says ok, main pins and restarts.
+	// §12.4 (ii): k read to head on this session and empty, keyringSeen unset: the engine says ok, main pins and the
+	// engine opens its gate in place (applyPin): the same engine goes live, no restart.
 	assert.deepEqual(await settle(w.clock, w.ctl.command({ t: "pinSuite0", source: "link" }), 100), { t: "ok" });
 	assert.deepEqual(w.ctl.data().e2ee, { suite: 0 });
 	assert.deepEqual(w.saved.at(-1)?.e2ee, { suite: 0 }, "saved");
-	assert.ok(await advanceUntil(w.clock, () => w.dev.engineStarts === 2 && w.ctl.status()?.phase === "live", 30_000), "restarted pinned, live");
+	assert.ok(await advanceUntil(w.clock, () => w.ctl.status()?.phase === "live", 30_000), "pinned in place, live");
+	assert.equal(w.dev.engineStarts, 1, "no second engine");
 	assert.equal(w.dev.engine?.config?.crypto.suite, 0);
 	await assert.rejects(w.ctl.command({ t: "pinSuite0", source: "link" }), (e: unknown) => e instanceof PinRefusedError && e.refusal === "already-pinned");
 	assert.equal(w.net.relay.rows(KEYRING_STREAM).length, 0);
+});
+
+test("pinSuite0 {link} on an engine that cannot pin in place: main restarts it pinned", async () => {
+	const w = await started(PAIRED, { pinInPlace: false });
+	assert.equal(w.dev.engineStarts, 1);
+	assert.deepEqual(await settle(w.clock, w.ctl.command({ t: "pinSuite0", source: "link" }), 100), { t: "ok" });
+	assert.deepEqual(w.saved.at(-1)?.e2ee, { suite: 0 }, "saved");
+	assert.ok(await advanceUntil(w.clock, () => w.dev.engineStarts === 2 && w.ctl.status()?.phase === "live", 30_000), "restarted pinned, live");
+	assert.equal(w.dev.engine?.config?.crypto.suite, 0);
 });
 
 test("a suite-0 device takes no key: installKey refused on main, keyringChanged refused unstored", async () => {
