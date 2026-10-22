@@ -189,6 +189,10 @@ export class ComposedLog implements LogPort {
 
 	// ---- LogPort writes ----------------------------------------------------------
 
+	assertWritable(): void {
+		this.log.c.assertWritable();
+	}
+
 	async submitNs(ops: readonly NsOp[], opts?: SubmitNsOptions): Promise<void> {
 		if (ops.length === 0) return;
 		try {

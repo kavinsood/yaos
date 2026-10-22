@@ -95,7 +95,7 @@ export class StubLog implements LogPort {
 	onAcquire: ((docId: DocId) => void) | null = null;
 	/** Called as commitEdits starts, before the frame closes (inject editor keystrokes racing a merge). */
 	onCommitEdits: ((docId: DocId) => void) | null = null;
-	/** Non-null: the engine's write gate is shut (e2ee-design §9.3): assertWritable and commitEdits throw KeyMissingError. */
+	/** Non-null: the engine's write gate is shut (e2ee-design §9.3): assertWritable, submitNs and commitEdits throw KeyMissingError. */
 	writeGate: KeyMissingReason | null = null;
 	/** "cork", "uncork", "ns live|held" (submitNs), "frame <docId>" (commitEdits), in order. */
 	readonly trace: string[] = [];
@@ -194,7 +194,12 @@ export class StubLog implements LogPort {
 		};
 	}
 
+	assertWritable(): void {
+		if (this.writeGate !== null) throw new KeyMissingError(this.writeGate);
+	}
+
 	async submitNs(ops: readonly NsOp[], opts?: SubmitNsOptions): Promise<void> {
+		if (ops.length > 0) this.assertWritable();
 		if (ops.length > 0) this.trace.push(opts?.liveCreates === true ? "ns live" : "ns held");
 		this.submitted.push(...ops);
 		this.pending.push(...ops);

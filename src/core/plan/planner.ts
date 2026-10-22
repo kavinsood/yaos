@@ -821,7 +821,23 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		if (l?.excluded) return push(prefix);
 		// The file at a path an observed rename left may be new: no merge into the doc before inference (ns ready).
 		if (l && !found.atRemote && !ctx.nsReady && renamedFrom.has(s.pathKey)) return push(prefix);
-		if (r?.body?.frozen) return push([...prefix, waitOp(s.docId, "frozen")]);
+		if (r?.body?.frozen) {
+			// The doc waits, and so does whatever happened to its file (sim suite-1 wipe/revoke/roll seed 40: a doc frozen
+			// key-missing, edited and renamed; the renamed file was created anew and the doc deleted once it thawed). Its
+			// renamed file (inference) is still this doc's: never a new create meanwhile. And a file gone from a complete
+			// listing is recorded as liveMissing records it (fileGone, the observed rename kept on S): the pass that drops
+			// the observed renames from memory must not take the rename with it, or the thawed doc reads as deleted.
+			const inf = l ? undefined : inferred.get(s0.docId);
+			if (inf) claimed.add(inf.to.pathKey);
+			push([...prefix, waitOp(s.docId, "frozen")]);
+			if (!l && r.state === "live" && !s.fileGone && input.localComplete) {
+				const { renamedTo: _to, ...rest } = s;
+				const away = renamedAway(input.renames, s.pathKey, pk);
+				push([{ op: "syncedPut", entry: { ...rest, fileGone: true, ...(away ? { renamedTo: away } : {}) } }],
+					"nsDelete", brakeKey("nsDelete", s.docId, s.path, s.contentHash), s.path);
+			}
+			return;
+		}
 		if (l && l.hash === null) return push([...prefix, { op: "needHash", path: l.path }]);
 		if (!r) return pruned(s, l, prefix);
 		if (r.state === "deleted") return deleted(s, s0.docId, r, l, prefix);

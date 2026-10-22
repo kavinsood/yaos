@@ -156,6 +156,10 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 		}
 		ns.push(nsOp);
 	}
+	// The gate first: a born-empty record committed for a create submitNs then refuses (key-missing) is S for a doc no
+	// ns op names. The pass after reads it as a pruned doc's record at the file's path, which hides the file from
+	// rename inference: a frozen doc's renamed file became a delete + a create (sim suite-1 wipe/revoke/roll seed 40).
+	if (ns.length > 0) ctx.log.assertWritable?.();
 	if (born.length > 0) await ctx.commit({ syncedPut: born });
 	const live = new Set<DocId>();
 	if (ctx.liveCreates) for (const o of ns) if (o.t === "create" && o.kind !== "blob" && o.contentHash !== EMPTY_CONTENT_HASH) live.add(o.docId);

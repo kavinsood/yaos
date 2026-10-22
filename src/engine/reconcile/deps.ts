@@ -118,6 +118,11 @@ export interface LogPort {
 	 */
 	submitNs(ops: readonly NsOp[], opts?: SubmitNsOptions): Promise<void>;
 	/**
+	 * Throws (KeyMissingError) while the write gate is shut (e2ee-design §9.3), as submitNs would. The runner asks
+	 * before it commits anything for ns ops (the born-empty records of creates). Optional: a log without a gate.
+	 */
+	assertWritable?(): void;
+	/**
 	 * Hold own ns frames back from the wire until the returned release (idempotent), at most NS_CORK_MAX_MS:
 	 * a pass's live creates then leave with their initial body frames (DESIGN §d.4).
 	 */

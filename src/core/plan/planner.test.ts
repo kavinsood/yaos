@@ -835,6 +835,26 @@ test("row frozen body: wait(frozen), nothing else", () => {
 	assert.deepEqual(run({ remote: [R("d1", "a.md", { body })] }).ops, [{ op: "wait", docId: "d1", reason: "frozen" }]);
 });
 
+test("row frozen body, file renamed and edited: the renamed file is still the doc's, and S keeps the rename", () => {
+	// Sim suite-1 wipe/revoke/roll seed 40: a doc frozen key-missing, its file renamed and edited. The renamed file was
+	// created as a new doc, and the pass that dropped the observed rename left the thawed doc reading as deleted.
+	const body = { ...R("d1", "a.md").body!, frozen: true, version: V(99) };
+	const sc = { remote: [R("d1", "a.md", { body })], synced: [S("d1", "a.md")], local: [L("b.md", h("c9"))] };
+	const p = run({ ...sc, over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] } });
+	assert.ok(!opsOf(p).includes("nsCreate"), JSON.stringify(p.ops));
+	assert.deepEqual(p.ops[0], { op: "wait", docId: "d1", reason: "frozen" });
+	const put = find(p, "syncedPut").entry;
+	assert.equal(put.fileGone, true);
+	assert.deepEqual(put.renamedTo, { to: "b.md", atMs: 1 });
+	// The next pass, the observed rename gone from memory: the one S kept still claims the file.
+	const next = run({ ...sc, synced: [{ ...S("d1", "a.md"), fileGone: true, renamedTo: { to: "b.md" as SyncedEntry["path"], atMs: 1 } }] });
+	assert.deepEqual(next.ops, [{ op: "wait", docId: "d1", reason: "frozen" }]);
+	// No rename observed and the file gone from a complete listing: recorded as gone, never a create.
+	const gone = run({ ...sc, local: [] });
+	assert.equal(find(gone, "syncedPut").entry.fileGone, true);
+	assert.equal(find(gone, "syncedPut").entry.renamedTo, undefined);
+});
+
 // ---------------------------------------------------------------------------
 // Worked examples and fold duties
 // ---------------------------------------------------------------------------

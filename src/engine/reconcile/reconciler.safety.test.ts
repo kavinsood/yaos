@@ -250,3 +250,21 @@ test("write gate shut (key-missing): a merge job fails before it edits the repli
 		if (path === "m.md") assert.equal(w.log.text(id), after);
 	}
 });
+
+test("write gate shut (key-missing): a create commits no born-empty synced record before the ns op is refused; it is created once writes are back", async () => {
+	// Sim suite-1 wipe/revoke/roll seed 40: the born-empty S of a create submitNs refused stayed, an S for a doc no ns
+	// op names. The next pass read it as a pruned doc's record at the file's path, which hid the file from rename
+	// inference: a frozen doc's renamed file became a delete and a create.
+	const w = new World();
+	await w.boot();
+	w.log.writeGate = "revoked-epoch";
+	w.vault.userWrite("notes/new.md", "new\n");
+	await assert.rejects(w.sync(3), KeyMissingError, "the pass fails on the gate");
+	assert.equal(w.log.submitted.length, 0, "no ns op went out");
+	assert.equal([...w.r.ctx.store.synced.values()].some((s) => s.path === "notes/new.md"), false, "no synced record for the refused create");
+	w.log.writeGate = null;
+	await w.sync();
+	const id = [...w.r.ctx.store.synced.values()].find((s) => s.path === "notes/new.md")?.docId;
+	assert.ok(id, "created once writes are back");
+	assert.equal(w.log.text(id), "new\n");
+});
