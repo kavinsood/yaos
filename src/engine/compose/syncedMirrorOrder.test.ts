@@ -92,12 +92,12 @@ test("recovery: a doc the outbox mirror lists as unmirrored is imported with no 
 	assert.equal(none.get(rec.docId), rec.contentHash);
 });
 
-test("recovery: a record's decided delete, kept rename and held content come back with it (mirror format 2)", async () => {
+test("recovery: a record's decided delete, kept rename and held edit (hash, text, base) come back with it", async () => {
 	// Sim suite-1 wipe/revoke/roll seeds 40 and 112: a store lost after the user renamed (or edited, then renamed) a
 	// file this device could not publish came back as a plain sync point; the moved file read as a new doc and the
 	// old one was put back at its path.
 	const marked: SyncedRecord = {
-		...rec, fileGone: true, renamedTo: { to: "b/renamed.md" as VaultPath, atMs: 1_759_600_000_123 }, heldHash: "cd".repeat(32) as ContentHash,
+		...rec, fileGone: true, renamedTo: { to: "b/renamed.md" as VaultPath, atMs: 1_759_600_000_123 }, held: { hash: "cd".repeat(32) as ContentHash, text: "one\nthree\n", base: "one\ntwo\nthree\n" },
 	};
 	const identity = { vaultId: "v", vaultEpoch: "e", deviceId: "dev" } as MirrorIdentity;
 	const hash = createWebHash();
@@ -110,7 +110,7 @@ test("recovery: a record's decided delete, kept rename and held content come bac
 	assert.equal(await importSyncedMirror({ db, side, hash, identity, pathKey: (p) => p as PathKey, nowMs: 1 }), 1);
 	const [row] = await db.tx([STORE.synced], "readonly", (tx) => tx.getAll(STORE.synced));
 	db.close();
-	assert.deepEqual({ gone: row?.fileGone, to: row?.renamedTo, held: row?.heldHash }, { gone: true, to: marked.renamedTo, held: marked.heldHash });
+	assert.deepEqual({ gone: row?.fileGone, to: row?.renamedTo, held: row?.held }, { gone: true, to: marked.renamedTo, held: marked.held });
 	assert.equal(row?.contentHash, rec.contentHash);
 	assert.equal(row?.bodyVersion, null, "still no CRDT sync point (§i.5 step 3)");
 });

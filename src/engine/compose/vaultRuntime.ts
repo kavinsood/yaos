@@ -572,7 +572,7 @@ export class VaultRuntime {
 			throw e;
 		} finally {
 			// What a record keeps of a file this device could not publish yet (a decided delete, the user's rename, an
-			// edit the write gate refused: SyncedEntry fileGone, renamedTo, heldHash) lives in the store alone until the
+			// edit the write gate refused: SyncedEntry fileGone, renamedTo, held) lives in the store alone until the
 			// synced mirror has it. It goes there now, not a debounce later: a store lost in between recovered the record
 			// without it, and the moved file read as a new doc beside the old one put back (sim suite-1 wipe/revoke/roll
 			// seed 40). A pass the write gate stopped commits it before it throws (runner keepObservedRenames).
@@ -676,11 +676,11 @@ export class VaultRuntime {
 		return `${n}:${h}`;
 	}
 
-	/** The records' fileGone / renamedTo / heldHash (runPass: the synced mirror takes them at once). */
+	/** The records' fileGone / renamedTo / held (runPass: the synced mirror takes them at once). */
 	private keptSignature(): string {
 		const parts: string[] = [];
 		for (const s of this.rec.ctx.store.synced.values()) {
-			if (s.fileGone || s.renamedTo || s.heldHash !== undefined) parts.push(`${s.docId}|${s.fileGone ? 1 : 0}|${s.renamedTo?.to ?? ""}|${s.heldHash ?? ""}`);
+			if (s.fileGone || s.renamedTo || s.held) parts.push(`${s.docId}|${s.fileGone ? 1 : 0}|${s.renamedTo?.to ?? ""}|${s.held?.hash ?? ""}|${s.held?.text !== undefined ? 1 : 0}`);
 		}
 		return parts.sort().join("\n");
 	}

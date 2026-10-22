@@ -141,23 +141,18 @@ one liveness timeout and one resource bound.
   example by batch refresh, or a faster retire rate after a flood) or the heal waits out the designed fallback. The
   second would relax the liveness bound. Both are for the owner to decide.
 
-### SIM-S1-HELD-EDIT-UNOBSERVED-RENAME: a key-missing edit, then a rename and an edit nobody saw
-
-- **Repro.** `gated-edit-renamed-and-edited-unobserved.json` (suite-1 wipe/revoke/roll seed 112, 30 steps; base).
-- **What happens.** B, key-missing after a revoke, deletes a canvas record (the merge is refused: kept as
-  `SyncedEntry.heldHash`). Its store is wiped (mirrors kept). While the app is down the canvas is renamed c0 -> c5
-  and edited again. Back up, c5 pairs with nothing (its hash is neither S's nor the held one): delete + create.
-  A peer had edited c0, so edit beats delete restores the doc at c0, with the record B deleted.
-- **Not data loss.** Every text B wrote is in c5 (a doc of its own); c0 holds the peer's edit. The invariant flags
-  the deleted record back in its doc.
-- **Why open.** Pairing the files needs similarity inference, which DESIGN §f.6 rejects (non-deterministic,
-  expensive). The held edit could be published when the gate opens if the store (and the synced mirror) kept its
-  text, not just its hash: a format and design change for the owner to decide.
-
 ## Landed on `sim-port` since 33bdf49b
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SIM-S1-HELD-EDIT-UNOBSERVED-RENAME** (`fix-held-text`, suite-1 wipe/revoke/roll seed 112): B, key-missing after a
+  revoke, deleted a canvas record (merge refused, only its hash kept); its store was wiped (mirrors kept); the canvas
+  was renamed and edited again unobserved; c5 paired with nothing and a peer's edit restored c0 with the record B
+  deleted. The refused edit's text and base are now kept on the synced record and in the synced mirror
+  (`SyncedEntry.held`, mirror format 3, DB schema 3; bounded by `HELD_TEXT_MAX_CHARS`, past it the hash alone), and a
+  doc whose file is gone publishes it (`reconcileContent(held)`) before its absence is decided (DESIGN §f.6 "Held
+  edits"). Plan `src/sim/regressions/gated-edit-renamed-and-edited-unobserved.json`, tests in
+  `src/engine/reconcile/reconciler.safety.test.ts` and `src/core/plan/planner.test.ts`.
 - **SIM-GATED-RESIDENCY** (`fix-refold`, soak seed 2006566456, invariant 6 "5 resident docs, budget 3"): an engine
   bound violation, not a tolerance issue. While C waited revoked-epoch for its QR, each pass's merge jobs applied the
   disk diff to the replica and then failed in `commitEdits` on the write gate; the edit stayed in the frame builder,

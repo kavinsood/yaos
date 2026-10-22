@@ -92,15 +92,19 @@ const FULL_SYNCED: SyncedMirror = {
 		{ docId: D("doc1"), path: "Notes/Über ünïcödé/日本語 🎉.md", kind: "markdown", contentHash: HASH_A, nsTouchSeq: 1, bodyRemoteSeq: 2 ** 33, blobRev: 0 },
 		{ docId: D("doc2"), path: "Boards/plan.canvas", kind: "canvas", contentHash: HASH_B, nsTouchSeq: 0, bodyRemoteSeq: 0, blobRev: 0 },
 		{ docId: D("doc3"), path: "attachments/ﬁle Ω.png", kind: "blob", contentHash: HASH_A, nsTouchSeq: 77, bodyRemoteSeq: 0, blobRev: 128 },
-		// Format 2: a decided delete, the user's rename that took the file away, the content a refused commit left.
+		// A decided delete, the user's rename that took the file away, an edit the write gate refused (its hash, and its
+		// text and base while kept).
 		{ docId: D("doc4"), path: "gone.md", kind: "markdown", contentHash: HASH_A, nsTouchSeq: 3, bodyRemoteSeq: 4, blobRev: 0, fileGone: true },
 		{
 			docId: D("doc5"), path: "Boards/old.canvas", kind: "canvas", contentHash: HASH_B, nsTouchSeq: 5, bodyRemoteSeq: 6, blobRev: 0,
-			fileGone: true, renamedTo: { to: "Boards/Ünï new.canvas", atMs: 1_759_600_000_123 }, heldHash: HASH_A,
+			fileGone: true, renamedTo: { to: "Boards/Ünï new.canvas", atMs: 1_759_600_000_123 }, held: { hash: HASH_A },
 		},
-		{ docId: D("doc6"), path: "held.md", kind: "markdown", contentHash: HASH_B, nsTouchSeq: 7, bodyRemoteSeq: 8, blobRev: 0, heldHash: HASH_A },
+		{
+			docId: D("doc6"), path: "held.md", kind: "markdown", contentHash: HASH_B, nsTouchSeq: 7, bodyRemoteSeq: 8, blobRev: 0,
+			held: { hash: HASH_A, text: "one\nthree 日本語 🎉\n", base: "" },
+		},
 	],
-	// Format 2: the previous epoch's renames not published yet (MetaPathMove).
+	// The previous epoch's renames not published yet (MetaPathMove).
 	moves: [
 		{ from: "Boards/c3.canvas", to: "Ünï/c5.canvas", atMs: 1_759_600_000_456 },
 		{ from: "a.md", to: "b.md", atMs: 0 },
@@ -122,7 +126,7 @@ interface Forge {
 	kindCode?: (i: number, real: number) => number;
 	countDelta?: number;
 	trailing?: Uint8Array;
-	/** Synced mirror format 2: every entry's flags byte. */
+	/** Synced mirror: every entry's flags byte. */
 	syncedFlags?: number;
 }
 
@@ -163,15 +167,14 @@ function syncedBody(m: SyncedMirror, forge: Forge = {}): Uint8Array {
 		const code = KIND_CODES[e.kind];
 		w.varstring(e.docId).varstring(e.path).u8(forge.kindCode ? forge.kindCode(i, code) : code).raw(hexToBytes(e.contentHash));
 		w.varuint(e.nsTouchSeq).varuint(e.bodyRemoteSeq).varuint(e.blobRev);
-		if ((forge.version ?? MIRROR_FORMAT_VERSION) < 2) return;
-		w.u8(forge.syncedFlags ?? ((e.fileGone ? 1 : 0) | (e.renamedTo ? 2 : 0) | (e.heldHash ? 4 : 0)));
+		const texts = e.held?.text !== undefined;
+		w.u8(forge.syncedFlags ?? ((e.fileGone ? 1 : 0) | (e.renamedTo ? 2 : 0) | (e.held ? 4 : 0) | (texts ? 8 : 0)));
 		if (e.renamedTo) w.varstring(e.renamedTo.to).varuint(e.renamedTo.atMs);
-		if (e.heldHash) w.raw(hexToBytes(e.heldHash));
+		if (e.held) w.raw(hexToBytes(e.held.hash));
+		if (texts) w.varstring(e.held.text).varstring(e.held.base!);
 	});
-	if ((forge.version ?? MIRROR_FORMAT_VERSION) >= 2) {
-		w.varuint(m.moves?.length ?? 0);
-		for (const mv of m.moves ?? []) w.varstring(mv.from).varstring(mv.to).varuint(mv.atMs);
-	}
+	w.varuint(m.moves?.length ?? 0);
+	for (const mv of m.moves ?? []) w.varstring(mv.from).varstring(mv.to).varuint(mv.atMs);
 	if (forge.trailing) w.raw(forge.trailing);
 	return w.finish();
 }
@@ -380,20 +383,14 @@ describe("synced mirror codec", () => {
 	it("rejects bad magic, an outbox-mirror file, and unsupported versions", async () => {
 		assert.equal(await decodeSyncedMirror(withChecksum(syncedBody(FULL_SYNCED, { magic: OUTBOX_MIRROR_MAGIC })), sha), null);
 		assert.equal(await decodeSyncedMirror(await encodeOutboxMirror(FULL_OUTBOX, sha), sha), null);
-		for (const version of [0, 3]) {
-			assert.equal(await decodeSyncedMirror(withChecksum(syncedBody(FULL_SYNCED, { version })), sha), null);
+		for (const version of [0, 1, 2, 4]) {
+			assert.equal(await decodeSyncedMirror(withChecksum(syncedBody(FULL_SYNCED, { version })), sha), null, `version ${version}`);
 		}
-	});
-
-	it("still reads format 1 (no per-entry flags, no moves): the records carry no decided delete, rename or held content", async () => {
-		const { moves: _moves, ...rest } = FULL_SYNCED;
-		const v1: SyncedMirror = { ...rest, entries: FULL_SYNCED.entries.slice(0, 3) };
-		assert.deepEqual(await decodeSyncedMirror(withChecksum(syncedBody(v1, { version: 1 })), sha), v1);
 	});
 
 	it("rejects unknown entry flags", async () => {
 		const plain: SyncedMirror = { ...FULL_SYNCED, entries: FULL_SYNCED.entries.slice(0, 1) };
-		for (const syncedFlags of [8, 0x80, 0xff]) {
+		for (const syncedFlags of [8, 9, 16, 0x80, 0xff]) { // 8: held texts without a held hash
 			assert.equal(await decodeSyncedMirror(withChecksum(syncedBody(plain, { syncedFlags })), sha), null, `flags ${syncedFlags}`);
 		}
 	});

@@ -113,6 +113,11 @@ export const ROLL_OWN_SEALS = 2 ** 22;
 export const MAX_DOC_TEXT_CHARS = 8 * 1024 * 1024;
 export const MAX_BASE_TEXT_CHARS = 4 * 1024 * 1024;
 /**
+ * Held edits (SyncedEntry.held, DESIGN §f.6): the text + base chars kept over all synced records together. They live
+ * in memory with the synced records and ride every synced mirror write. Past it a held edit keeps its hash only.
+ */
+export const HELD_TEXT_MAX_CHARS = 1024 * 1024;
+/**
  * Largest input core's synchronous pure-JS SHA-256 (core/hash/sha256.ts) takes; above it, it throws. It runs on the
  * engine thread and blocks it for the whole digest: ~3 ms per MiB (316 ms for 100 MB, against 42 ms through
  * WebCrypto, which does not block). Everything else (file, blob, canvas, config, snapshot content, brake ids) is

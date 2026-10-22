@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { VaultPath } from "../../core/types";
 import { World } from "./testkit/world";
 import { KeyMissingError } from "../keyring/writeGate";
+import { HELD_TEXT_MAX_CHARS } from "../../core/limits";
 
 const P = (s: string): VaultPath => s;
 
@@ -293,7 +294,7 @@ test("write gate shut (key-missing): a bound replica's unframed typing is never 
 	assert.equal(w.log.text(id), "one\n");
 });
 
-test("write gate shut (key-missing): an edit the gate refused is kept on the synced record (heldHash) and pairs the file renamed while the app was down", async () => {
+test("write gate shut (key-missing): an edit the gate refused is kept on the synced record (held) and pairs the file renamed while the app was down", async () => {
 	// Sim suite-1 wipe/revoke/roll seed 112: key-missing after a revoke, B deleted a canvas record (the merge refused);
 	// the canvas was then renamed while the app was down. By S's content the renamed file was new: a delete + a create,
 	// and a peer's edit restored the doc at its old path with the record B had deleted.
@@ -307,7 +308,7 @@ test("write gate shut (key-missing): an edit the gate refused is kept on the syn
 	await assert.rejects(w.sync(3), KeyMissingError);
 	const held = w.synced(id)!;
 	assert.equal(held.contentHash, base, "S stays the merge base");
-	assert.ok(held.heldHash !== undefined && held.heldHash !== base, "the refused content is kept");
+	assert.ok(held.held !== undefined && held.held.hash !== base, "the refused content is kept");
 	w.vault.userRename("a.md", "b.md"); // the event dies with the app
 	await w.crashAndReboot();
 	w.log.writeGate = null;
@@ -318,7 +319,102 @@ test("write gate shut (key-missing): an edit the gate refused is kept on the syn
 	assert.equal(w.log.text(id), "one\nthree\nfour\n", "the delete merged against the synced base");
 	assert.deepEqual(w.conflictCopies(), []);
 	assert.equal([...w.log.view().remote.values()].filter((r) => r.state === "live").length, 1, "no new doc");
-	assert.equal(w.synced(id)!.heldHash, undefined, "dropped with the next sync point");
+	assert.equal(w.synced(id)!.held, undefined, "dropped with the next sync point");
+});
+
+/** Gate shut, the user's edit refused, the store wiped (mirrors kept), the file renamed and edited again while down. */
+async function heldThenRenamedAndEdited(path: string, text: string, edit: string, moved: string, again: string) {
+	const w = new World();
+	await w.boot();
+	const id = w.log.remoteCreate(P(path), text);
+	await w.sync();
+	const base = w.synced(id)!.contentHash;
+	w.log.writeGate = "revoked-epoch";
+	w.vault.userWrite(path, edit);
+	await assert.rejects(w.sync(3), KeyMissingError);
+	const kept = w.synced(id)!.held;
+	assert.equal(w.synced(id)!.contentHash, base, "S stays the merge base");
+	await w.wipeAndRebootFromMirror();
+	assert.deepEqual(w.synced(id)!.held, kept, "the held edit, text and base, came back from the synced mirror");
+	assert.equal(w.synced(id)!.hasBase, false, "no stored base after the wipe: the held edit carries its own");
+	await assert.rejects(w.sync(3), KeyMissingError); // still key-missing: nothing is decided about the gone file
+	w.vault.userRename(path, moved);
+	w.vault.userWrite(moved, again);
+	await w.crashAndReboot(); // the events die with the app
+	return { w, id, kept };
+}
+
+test("held edit (markdown): the refused edit's text and base are kept, survive a wipe, and publish once the gate opens", async () => {
+	// Sim suite-1 wipe/revoke/roll seed 112, as a note. The file renamed and edited again pairs with nothing (neither
+	// S's hash nor the held one): a delete + a create. A peer's edit makes it edit beats delete, which put the doc back
+	// at its old path with the line the user had removed.
+	const { w, id, kept } = await heldThenRenamedAndEdited("a.md", "one\ntwo\nthree\nfour\n", "one\nthree\nfour\n", "b.md", "one\nthree\nfour\nfive\n");
+	assert.equal(kept?.text, "one\nthree\nfour\n");
+	assert.equal(kept?.base, "one\ntwo\nthree\nfour\n");
+	w.log.writeGate = null;
+	w.log.remoteEdit(id, (t) => t.insert(t.length, "peer\n"));
+	await w.sync();
+	assert.equal(w.log.text(id), "one\nthree\nfour\npeer\n", "the held edit is in the doc: the removed line stays removed");
+	assert.equal(w.vault.text("a.md"), "one\nthree\nfour\npeer\n", "edit beats delete, with the held edit");
+	assert.equal(w.vault.text("b.md"), "one\nthree\nfour\nfive\n");
+	assert.deepEqual(w.conflictCopies(), []);
+	assert.equal(w.synced(id)!.held, undefined, "cleared by the publish");
+});
+
+test("held edit (markdown): published with no peer edit, the gone file is the user's delete; nothing is put back", async () => {
+	const { w, id } = await heldThenRenamedAndEdited("a.md", "one\ntwo\nthree\n", "one\nthree\n", "b.md", "one\nthree\nmore\n");
+	w.log.writeGate = null;
+	await w.sync();
+	assert.equal(w.log.text(id), "one\nthree\n", "the held edit was published before the delete");
+	assert.equal(w.log.view().remote.get(id)?.state, "deleted");
+	assert.equal(w.vault.text("a.md"), null);
+	assert.equal(w.vault.text("b.md"), "one\nthree\nmore\n");
+	assert.equal(w.synced(id), undefined);
+});
+
+test("held edit (canvas): a record deleted while key-missing stays deleted after a wipe, an unobserved rename + edit and a peer's edit", async () => {
+	// Sim suite-1 wipe/revoke/roll seed 112 (src/sim/regressions/gated-edit-renamed-and-edited-unobserved.json).
+	const node = (id: string, text: string): Record<string, unknown> => ({ id, type: "text", text, x: 0, y: 0, width: 100, height: 50 });
+	const board = (...ids: string[]): string => JSON.stringify({ nodes: ids.map((i) => node(i, i.toUpperCase())), edges: [] }, null, "\t");
+	const { w, id, kept } = await heldThenRenamedAndEdited("c0.canvas", board("a", "b", "c"), board("a", "c"), "c5.canvas", board("a", "c", "d"));
+	assert.ok(kept?.text !== undefined && kept.base !== undefined, "canvas: the file text and the base merge text are kept");
+	w.log.writeGate = null;
+	w.log.remoteEditCanvas(id, (d) => {
+		const m = d.getMap<unknown>("nodes").get("a") as { get(k: string): { insert(i: number, s: string): void; length: number } };
+		const t = m.get("text");
+		t.insert(t.length, "!");
+	});
+	await w.sync();
+	const ids = (path: string): string[] => (JSON.parse(w.vault.text(path) ?? "{\"nodes\":[]}") as { nodes: { id: string }[] }).nodes.map((n) => n.id).sort();
+	assert.deepEqual(ids("c0.canvas"), ["a", "c"], "the record B deleted is not back in the doc");
+	assert.match(w.vault.text("c0.canvas")!, /A!/, "with the peer's edit");
+	assert.deepEqual(ids("c5.canvas"), ["a", "c", "d"]);
+	assert.deepEqual(w.conflictCopies(), []);
+});
+
+test("held edit: the texts are kept within HELD_TEXT_MAX_CHARS over all records; past it the hash alone, the file untouched", async () => {
+	const w = new World();
+	await w.boot();
+	// a's text + base fill the bound but for a char: with b's small held edit kept first, a's no longer fits.
+	const big = "x".repeat(Math.floor((HELD_TEXT_MAX_CHARS - 5) / 2) - 1) + "\n";
+	const a = w.log.remoteCreate(P("a.md"), big);
+	const b = w.log.remoteCreate(P("b.md"), "one\ntwo\n");
+	await w.sync();
+	w.log.writeGate = "revoked-epoch";
+	w.vault.userWrite("b.md", "one\n");
+	await assert.rejects(w.sync(3), KeyMissingError);
+	assert.deepEqual(w.synced(b)!.held?.text, "one\n", "within the bound: kept with its text");
+	w.vault.userWrite("a.md", big + "tail\n");
+	await assert.rejects(w.sync(3), KeyMissingError);
+	const ha = w.synced(a)!.held;
+	assert.ok(ha !== undefined && ha.text === undefined && ha.base === undefined, "past the bound: the hash alone");
+	assert.equal(w.vault.text("a.md"), big + "tail\n", "nothing is lost: the file holds the edit");
+	w.log.writeGate = null;
+	await w.sync();
+	assert.equal(w.log.text(a), big + "tail\n");
+	assert.equal(w.log.text(b), "one\n", "published by the ordinary merge once the gate opened");
+	assert.equal(w.synced(a)!.held, undefined);
+	assert.equal(w.synced(b)!.held, undefined);
 });
 
 test("write gate shut (key-missing): a pass the gate stops at another doc's ns op still marks a file gone from its record", async () => {

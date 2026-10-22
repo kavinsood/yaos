@@ -37,7 +37,7 @@ export function toMirrorEntry(s: SyncedRecord): SyncedMirrorEntry {
 	return {
 		docId: s.docId, path: s.path, kind: s.kind, contentHash: s.contentHash, nsTouchSeq: s.nsTouchSeq,
 		bodyRemoteSeq: s.bodyVersion?.remoteSeq ?? 0, blobRev: s.blobRev,
-		...(s.fileGone ? { fileGone: true as const } : {}), ...(s.renamedTo ? { renamedTo: s.renamedTo } : {}), ...(s.heldHash !== undefined ? { heldHash: s.heldHash } : {}),
+		...(s.fileGone ? { fileGone: true as const } : {}), ...(s.renamedTo ? { renamedTo: s.renamedTo } : {}), ...(s.held ? { held: s.held } : {}),
 	};
 }
 
@@ -46,7 +46,7 @@ export function fromMirrorEntry(e: SyncedMirrorEntry, pk: PathKeyFn, nowMs: numb
 		docId: e.docId, path: e.path, pathKey: pk(e.path), kind: e.kind, contentHash: e.contentHash, fingerprint: "" as DiskFingerprint,
 		size: -1, mtimeMs: 0, bodyVersion: null, blobRev: e.blobRev,
 		nsTouchSeq: e.nsTouchSeq, hasBase: false, syncedAtMs: nowMs,
-		...(e.fileGone ? { fileGone: true as const } : {}), ...(e.renamedTo ? { renamedTo: e.renamedTo } : {}), ...(e.heldHash !== undefined ? { heldHash: e.heldHash } : {}),
+		...(e.fileGone ? { fileGone: true as const } : {}), ...(e.renamedTo ? { renamedTo: e.renamedTo } : {}), ...(e.held ? { held: e.held } : {}),
 	};
 }
 

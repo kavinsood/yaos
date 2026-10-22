@@ -34,6 +34,7 @@ import type { SyncedRecord } from "../store/schema";
 import { conflictCopy, fetchBlob, pushBlob } from "./blobJobs";
 import { diskMaterializeCanvas } from "./canvasJob";
 import { diskMaterialize, diskRename, diskTrash, rebind, syncedDrop, syncedPut, type Env, type JobOutcome } from "./diskJobs";
+import { keepHeld } from "./heldJob";
 import { reconcileContent } from "./mergeJob";
 import type { LogPort } from "./deps";
 
@@ -123,17 +124,12 @@ async function keepObservedRenames(env: Env, ns: readonly NsOp[], ops: readonly 
 
 /**
  * A content merge the write gate refused (key missing): the file's content stays out of the log and S stays the merge
- * base, so the next pass merges it again. Record that content on S (`heldHash`): rename inference pairs the file by
- * it, otherwise a file edited and then renamed before this device could write again, or while the app was down after
- * the store was lost (the synced mirror carries it), reads as a delete + a create, and a peer's edit restores the doc
- * at its old path with what the user had removed (sim suite-1 wipe/revoke/roll seed 112).
+ * base, so the next pass merges it again. The merge jobs keep it on S with its text (heldJob.ts); a refusal before the
+ * job read the file (or of a held publish) leaves at least its hash: rename inference pairs the file by it.
  */
 async function keepHeldContent(env: Env, docId: DocId, path: VaultPath): Promise<void> {
-	const { ctx } = env;
-	const s = ctx.store.synced.get(docId);
-	const held = ctx.localAt(path)?.hash ?? null;
-	if (!s || held === null || held === s.contentHash || held === s.heldHash) return;
-	await ctx.commit({ syncedPut: [{ ...s, heldHash: held }] });
+	const held = env.ctx.localAt(path)?.hash ?? null;
+	if (held !== null) await keepHeld(env, docId, { hash: held });
 }
 
 export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunReport> {
@@ -253,7 +249,7 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 		try {
 			res = await runOne(env, op);
 		} catch (e) {
-			if (e instanceof KeyMissingError && op.op === "reconcileContent") await keepHeldContent(env, op.docId, op.path);
+			if (e instanceof KeyMissingError && op.op === "reconcileContent" && !op.held) await keepHeldContent(env, op.docId, op.path);
 			throw e;
 		}
 		note(op, res);

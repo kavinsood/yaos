@@ -456,12 +456,26 @@ export interface SyncedEntry {
 	 */
 	readonly renamedTo?: { readonly to: VaultPath; readonly atMs: number };
 	/**
-	 * The disk content a content job could not commit (the write gate refused it, key missing): S stays the merge
-	 * base, the file has moved on. Rename inference pairs a missing doc's file by it as by contentHash, so a file the
-	 * user edited and then renamed while this device could not write (or while the app was down, the store lost) is
-	 * still the doc's, not a delete + a create. Dropped with the next sync point (reconcile/store.ts commit).
+	 * An edit the write gate refused (key missing): a content job could not commit the disk content, S stays the merge
+	 * base and the file has moved on (DESIGN §f.6 "Held edits"). Dropped with the next sync point (reconcile/store.ts
+	 * commit).
 	 */
-	readonly heldHash?: ContentHash;
+	readonly held?: HeldEdit;
+}
+
+/**
+ * SyncedEntry.held. `hash` is the held disk content's logical hash: rename inference pairs a missing doc's file by it
+ * as by contentHash. `text` / `base` (both or neither) are the held disk text and the merge base it was refused
+ * against (S's content): markdown canonical text and base; canvas file text and base merge text. With them, a doc whose
+ * file is gone once the gate opens publishes the held edit (merge `text` against `base` into the doc, planner
+ * liveMissing) before its file's absence is decided: renamed and edited again unobserved, the file pairs with nothing,
+ * and the edit (a deleted canvas record) must not be lost to edit-beats-delete. Kept only within HELD_TEXT_MAX_CHARS
+ * (all records' text + base together); past it, or with no base, the hash alone.
+ */
+export interface HeldEdit {
+	readonly hash: ContentHash;
+	readonly text?: string;
+	readonly base?: string;
 }
 
 /** Vault event hint: a rename observed live; verified by the next reconcile. */
@@ -539,6 +553,11 @@ export type PlannerOp =
 		 * there before its first merge in the new epoch (an untracked file of a remote doc, moved by an observed rename).
 		 */
 		readonly basePath?: VaultPath;
+		/**
+		 * Publish the synced record's held edit (SyncedEntry.held text against its base) into the doc; the disk is not
+		 * read or written. `path` is S.path. Planned for a doc whose file is gone (liveMissing), the gate open or not.
+		 */
+		readonly held?: true;
 	}
 	| { readonly op: "pushBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }
 	| { readonly op: "fetchBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }

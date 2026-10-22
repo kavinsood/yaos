@@ -5,7 +5,7 @@
  * - Observed, verified rename events win (they may carry a content change).
  * - Otherwise, only when the listing is complete: pair missing synced docs
  *   with new local entries by (kind, contentHash), or by the content a refused
- *   commit left on disk (SyncedEntry.heldHash). A unique pair is a rename;
+ *   commit left on disk (SyncedEntry.held.hash). A unique pair is a rename;
  *   several equal hashes pair by score (same leaf name = 2, same parent = 1),
  *   ties by path code-unit order. Unpaired ones become delete + create.
  */
@@ -78,7 +78,7 @@ export function inferRenames(
 	const groups = new Map<string, { miss: SyncedEntry[]; news: LocalEntry[] }>();
 	for (const s of missing) {
 		if (usedDocs.has(s.docId)) continue;
-		for (const h of s.heldHash !== undefined && s.heldHash !== s.contentHash ? [s.contentHash, s.heldHash] : [s.contentHash]) {
+		for (const h of s.held !== undefined && s.held.hash !== s.contentHash ? [s.contentHash, s.held.hash] : [s.contentHash]) {
 			const g = `${s.kind}\u0000${h}`;
 			const group = groups.get(g) ?? { miss: [], news: [] };
 			group.miss.push(s);

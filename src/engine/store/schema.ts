@@ -11,7 +11,7 @@
 
 import type { StoreSpec, KeyRange } from "../../ports/storage";
 import type {
-	BodyVersion, ClientFrameId, ConfigRelPath, ContentHash, DeviceId, DiskFingerprint, DocId, DocKind, PathKey, Seq, StreamClass,
+	BodyVersion, ClientFrameId, ConfigRelPath, ContentHash, DeviceId, DiskFingerprint, DocId, DocKind, HeldEdit, PathKey, Seq, StreamClass,
 	StreamName, SyncedEntry, VaultEpoch, VaultId, VaultPath,
 } from "../../core/types";
 import type { EnvelopeKind, CheckpointEncoding } from "../../core/envelope";
@@ -21,11 +21,12 @@ import type { EnvelopeKind, CheckpointEncoding } from "../../core/envelope";
  * (schemaVersion) and is deleted and rebuilt from relay + disk + side-file mirrors (DESIGN §i.5).
  * 2: dropped the unused streams byStalePriority / byAccess, synced byPathKey and blobQueue byActiveDue indexes
  * and the fields only they read; dropped the outbox "sent" state, attempts and lastSentAtMs (T_sent).
+ * 3: SyncedRecord.heldHash became `held` (the refused edit's hash, text and base, DESIGN §f.6 "Held edits").
  * Not bumped for a new meta key family whose absence reads as before (blobPut:, pathBase:,
  * keyringRecords, docDeletes:): an older reader never looks the keys up, and a DB without them behaves as it did. A bump would
  * delete and rebuild every DB.
  */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 /**
  * `yaos3`: the store is named by the install key, and its device identity lives in it (identity-per-store §2.4).
  * The `yaos2:<vaultId>:<epoch>:<deviceId>` layout (identity in data.json) is deleted on start (§13).
@@ -583,12 +584,12 @@ export interface SyncedMirrorEntry {
 	readonly nsTouchSeq: Seq;
 	readonly bodyRemoteSeq: Seq;
 	readonly blobRev: Seq;
-	/** Mirror format 2: SyncedRecord.fileGone. */
+	/** SyncedRecord.fileGone. */
 	readonly fileGone?: true;
-	/** Mirror format 2: SyncedRecord.renamedTo. */
+	/** SyncedRecord.renamedTo. */
 	readonly renamedTo?: { readonly to: VaultPath; readonly atMs: number };
-	/** Mirror format 2: SyncedRecord.heldHash. */
-	readonly heldHash?: ContentHash;
+	/** SyncedRecord.held, with its text and base when the store keeps them. */
+	readonly held?: HeldEdit;
 }
 
 export interface SyncedMirror {
