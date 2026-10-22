@@ -81,7 +81,8 @@ test("residency: acquire returns a pinned, resident handle even when an eviction
 		const stream = b.streamOf(id);
 		assert.equal(hs.isResident(stream), false);
 		// The first load is evicted in the microtask after it registers, before acquire's continuation runs.
-		const hooks = (hs as unknown as { hooks: HandleHooks }).hooks;
+		// @ts-expect-error -- the test reaches HandleCache's private hooks to run an eviction inside the load.
+		const hooks: HandleHooks = hs.hooks;
 		const onLoaded = hooks.onLoaded.bind(hooks);
 		let once = true;
 		hooks.onLoaded = (h) => {

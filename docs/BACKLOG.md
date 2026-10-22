@@ -143,7 +143,7 @@ Kept here until `sim-port` merges; then git history holds them.
   body checkpoint and retire puts now go in order of due time (duty, then their own jitter), so fallback devices
   no longer sweep a backlog in the same store order and put each stream once per device. The repro quiesces at
   453 s with no violation (was: no quiescence, 1,394 violations); body put conflicts 4,206 → 483, relay read
-  requests 8,552 → 5,737. Plan `src/sim/regressions/flood-retire-backlog-past-heal-horizon.json`, tests in
+  requests 8,552 → 5,737. Plan `src/sim/regressions/slow/flood-retire-backlog-past-heal-horizon.json` (slow: `npm run test:sim`), tests in
   `src/engine/runtime/retire.test.ts` (batched learning and one-tick drop, duty lost to a restart) and
   `settleCheckpoint.test.ts` (due order).
 - **SIM-S1-HELD-EDIT-UNOBSERVED-RENAME** (`fix-held-text`, suite-1 wipe/revoke/roll seed 112): B, key-missing after a

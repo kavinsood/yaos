@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Replays sim failure artifacts (scripts/sim-soak.mjs output, or src/sim/regressions/*.json):
+// Replays sim failure artifacts (scripts/sim-soak.mjs output, or src/sim/regressions/*.json and slow/*.json):
 // runSim(config, minimizedPlan). Usage: npm run sim:replay -- <file.json> [...] [--full] (--full: the unminimized plan)
 // Exit 1 if any replay still has violations.
 import { readFileSync } from "node:fs";

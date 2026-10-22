@@ -23,7 +23,7 @@ import { gate } from "../ingest/gate";
 import { sealCheckpoint } from "../ingest/envelope";
 import type { LogEngine } from "./engine";
 import type { EngineTuning } from "./options";
-import { converged, createDoc, deleteDoc, drive, editDoc, sleep, startTestEngine, testStorage, until } from "./testHarness";
+import { converged, createDoc, deleteDoc, drive, editDoc, maintenanceTicks, startTestEngine, testStorage, until } from "./testHarness";
 import { STORE } from "../store/schema";
 
 const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, hardRows: 1e9, hardBytes: 1e15, settleMs: 1e9, fallbackMs: 300, nsRows: 1e9, nsBytes: 1e12 };
@@ -367,7 +367,7 @@ test("a merged create's held frames stay in the outbox until its stream is dropp
 		await a.c.repo.db.tx([STORE.synced], "readwrite", async (tx) => { tx.put(STORE.synced, tracked as never); });
 		await a.reconnect();
 		await until(() => a.c.ns.entry(loser)?.state === "merged", 5_000, "merged");
-		await sleep(1_000); // maintenance ticks: the retire finds the dead stream and may not drop it
+		await maintenanceTicks(a, 3); // the retire finds the dead stream and may not drop it
 		assert.deepEqual(a.c.outbox.ofStream(stream).map((r) => r.clientFrameId), held.map((r) => r.clientFrameId), "kept at the merge");
 		await a.c.repo.db.tx([STORE.synced], "readwrite", async (tx) => { tx.delete(STORE.synced, loser); });
 		await until(() => a.c.outbox.size === 0, 10_000, "dropped");

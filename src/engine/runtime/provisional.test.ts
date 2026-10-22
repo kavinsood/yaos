@@ -29,10 +29,12 @@ class View {
 	}
 }
 
-async function pair(relay: SimRelay, tuning: Partial<EngineTuning> = {}) {
+/** `diags`: when given, b's diagnostic codes are pushed onto it. */
+async function pair(relay: SimRelay, tuning: Partial<EngineTuning> = {}, diags?: string[]) {
 	const views = new Map<string, View>();
 	const origins: Record<string, string[]> = { a: [], b: [] };
 	const mk = (dev: "a" | "b") => startTestEngine({ relay, deviceId: `dev-${dev}`, tuning, extra: {
+		...(diags && dev === "b" ? { onDiag: (ev: { code: string }) => void diags.push(ev.code) } : {}),
 		onBoundText: (d: DocId, changes: TextChanges, _length: number, o: string) => {
 			origins[dev]!.push(o);
 			if (o !== "editor") views.get(`${dev}:${d}`)?.receive(changes);
@@ -248,7 +250,8 @@ test("provisional: a storage failure when the adopt timeout fires is diagnosed, 
 	// Soak master seed 13 run 45 (SUSPEND_FAULTS + RACE_OPS): the adopt timer's adoptToPending hit a store that had just
 	// died (a simulated crash after a commit), and nothing caught the rejected tOutbox.
 	const relay = new SimRelay();
-	const { a, b, view } = await pair(relay);
+	const diags: string[] = [];
+	const { a, b, view } = await pair(relay, {}, diags);
 	const unhandled: unknown[] = [];
 	const onUnhandled = (e: unknown) => void unhandled.push(e);
 	process.on("unhandledRejection", onUnhandled);
@@ -262,8 +265,8 @@ test("provisional: a storage failure when the adopt timeout fires is diagnosed, 
 		await until(() => adoptableOf(b, id) !== null, 3_000, "adopted");
 		const repo = b.c.repo;
 		repo.tOutbox = () => Promise.reject(new Error("storage port is dead (test)"));
-		await sleep(b.c.tuning.provisionalAdoptMs + 200);
-		await sleep(50);
+		// The adopt timer fires and its adoptToPending fails: diagnosed (caught), or reported unhandled (not caught).
+		await until(() => diags.includes("adopt-pending-failed") || unhandled.length > 0, b.c.tuning.provisionalAdoptMs, "the adopt timeout's failure");
 		assert.deepEqual(unhandled.map(String), [], "no unhandled rejection");
 	} finally {
 		process.off("unhandledRejection", onUnhandled);

@@ -3,6 +3,17 @@
 Each `*.json` here is a minimized failing sim run, replayed by `regressions.test.ts` (part of `npm run test:client`)
 with `runSim(config, minimizedPlan)`; the test asserts the replay has no violations.
 
+## Slow plans
+
+A plan whose replay takes more than about 10 s goes in `slow/` instead, so `npm run test:client` stays fast:
+`slow/regressions.sim.test.ts` replays each as its own `simTest` unit under `npm run test:sim` (filter:
+`npm run test:sim -- regressions.sim`), and `regressions.test.ts` reads only this directory, not `slow/`. Replay one
+by hand with `npm run sim:replay -- src/sim/regressions/slow/<file>.json`.
+
+| File | Replay |
+| --- | --- |
+| `flood-retire-backlog-past-heal-horizon.json` | ~150 s (5 devices, FLOOD_FAULTS small-cap, 256 steps) |
+
 ## Promoting a failure
 
 1. The soak (`npm run sim:soak`, nightly `.github/workflows/sim-soak.yml`) writes `sim-failures/<seed>-<n>.json`:
