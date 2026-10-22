@@ -2,7 +2,8 @@
  * Retired streams of dead docs (DESIGN §b.5 "retired", §c.9, §d.9; body/retire.ts): the writer (duty device at
  * once, the others after the fallback), the local drop (Repo.tDropStream), a late writer re-retiring, the CAS
  * outcomes, a fresh device reading a retired stream, merged aliases, and the normal checkpoint of a deleted (not
- * pruned) doc's stream.
+ * pruned) doc's stream. On a virtual clock: a non-duty device learns retirements in one batched read and drops them
+ * in one transaction, and a pruning device that lost its duty to a restart retires within the short grace.
  */
 
 import assert from "node:assert/strict";
@@ -11,14 +12,18 @@ import { CheckpointEncoding } from "../../core/envelope";
 import { encodeCheckpointContent } from "../../core/codec/contents";
 import { NS_STREAM, docStream, type DeviceId, type DocId, type NsEntry, type NsFoldEvent, type StreamName } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
-import { writeRetired } from "../body/retire";
+import { RETIRE_GRACE_MS, writeRetired } from "../body/retire";
+import { CHECKPOINT_FALLBACK_MS } from "../body/checkpoints";
+import { compactFold } from "../body/compaction";
+import { VirtualClock } from "../../sim/clock";
+import type { ReadRequest, RelaySession } from "../../ports/relay";
 import { prunedRestoreDuty, removedDeletes } from "../../core/ns/pruned";
 import { ComposedLog } from "../compose/logPort";
 import { gate } from "../ingest/gate";
 import { sealCheckpoint } from "../ingest/envelope";
 import type { LogEngine } from "./engine";
 import type { EngineTuning } from "./options";
-import { converged, createDoc, deleteDoc, editDoc, sleep, startTestEngine, until } from "./testHarness";
+import { converged, createDoc, deleteDoc, drive, editDoc, sleep, startTestEngine, testStorage, until } from "./testHarness";
 import { STORE } from "../store/schema";
 
 const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, hardRows: 1e9, hardBytes: 1e15, settleMs: 1e9, fallbackMs: 300, nsRows: 1e9, nsBytes: 1e12 };
@@ -398,5 +403,109 @@ test("Repo.tDropStream: one transaction drops the records; refused while an own 
 		assert.equal(a.c.repo.cursor.vaultSeq, relay.head(), "the vault cursor is untouched");
 	} finally {
 		for (const e of es) await e.stop();
+	}
+});
+
+// ---- virtual clock: batched refresh, bounded drops, duty lost to a restart --------------------------------------
+
+/** Every delete pruned in its own frame (goal 0); the shipped 10 min checkpoint fallback, so the retire grace is 60 s. */
+const PROD_GRACE: Partial<EngineTuning> = { ...TUNING, checkpoint: { ...NO_CKPT, fallbackMs: CHECKPOINT_FALLBACK_MS }, nsPrune: { tombstoneCap: 0, pruneHysteresis: 0 } };
+
+/** Counts a session's reads that name one of `streams`: readBatch requests and single reads. */
+function countReads(session: RelaySession, streams: ReadonlySet<StreamName>): { batches: number; entries: number; singles: number } {
+	const n = { batches: 0, entries: 0, singles: 0 };
+	const readBatch = session.readBatch.bind(session);
+	const read = session.read.bind(session);
+	session.readBatch = (reqs: readonly ReadRequest[]) => {
+		const hit = reqs.filter((r) => streams.has(r.stream)).length;
+		if (hit > 0) {
+			n.batches++;
+			n.entries += hit;
+		}
+		return readBatch(reqs);
+	};
+	session.read = (stream, afterSeq, prefer) => {
+		if (streams.has(stream)) n.singles++;
+		return read(stream, afterSeq, prefer);
+	};
+	return n;
+}
+
+test("retire: a non-duty device learns 20 retirements in one batched read and drops them in one tick, long before its grace", async () => {
+	const clock = new VirtualClock(Date.UTC(2026, 0, 1, 12, 0));
+	const relay = new SimRelay({ clock });
+	const dropTicks: number[] = [];
+	const a = (await startTestEngine({ relay, deviceId: "dev-a", clock, tuning: PROD_GRACE })).engine;
+	let b: LogEngine | null = null;
+	b = (await startTestEngine({ relay, deviceId: "dev-b", clock, tuning: PROD_GRACE, extra: { onDiag: (ev) => {
+		if (ev.code === "retire-dropped") dropTicks.push(b!.maint.stats.ticks);
+	} } })).engine;
+	const es = [a, b];
+	try {
+		await until(() => es.every((e) => e.status().phase === "live"), 10_000, "live", clock);
+		// More than the old 16 drops per tick.
+		const ids: DocId[] = [];
+		for (let i = 0; i < 20; i++) {
+			ids.push(await drive(createDoc(a, `d${i}.md`, `d${i};`), clock));
+			await drive(editDoc(a, ids[i]!, (t) => t.insert(t.length, "e;")), clock);
+		}
+		await converged(es, 30_000, clock);
+		const dead = new Set(ids.map(md));
+		const reads = countReads(b.c.session!, dead);
+		// One frame deletes them all; goal 0 prunes them in it: a's fold pruned them, a has the duty, b has none.
+		await drive(a.submitNs(ids.map((id) => ({ t: "delete" as const, docId: id, baseBodySeq: a.c.repo.stream(md(id))!.remoteHeadSeq }))), clock);
+		await until(() => ids.every((id) => b.c.ns.entry(id) === undefined), 10_000, "b folded the prune", clock);
+		const t0 = clock.monotonic();
+		await until(() => ids.every((id) => retiredOnRelay(relay, md(id))), 10_000, "the duty device retired them", clock);
+		assert.equal(b.c.retire.pending, 20, "b still holds them: relay checkpoints are not broadcast");
+		await until(() => ids.every((id) => b.c.repo.stream(md(id)) === undefined), RETIRE_GRACE_MS, "b dropped them", clock);
+		assert.ok(clock.monotonic() - t0 <= RETIRE_GRACE_MS / 4 + 1_000, `learnt at the first refresh (grace / 4), not after the grace: ${clock.monotonic() - t0} ms`);
+		assert.deepEqual(reads, { batches: 1, entries: 20, singles: 0 }, "one readBatch for the 20 streams, no read each");
+		assert.equal(b.c.retire.stats.written, 0, "no second put");
+		assert.equal(b.c.retire.stats.refreshed, 20);
+		assert.equal(new Set(dropTicks).size, 1, "the 20 drops went in one tick (one transaction)");
+		assert.equal(b.c.retire.pending, 0);
+		for (const id of ids) assert.deepEqual(await holds(b, md(id)), []);
+	} finally {
+		for (const e of es) await drive(e.stop(), clock);
+	}
+});
+
+test("retire: a pruning device whose duty a restart lost retires within the short grace, not the 10 min checkpoint fallback", async () => {
+	const clock = new VirtualClock(Date.UTC(2026, 0, 1, 12, 0));
+	const relay = new SimRelay({ clock });
+	const storage = testStorage(clock);
+	// a runs no maintenance before the restart: its duty (in memory) is never acted on.
+	let a = (await startTestEngine({ relay, deviceId: "dev-a", clock, storage, tuning: { ...PROD_GRACE, maintenanceMs: 1e9 } })).engine;
+	const b = (await startTestEngine({ relay, deviceId: "dev-b", clock, tuning: PROD_GRACE })).engine;
+	try {
+		await until(() => a.status().phase === "live" && b.status().phase === "live", 10_000, "live", clock);
+		const ids: DocId[] = [];
+		for (let i = 0; i < 3; i++) ids.push(await drive(createDoc(a, `r${i}.md`, `r${i};`), clock));
+		await converged([a, b], 30_000, clock);
+		// b writes the newest rows: a is not the author duty either.
+		for (const id of ids) await drive(editDoc(b, id, (t) => t.insert(t.length, "b;")), clock);
+		await converged([a, b], 30_000, clock);
+		await drive(b.stop(), clock);
+		await drive(a.submitNs(ids.map((id) => ({ t: "delete" as const, docId: id, baseBodySeq: a.c.repo.stream(md(id))!.remoteHeadSeq }))), clock);
+		await until(() => ids.every((id) => a.c.ns.entry(id) === undefined), 10_000, "a pruned them", clock);
+		assert.equal(ids.filter((id) => a.c.retire.duty.has(id)).length, 3, "a's frame pruned them: a has the duty");
+		// A reload refolds the ns tail (and so finds the duty again) until it is compacted past the pruning frame.
+		assert.equal((await drive(compactFold(a.c.deps, a.c.ns), clock)).t, "ok");
+		await drive(a.stop(), clock);
+		assert.ok(ids.every((id) => !retiredOnRelay(relay, md(id))));
+		a = (await startTestEngine({ relay, deviceId: "dev-a", clock, storage, tuning: PROD_GRACE })).engine;
+		await until(() => a.status().phase === "live", 10_000, "a live again", clock);
+		assert.equal(a.c.retire.duty.size, 0, "the duty did not survive the restart");
+		for (const id of ids) assert.ok(a.c.repo.stream(md(id))!.lastOwnSeq < a.c.repo.stream(md(id))!.remoteHeadSeq, "not the author of the newest row");
+		const t0 = clock.monotonic();
+		await until(() => ids.every((id) => retiredOnRelay(relay, md(id))), 2 * RETIRE_GRACE_MS + 5_000, "retired after the grace", clock);
+		const took = clock.monotonic() - t0;
+		assert.ok(took >= RETIRE_GRACE_MS && took < CHECKPOINT_FALLBACK_MS, `grace + jitter: ${took} ms`);
+		// The relay holds a put before its response reaches the writer.
+		await until(() => a.c.retire.stats.written === 3, 5_000, "a counted its 3 puts", clock);
+		await until(async () => (await Promise.all(ids.map((id) => holds(a, md(id))))).every((h) => h.length === 0), 10_000, "dropped", clock);
+	} finally {
+		await drive(a.stop(), clock);
 	}
 });

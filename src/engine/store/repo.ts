@@ -903,39 +903,51 @@ export class Repo {
 	 * planner wrote the loser's text to its file before the rebind); any other own frame of the stream refuses.
 	 */
 	tDropStream(stream: StreamName, expect: Pick<StreamRecord, "remoteHeadSeq" | "remoteCheckpointCoversSeq">, held: readonly ClientFrameId[] = []): Promise<boolean> {
+		return this.tDropStreams([{ stream, expect, held }]).then((r) => r[0]!);
+	}
+
+	/**
+	 * tDropStream for several streams in one transaction (the retire step's drops of a tick, bounded there:
+	 * body/retire.ts DROPS_PER_TICK / DROP_TAIL_ROWS_PER_TICK). Each stream is checked and dropped on its own: a
+	 * refused one (false at its index) writes nothing and does not keep the others.
+	 */
+	tDropStreams(items: readonly { readonly stream: StreamName; readonly expect: Pick<StreamRecord, "remoteHeadSeq" | "remoteCheckpointCoversSeq">; readonly held?: readonly ClientFrameId[] }[]): Promise<boolean[]> {
+		if (items.length === 0) return Promise.resolve([]);
 		return this.serial("tDropStream", async () => {
-			let dropDuty = false;
-			const docId = streamDocId(stream);
-			const ok = await this.db.tx([STORE.streams, STORE.snapshots, STORE.tail, STORE.quarantine, STORE.outbox, STORE.meta, STORE.synced, STORE.intents], "readwrite", async (tx) => {
-				const r = await tx.get(STORE.streams, stream);
-				if (r && (r.remoteHeadSeq !== expect.remoteHeadSeq || r.remoteCheckpointCoversSeq !== expect.remoteCheckpointCoversSeq)) return false;
-				if (docId && (await tx.get(STORE.synced, docId) || (await tx.getAll(STORE.intents)).some((i) => i.docId === docId))) return false;
-				if (await tx.countByIndex(STORE.outbox, INDEX.outboxByStream, streamOrderRange(stream)) > held.length) return false;
-				for (const id of held) {
-					const o = await tx.get(STORE.outbox, id);
-					if (!o || o.stream !== stream || o.state !== "held") return false;
+			const duty = new Set(this.ckptDuty);
+			let dutyChanged = false;
+			const out = await this.db.tx([STORE.streams, STORE.snapshots, STORE.tail, STORE.quarantine, STORE.outbox, STORE.meta, STORE.synced, STORE.intents], "readwrite", async (tx) => {
+				const intents = new Set((await tx.getAll(STORE.intents)).map((i) => i.docId));
+				const res: boolean[] = [];
+				for (const { stream, expect, held = [] } of items) {
+					const ok = await (async () => {
+						const docId = streamDocId(stream);
+						const r = await tx.get(STORE.streams, stream);
+						if (r && (r.remoteHeadSeq !== expect.remoteHeadSeq || r.remoteCheckpointCoversSeq !== expect.remoteCheckpointCoversSeq)) return false;
+						if (docId && (intents.has(docId) || await tx.get(STORE.synced, docId))) return false;
+						if (await tx.countByIndex(STORE.outbox, INDEX.outboxByStream, streamOrderRange(stream)) > held.length) return false;
+						for (const id of held) {
+							const o = await tx.get(STORE.outbox, id);
+							if (!o || o.stream !== stream || o.state !== "held") return false;
+						}
+						for (const id of held) tx.delete(STORE.outbox, id);
+						tx.delete(STORE.streams, stream);
+						tx.delete(STORE.snapshots, stream);
+						tx.deleteRange(STORE.tail, tailRange(stream));
+						tx.deleteRange(STORE.quarantine, tailRange(stream));
+						if (duty.delete(stream)) dutyChanged = true;
+						return true;
+					})();
+					res.push(ok);
 				}
-				for (const id of held) tx.delete(STORE.outbox, id);
-				tx.delete(STORE.streams, stream);
-				tx.delete(STORE.snapshots, stream);
-				tx.deleteRange(STORE.tail, tailRange(stream));
-				tx.deleteRange(STORE.quarantine, tailRange(stream));
-				if (this.ckptDuty.has(stream)) {
-					dropDuty = true;
-					const duty = new Set(this.ckptDuty);
-					duty.delete(stream);
-					tx.put(STORE.meta, { key: "ckptDuty", streams: [...duty] });
-				}
-				return true;
+				if (dutyChanged) tx.put(STORE.meta, { key: "ckptDuty", streams: [...duty] });
+				return res;
 			});
-			if (!ok) return false;
-			this.cache.delete(stream);
-			if (dropDuty) {
-				const duty = new Set(this.ckptDuty);
-				duty.delete(stream);
-				this.ckptDuty = duty;
-			}
-			return true;
+			items.forEach((it, i) => {
+				if (out[i]) this.cache.delete(it.stream);
+			});
+			if (dutyChanged) this.ckptDuty = duty;
+			return out;
 		});
 	}
 

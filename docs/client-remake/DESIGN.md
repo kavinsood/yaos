@@ -296,7 +296,7 @@ A deleted doc is not dead: its body stays for a restore (§c.7) and its stream i
 The ingest gate takes a `retired` checkpoint only on `b:`/`c:` and only with an empty state (`kind-not-allowed` /
 `decode-failed` otherwise, `src/engine/ingest/gate.ts:220`). Catch-up adopts nothing from one: the reader's replica
 stays as it is, rows above coversSeq (a late writer's) still apply, and it counts `diag checkpoint-retired`
-(`src/engine/sync/catchUp.ts:181`). Writer, duty and local drop: §d.9.
+(`src/engine/sync/catchUp.ts:181`). Writer, duty, batched refresh, grace and local drop: §d.9.
 
 ### b.6 Size rules and splitting
 
@@ -548,7 +548,8 @@ path (example E8).
   - With `TOMBSTONE_CAP`, a device behind by up to ~40000 prunes still finds every base: in an entry or a stub.
 - Later ops on pruned docIds are `unknown-docid`.
 - The pruned deleted docs' `b:`/`c:` streams are retired (§b.5, §d.9): the device whose frame pruned them puts the
-  `retired` checkpoint, every device that folded the prune or holds the stub then drops their local records. A
+  `retired` checkpoint (any other after a short grace), every device that folded the prune or holds the stub learns
+  it by a batched refresh and drops their local records. A
   pruned merged alias (no stub) keeps its stream unless it was retired while its merged entry stood.
 - `TOMBSTONE_CAP` and `TOMBSTONE_PRUNE_HYSTERESIS` are fold rules: every device folds with the same values.
   `EngineTuning.nsPrune` (`src/engine/runtime/options.ts:57`) carries them for the sim only (one draw per run for
@@ -1480,6 +1481,9 @@ The planner does no destructive work until ns is caught up (§f.2).
   - Primary: the author of the stream's newest row (`meta.ckptDuty`). Fallback: any other device, once the
     condition, idle included, has held for `CHECKPOINT_FALLBACK_MS` (10 min, checkpoints.ts:34) plus a per-stream
     jitter in [0, 10 min) (src/engine/runtime/maintenance.ts:128).
+    Due streams are put in order of due time (the duty device's first, then condSince + fallbackMs + jitter): with
+    a short fallback every device sweeping a backlog in store order put each stream (one ok, the rest CAS conflicts;
+    sim SOAK-FLOOD-RETIRE-BACKLOG, a 31 ms fallback after a flood: 4,206 body put conflicts in store order, 483 in due order with the batched retire refresh).
   - A fallback device first re-reads the stream's checkpoint seq with `read(stream, appliedSeq, false)`
     (`refreshRemote`, checkpoints.ts:175; maintenance.ts:157). Relay checkpoints are not broadcast, and the duty
     device has usually written one. If it covers `appliedSeq`, the counters reset and nothing is compacted, sealed
@@ -1537,25 +1541,49 @@ The planner does no destructive work until ns is caught up (§f.2).
   - A settle checkpoint covers the newest candidate. The rows after it stay: fewer than one candidate interval (1000
     vault seqs). There is at most one settle put per candidate.
   - cfg and snap use the same candidate rule.
-- **`retired`** (§b.5; the maintenance step `retire`, `src/engine/runtime/maintenance.ts:263`, after checkpoint duty).
+- **`retired`** (§b.5; the maintenance step `retire`, `Maintenance.retire` in `src/engine/runtime/maintenance.ts`, after checkpoint duty).
   - For the caught-up `b:`/`c:` streams of dead docs (merged aliases, pruned docs with a stub; `deadStreams`)
     that hold rows beyond the relay's checkpoint (`remoteCheckpointCoversSeq < remoteHeadSeq`).
   - `coversSeq` = the caught-up record's `remoteHeadSeq` (its `lastSeq`); CAS on the known checkpoint seq
-    (`writeRetired`, retire.ts:102). Outcomes follow the checkpoint table (`applyOutcome`), but a retire does not
+    (`writeRetired`, retire.ts). Outcomes follow the checkpoint table (`applyOutcome`), but a retire does not
     count against the settle cap.
   - Duty: the device whose own ns frame pruned the doc or folded its create as merged (`RetireState.noteFold`, in
     memory), or the author of the stream's newest row (a merged loser's junk rows, a long-offline device's late edit
-    of a pruned doc). Everyone else after `fallbackMs` plus jitter, with a refresh read of the checkpoint seq first
-    (a non-advancing refresh means someone else retired it). Duty lost to a restart is covered by the fallback.
+    of a pruned doc). The duty device puts on its next tick.
+  - *Batched refresh* (`refreshRetiredBatch`, `Maintenance.refreshDead`). Relay checkpoints are not broadcast, so a
+    device re-reads the checkpoint seq and last seq of its dead streams with rows to retire: one `readBatch` per tick,
+    as wide as catch-up batches (128), `every` = max(grace / 4, 1 s) after it first saw the stream dead and then every
+    `every`, least recently read first. A stream found covered at its last seq drops at once (below). The duty
+    device's own streams are read too: at 4 puts a tick, a flood's backlog past the first `every` is mostly retired by
+    the others meanwhile. Reads only: it runs without write permission (a read-only device learns retirements too),
+    behind the write gate or a checkpoint hold, not in background. After a pruning flood a device learns N
+    retirements in about N / 128 requests, not N puts' refreshes or conflicts at 4 per tick (sim
+    SOAK-FLOOD-RETIRE-BACKLOG: 1,400 to 2,400 dead streams per device outlasted the 600 s heal).
+  - *Grace.* A non-duty device puts the `retired` checkpoint itself once the stream has been dead with rows for
+    `grace` = min(`fallbackMs`, `RETIRE_GRACE_MS` 60 s) plus a jitter in [0, grace) (the checkpoint jitter, scaled),
+    with no refresh read of its own when a batched refresh read it within `every`, else with one first. Due puts go
+    in order of due time (duty first, then since + grace + jitter), so the devices' sweeps of a backlog differ. Not
+    the body checkpoint's 10 min: a retire put by a second device costs the relay nothing (a CAS conflict or a
+    non-advancing put writes no row), and a stream still not retired a minute after the prune has lost its duty
+    device (restarted, background, offline).
+  - *Duty after a restart.* The duty set is not persisted. An engine start refolds the ns tail above the ns
+    snapshot (`ns.load`), so a pruning frame not yet compacted hands the duty back; once compacted, the restarted
+    device is a non-duty device and retires within grace + jitter (at most 2 min), not the 10–20 min checkpoint
+    fallback. Persisting it would cost a write per pruning fold to save at most that.
   - At most `RETIRES_PER_TICK` (4) puts per tick; not while the session cannot write, in background, behind the
     write gate or a checkpoint hold.
   - A row committed after the retirement (a late writer) leaves the stream above its checkpoint again: the next
     pass retires it again (server: a put at the new lastSeq with CAS on the old one).
-  - **Local drop**: once nothing lies beyond the relay checkpoint, up to `DROPS_PER_TICK` (16) dead streams per tick
-    leave the store in one transaction, `T_drop_stream` (§e.2). Not while a read of it runs, the outbox holds an own
+  - **Local drop**: once nothing lies beyond the relay checkpoint, the dead streams leave the store in one
+    transaction per tick (`Repo.tDropStreams`, `T_drop_stream` for each, §e.2): up to `DROPS_PER_TICK` (128) streams
+    holding up to `DROP_TAIL_ROWS_PER_TICK` (4,096) tail rows together, the first stream always (its tail is at most
+    `TAIL_HARD_ROWS`). I5: whatever the backlog, a tick's drop is one bounded IDB transaction; deleting records is
+    local work only, so the bound is the transaction's size, not the relay's budget (was 16 transactions of one stream).
+    Not while a read of it runs, the outbox holds an own
     frame of it (a merged alias's held frames, never sent, go with the drop instead: they may be the only copy of an
-    edit, I1, §c.5), or its replica is pinned, bound, loading or has an open frame; the transaction itself refuses if
-    the record moved, the outbox holds another record, or a synced record or an intent still names the doc.
+    edit, I1, §c.5), or its replica is pinned, bound, loading or has an open frame; the transaction refuses a stream
+    (and keeps the others) if its record moved, the outbox holds another record, or a synced record or an intent still
+    names the doc.
   - A stream already covered at lastSeq by a `yjsStateV1` settle checkpoint keeps that checkpoint's bytes: a retired
     put there would be non-advancing. Its rows are reclaimed all the same (H7), and the local drop runs.
 - **Budget** (Free plan: 100k rows written a day).
@@ -1651,7 +1679,7 @@ Rules:
 | `T_feed_page` | streams, meta | Stream heads, stale; cursor = `throughSeq` | Before commit: the page is re-fetched. |
 | `T_read_page` | tail, quarantine, outbox, streams, snapshots | Rows; late receipts; fresh-stream checkpoint snapshot + exact-key deletes of tail ≤ coversSeq; `appliedSeq` / `stale` when complete | Idempotent puts. The page is re-read from `appliedSeq`. |
 | `T_snapshot` (checkpoint union) / `T_compact` | snapshots, tail, streams | CAS on `snapshotCoversSeq`; snapshot put; exact-key tail deletes | Old snapshot + tail and new snapshot + less tail reconstruct the same state. |
-| `T_drop_stream` (retire, §d.9) | streams, snapshots, tail, quarantine, outbox, meta, synced, intents | Refuses (no write) if the record's `remoteHeadSeq` / `remoteCheckpointCoversSeq` moved, the outbox holds a record of the stream other than a merged alias's held frames named by the caller, or a synced record or an intent names its doc; else deletes the stream record, its snapshot, tail and quarantine rows, those held frames, and its `ckptDuty` entry (`src/engine/store/repo.ts`). The cursor is untouched | Before commit: nothing changed, the next tick drops it. After: the doc loads as an empty replica; a later row of the stream (a late writer) re-creates the record and the stream is retired again. |
+| `T_drop_stream` (retire, §d.9; a tick's drops share one transaction, `Repo.tDropStreams`, each stream checked on its own) | streams, snapshots, tail, quarantine, outbox, meta, synced, intents | Refuses (no write) if the record's `remoteHeadSeq` / `remoteCheckpointCoversSeq` moved, the outbox holds a record of the stream other than a merged alias's held frames named by the caller, or a synced record or an intent names its doc; else deletes the stream record, its snapshot, tail and quarantine rows, those held frames, and its `ckptDuty` entry (`src/engine/store/repo.ts`). The cursor is untouched | Before commit: nothing changed, the next tick drops it. After: the doc loads as an empty replica; a later row of the stream (a late writer) re-creates the record and the stream is retired again. |
 | `T_adopt` | outbox, meta | Adoptable record | Before commit: the provisional was applied to the bound replica only. The edit reaches disk through the editor and is re-merged. The commit or the author's resend brings it anyway. |
 | `T_intent_begin` / `T_intent_end` | intents | Put / delete the intent | §f.7: startup completes or rolls back each intent from disk state. |
 | `T_synced` (after a disk-op batch) | synced, baseText, localTree, intents | Synced put/drop, base put, stat cache, intent end | Before commit: the next reconcile sees L = R ≠ S, which is the "identical" path. Only S advances. |

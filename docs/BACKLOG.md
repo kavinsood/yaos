@@ -111,8 +111,8 @@ Each has a minimized plan in `src/sim/open-repros/` (README there: replay with `
 replayed by the regressions test). All checked still failing on `integrate-3` (2026-10-22); "base" = also failing on
 `client-remake-next` 6a1fb3e5 before the reclaim / generators / governance merges.
 
-No data-loss failure open on `integrate-3`. Three non-data-loss failures stay open: one resurrection (no text lost),
-one liveness timeout and one resource bound.
+No data-loss failure open on `integrate-3`. Two non-data-loss failures stay open: one resurrection (no text lost)
+and one resource bound.
 
 ### SOAK-BOUND-RESIDENT-BYTES: two big bound notes go past a small resident byte budget
 
@@ -126,20 +126,6 @@ one liveness timeout and one resource bound.
 - **Why open.** The design allows a bound replica over budget, but the invariant does not exempt bound handles.
   Either the invariant counts bound handles apart, which relaxes it, or the engine refuses to bind past the budget.
   For the owner.
-
-### SOAK-FLOOD-RETIRE-BACKLOG: a flood's dead streams take longer to retire than the heal horizon
-
-- **Repro.** `flood-retire-backlog-past-heal-horizon.json` (soak 979386157 #245, FLOOD_FAULTS small-cap, 5 devices;
-  base, worse there: about 2,900 per device).
-- **What happens.** Storms plus the small tombstone and stub caps prune thousands of docs. When the 600 s heal ends,
-  every device still has 1,400 to 2,400 dead streams to retire or drop (`clean: no quiescence`, and `retired: ... not
-  retired on the relay`). Only the device whose fold pruned a doc has retire duty, and only in memory. Every other
-  device, and a duty device after a restart, waits `CHECKPOINT_FALLBACK_MS` (10 min) plus up to 10 min of jitter
-  (DESIGN §b.5 "retired"). At 4 puts and 16 drops per tick the backlog drains slowly.
-- **Not data loss.** With `healHorizonMs` 3,600,000 the same plan quiesces at 1,105 s with no violation.
-- **Why open.** The fix is either product-side (non-duty devices learn a retirement before their fallback, for
-  example by batch refresh, or a faster retire rate after a flood) or the heal waits out the designed fallback. The
-  second would relax the liveness bound. Both are for the owner to decide.
 
 ### SIM-S1-HELD-EDIT-UNOBSERVED-RENAME: a key-missing edit, then a rename and an edit nobody saw
 
@@ -158,6 +144,21 @@ one liveness timeout and one resource bound.
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SOAK-FLOOD-RETIRE-BACKLOG** (`fix-retire-refresh`, soak 979386157 #245, FLOOD_FAULTS small-cap, 5 devices: 1,400
+  to 2,400 dead streams per device still to retire / drop when the 600 s heal ended). Not data loss, a liveness
+  bound. Relay checkpoints are not broadcast, so a non-duty device learnt of a retirement only through its own
+  put's refresh read or CAS conflict, 4 a tick, and dropped 16 a tick. Now (DESIGN §d.9 "retired"): every device
+  batch-reads the checkpoint seqs of its dead streams with rows to retire (one 128-wide `readBatch` a tick, every
+  max(grace / 4, 1 s)) and drops those found retired at once; the drops of a tick go in one bounded transaction
+  (`Repo.tDropStreams`: 128 streams / 4,096 tail rows, I5); a non-duty device puts the retired checkpoint itself
+  after a short grace, min(fallbackMs, 60 s) + jitter, not the 10–20 min checkpoint fallback, which also covers
+  duty lost to a restart (the ns reload refolds an uncompacted pruning frame; compacted, the grace covers it). Due
+  body checkpoint and retire puts now go in order of due time (duty, then their own jitter), so fallback devices
+  no longer sweep a backlog in the same store order and put each stream once per device. The repro quiesces at
+  453 s with no violation (was: no quiescence, 1,394 violations); body put conflicts 4,206 → 483, relay read
+  requests 8,552 → 5,737. Plan `src/sim/regressions/flood-retire-backlog-past-heal-horizon.json`, tests in
+  `src/engine/runtime/retire.test.ts` (batched learning and one-tick drop, duty lost to a restart) and
+  `settleCheckpoint.test.ts` (due order).
 - **SIM-GATED-RESIDENCY** (`fix-refold`, soak seed 2006566456, invariant 6 "5 resident docs, budget 3"): an engine
   bound violation, not a tolerance issue. While C waited revoked-epoch for its QR, each pass's merge jobs applied the
   disk diff to the replica and then failed in `commitEdits` on the write gate; the edit stayed in the frame builder,

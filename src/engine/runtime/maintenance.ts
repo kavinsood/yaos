@@ -13,12 +13,12 @@
  */
 
 import { TAIL_HARD_ROWS } from "../../core/limits";
-import { NS_STREAM, SNAP_STREAM, type DocId, type StreamName } from "../../core/types";
+import { NS_STREAM, SNAP_STREAM, type ClientFrameId, type DocId, type StreamName } from "../../core/types";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
 import { bodyCheckpointDue, foldCheckpointDue, refreshRemoteBatch, writeBodyCheckpoint, writeFoldCheckpoint } from "../body/checkpoints";
 import { compactBody, compactFold, needsCompaction } from "../body/compaction";
-import { deadReason, writeRetired, DROPS_PER_TICK, RETIRES_PER_TICK, type DeadReason, type FoldCompleteness, type PruneEvidence } from "../body/retire";
+import { deadReason, refreshRetiredBatch, retireGrace, retireRefreshEvery, writeRetired, DROP_TAIL_ROWS_PER_TICK, DROPS_PER_TICK, RETIRES_PER_TICK, type DeadReason, type FoldCompleteness, type PruneEvidence } from "../body/retire";
 import type { StreamRecord } from "../store/schema";
 import type { EngineCtx } from "./context";
 
@@ -187,13 +187,23 @@ export class Maintenance {
 		c.ckpt.markLive(now);
 		await this.refreshFallbacks(s, now);
 		const fresh = (stream: StreamName) => now - (this.refreshedAt.get(stream) ?? -Infinity) < REFRESH_FRESH_MS;
-		let budget = CHECKPOINTS_PER_TICK;
-		for (const r of [...c.repo.streams()]) {
-			if (budget <= 0 || c.session !== s) return;
+		// Due streams in order of due time (the duty device's at once, a fallback's at condSince + fallbackMs + its
+		// jitter): fallback devices sweep a backlog in their own jittered orders, not all in store order, where each
+		// stream was put by every device, one ok and the others CAS conflicts (sim SOAK-FLOOD-RETIRE-BACKLOG: a 31 ms
+		// fallback after a flood, thousands of settle puts at 2 per tick).
+		const due: { r: StreamRecord; duty: boolean; at: number }[] = [];
+		for (const r of c.repo.streams()) {
 			if (r.cls !== "body" && r.cls !== "canvas") continue;
 			if (c.sess.isReading(r.stream)) continue;
 			const duty = c.repo.hasCkptDuty(r.stream);
-			if (!bodyCheckpointDue(r, duty, c.ckpt, c.tuning.checkpoint, now, this.jitter(r.stream))) continue;
+			const j = this.jitter(r.stream);
+			if (!bodyCheckpointDue(r, duty, c.ckpt, c.tuning.checkpoint, now, j)) continue;
+			due.push({ r, duty, at: duty ? -Infinity : (c.ckpt.condSince.get(r.stream) ?? now) + j });
+		}
+		due.sort((x, y) => x.at - y.at);
+		let budget = CHECKPOINTS_PER_TICK;
+		for (const { r, duty } of due) {
+			if (budget <= 0 || c.session !== s) break;
 			budget--;
 			try {
 				const o = await writeBodyCheckpoint(c.deps, c.ckpt, s, r.stream, { refreshFirst: !duty && !fresh(r.stream) });
@@ -276,8 +286,9 @@ export class Maintenance {
 	}
 
 	/**
-	 * Dead streams (DESIGN §b.5 "retired"): a retired checkpoint where the relay still holds rows beyond its
-	 * checkpoint (duty now, others after the fallback), then the local records once nothing lies beyond it.
+	 * Dead streams (DESIGN §b.5 "retired", §d.9): batched refreshes of the relay checkpoints of the ones to retire,
+	 * then the local records of every one nothing lies beyond any more (one transaction), then a retired
+	 * checkpoint where the relay still holds rows beyond its checkpoint (duty now, others after the grace).
 	 */
 	private async retire(): Promise<void> {
 		const c = this.c;
@@ -293,46 +304,59 @@ export class Maintenance {
 		if (dead.length === 0) return;
 		const s = c.session;
 		const now = c.mono();
-		const canWrite = s !== null && s.canWrite && !c.readOnly && c.phase === "live" && !c.background && c.gate() === null && now >= c.ckpt.holdUntilMono;
-		let puts = RETIRES_PER_TICK;
-		let drops = DROPS_PER_TICK;
+		const grace = retireGrace(c.tuning.checkpoint.fallbackMs);
+		const every = retireRefreshEvery(grace);
+		const duty = (rec: StreamRecord) => (rec.docId !== null && st.duty.has(rec.docId)) || rec.lastOwnSeq >= rec.remoteHeadSeq;
+		for (const { rec } of dead) if (!rec.stale && rec.remoteCheckpointCoversSeq < rec.remoteHeadSeq && !st.since.has(rec.stream)) st.since.set(rec.stream, now);
+		if (s && c.phase === "live" && !c.background) await this.refreshDead(s, dead.map((d) => d.rec), now, every);
+		const cur: { rec: StreamRecord; why: DeadReason }[] = [];
 		for (const { rec, why } of dead) {
-			if (c.stopped || (puts <= 0 && drops <= 0)) return;
-			const stream = rec.stream;
-			// Own frames on their way (a late edit of a pruned doc): their rows come first, then the stream is retired.
-			// A merged alias's held frames are never sent: they go with the drop (Repo.tDropStream).
-			const own = c.outbox.ofStream(stream);
-			const held = why === "merged" && own.every((r) => r.state === "held") ? own.map((r) => r.clientFrameId) : null;
-			if (c.sess.isReading(stream) || rec.stale || (own.length > 0 && held === null)) continue;
-			if (rec.remoteCheckpointCoversSeq >= rec.remoteHeadSeq) {
-				if (drops <= 0) continue;
-				const h = c.handles.peek(stream);
-				if ((h && !c.handles.isClean(h)) || c.handles.loadingOf(stream)) continue;
-				drops--;
-				if (!(await c.repo.tDropStream(stream, rec, held ?? []))) continue;
-				if (held && held.length > 0) c.applyOutboxResult({ removed: held.flatMap((id) => c.outbox.get(id) ?? []), updated: [] });
-				c.handles.drop(stream);
-				for (const m of [c.ckpt.condSince, c.ckpt.jitter, c.ckpt.lastActivity, c.ckpt.backoffUntil, c.ckpt.tooLarge]) m.delete(stream);
-				st.forget(stream, rec.docId);
-				st.stats.dropped++;
-				st.pending = Math.max(0, st.pending - 1);
-				this.stats.drops++;
-				c.diag("retire-dropped", { cls: rec.cls, why, seq: rec.remoteHeadSeq });
-				continue;
-			}
-			if (!canWrite || puts <= 0 || !s || c.session !== s) continue;
+			const r = c.repo.stream(rec.stream);
+			if (r) cur.push({ rec: r, why });
+		}
+		const held = (rec: StreamRecord, why: DeadReason): ClientFrameId[] | null | undefined => {
+			// Own frames on their way (a late edit of a pruned doc): their rows come first, then the stream is retired
+			// (undefined: not now). A merged alias's held frames are never sent: they go with the drop (Repo.tDropStream).
+			const own = c.outbox.ofStream(rec.stream);
+			const h = why === "merged" && own.every((r) => r.state === "held") ? own.map((r) => r.clientFrameId) : null;
+			if (c.sess.isReading(rec.stream) || rec.stale || (own.length > 0 && h === null)) return undefined;
+			return h;
+		};
+		await this.dropDead(cur, held);
+		if (c.stopped) return;
+		const canWrite = s !== null && s.canWrite && !c.readOnly && c.phase === "live" && !c.background && c.gate() === null && now >= c.ckpt.holdUntilMono;
+		if (!canWrite || !s) return;
+		const fallbackMs = c.tuning.checkpoint.fallbackMs;
+		// Due puts in order of due time (duty first), as for checkpoints: the non-duty devices' jittered orders differ.
+		const due: { rec: StreamRecord; why: DeadReason; mine: boolean; at: number }[] = [];
+		for (const { rec: r0, why } of cur) {
+			const stream = r0.stream;
+			const rec = c.repo.stream(stream);
+			if (!rec || rec.remoteCheckpointCoversSeq >= rec.remoteHeadSeq || held(rec, why) === undefined) continue;
 			if ((st.backoffUntil.get(stream) ?? 0) > now) continue;
-			const duty = (rec.docId !== null && st.duty.has(rec.docId)) || rec.lastOwnSeq >= rec.remoteHeadSeq;
+			const mine = duty(rec);
 			if (!st.since.has(stream)) st.since.set(stream, now);
-			if (!duty && now - st.since.get(stream)! < c.tuning.checkpoint.fallbackMs + this.jitter(stream)) continue;
+			// The checkpoint jitter, scaled to the grace (one random draw per stream for both).
+			const jitter = fallbackMs > 0 ? Math.floor((this.jitter(stream) / fallbackMs) * grace) : 0;
+			const at = st.since.get(stream)! + grace + jitter;
+			if (!mine && now < at) continue;
+			due.push({ rec, why, mine, at: mine ? -Infinity : at });
+		}
+		due.sort((x, y) => x.at - y.at);
+		let puts = RETIRES_PER_TICK;
+		for (const { rec, why, mine } of due) {
+			if (c.stopped || puts <= 0 || c.session !== s) return;
+			const stream = rec.stream;
 			puts--;
+			// A batched refresh this recent stands in for the put's own read (the put is a CAS anyway).
+			const fresh = now - (st.refreshedAt.get(stream) ?? -Infinity) <= every;
 			try {
-				const o = await writeRetired(c.deps, c.ckpt, s, stream, { refreshFirst: !duty });
+				const o = await writeRetired(c.deps, c.ckpt, s, stream, { refreshFirst: !mine && !fresh });
 				this.count(`retire-${o.t}`);
 				if (o.t === "ok") {
 					st.stats.written++;
 					this.stats.retires++;
-					c.diag("retire-written", { cls: rec.cls, why, coversSeq: o.coversSeq, duty });
+					c.diag("retire-written", { cls: rec.cls, why, coversSeq: o.coversSeq, duty: mine });
 				} else if (o.t === "not-advancing") st.stats.refreshed++;
 				else if (o.t === "conflict") st.stats.conflicts++;
 				// A refresh that found rows this device has not read: catch-up reads them, the next tick retires.
@@ -343,6 +367,69 @@ export class Maintenance {
 				c.diag("checkpoint-failed", { cls: rec.cls, error: String(e) });
 			}
 		}
+	}
+
+	/**
+	 * Dead streams with rows beyond the known relay checkpoint re-read it in one readBatch per tick (as wide as
+	 * catch-up batches), from `every` after first seen dead and then every `every`, least recently read first: other
+	 * devices' retirements are learnt in about N / width requests, and those streams drop at once. The duty device's
+	 * own streams too: it puts 4 a tick, and a flood's backlog past the first `every` is mostly retired by the others
+	 * meanwhile (after their grace). Reads only: no write permission, gate or checkpoint hold needed (a read-only
+	 * device learns them too). Width 1: none, the put's own refresh covers it.
+	 */
+	private async refreshDead(s: RelaySession, recs: readonly StreamRecord[], now: number, every: number): Promise<void> {
+		const c = this.c;
+		const st = c.retire;
+		const width = Math.min(s.limits.readBatchStreams, c.tuning.readBatchStreams);
+		if (width < 2) return;
+		const at = (r: StreamRecord) => st.refreshedAt.get(r.stream) ?? -Infinity;
+		const due = recs.filter((r) => !r.stale && !r.frozen && r.remoteCheckpointCoversSeq < r.remoteHeadSeq && !c.sess.isReading(r.stream)
+			&& now - (st.since.get(r.stream) ?? now) >= every && now - at(r) >= every);
+		if (due.length === 0) return;
+		due.sort((x, y) => at(x) - at(y));
+		try {
+			const { served, retired } = await refreshRetiredBatch(c.deps, s, due.slice(0, width));
+			for (const stream of served) st.refreshedAt.set(stream, now);
+			st.stats.refreshed += retired;
+			st.stats.batches++;
+			this.stats.refreshBatches++;
+		} catch (e) {
+			this.count("retire-refresh-error");
+			c.diag("checkpoint-failed", { cls: "body", error: String(e) });
+		}
+	}
+
+	/** Dead streams nothing lies beyond on the relay any more: their records leave in one bounded transaction. */
+	private async dropDead(cur: readonly { readonly rec: StreamRecord; readonly why: DeadReason }[], held: (rec: StreamRecord, why: DeadReason) => ClientFrameId[] | null | undefined): Promise<void> {
+		const c = this.c;
+		const st = c.retire;
+		const batch: { rec: StreamRecord; why: DeadReason; held: ClientFrameId[] | null }[] = [];
+		let rows = 0;
+		for (const { rec, why } of cur) {
+			if (batch.length >= DROPS_PER_TICK) break;
+			if (rec.remoteCheckpointCoversSeq < rec.remoteHeadSeq) continue;
+			const hf = held(rec, why);
+			if (hf === undefined) continue;
+			const h = c.handles.peek(rec.stream);
+			if ((h && !c.handles.isClean(h)) || c.handles.loadingOf(rec.stream)) continue;
+			if (batch.length > 0 && rows + rec.tailRows > DROP_TAIL_ROWS_PER_TICK) break;
+			rows += rec.tailRows;
+			batch.push({ rec, why, held: hf });
+		}
+		if (batch.length === 0) return;
+		const ok = await c.repo.tDropStreams(batch.map(({ rec, held: hf }) => ({ stream: rec.stream, expect: rec, held: hf ?? [] })));
+		batch.forEach(({ rec, why, held: hf }, i) => {
+			if (!ok[i]) return;
+			const stream = rec.stream;
+			if (hf && hf.length > 0) c.applyOutboxResult({ removed: hf.flatMap((id) => c.outbox.get(id) ?? []), updated: [] });
+			c.handles.drop(stream);
+			for (const m of [c.ckpt.condSince, c.ckpt.jitter, c.ckpt.lastActivity, c.ckpt.backoffUntil, c.ckpt.tooLarge]) m.delete(stream);
+			st.forget(stream, rec.docId);
+			st.stats.dropped++;
+			st.pending = Math.max(0, st.pending - 1);
+			this.stats.drops++;
+			c.diag("retire-dropped", { cls: rec.cls, why, seq: rec.remoteHeadSeq });
+		});
 	}
 
 	/**

@@ -342,3 +342,40 @@ test("engine: ns settles at its newest candidate once quiet (below NS_CHECKPOINT
 		await drive(a.stop(), clock);
 	}
 });
+
+test("engine: a fallback device puts a backlog in order of due time (its own jitter), not in store order", async () => {
+	// Sim SOAK-FLOOD-RETIRE-BACKLOG: with a short fallback every device swept a flood's thousands of settle-due streams
+	// in the same store order, 2 puts a tick, so each stream was put by every device (one ok, the rest CAS conflicts).
+	const clock = new VirtualClock(Date.UTC(2026, 0, 1, 12, 0));
+	const relay = new SimRelay({ clock });
+	const fast = { ...TUNING, maintenanceMs: 25, checkpoint: { ...T, rows: 1e9, bytes: 1e12, hardRows: 1e9, hardBytes: 1e15, idleMs: 100, settleMs: 200, fallbackMs: 31 } };
+	const a = (await startTestEngine({ relay, deviceId: "dev-a", clock, tuning: { ...fast, maintenanceMs: 1e9 } })).engine;
+	const b = (await startTestEngine({ relay, deviceId: "dev-b", clock, tuning: fast })).engine;
+	try {
+		await until(() => a.status().phase === "live" && b.status().phase === "live", 10_000, "live", clock);
+		const ids: DocId[] = [];
+		for (let i = 0; i < 20; i++) {
+			ids.push(await drive(createDoc(a, `o${i}.md`, `seed ${i};`), clock));
+			await drive(editDoc(a, ids[i]!, (t) => t.insert(t.length, "e;")), clock);
+		}
+		// a (the duty device, no maintenance) never puts: b takes over every stream on its fallback.
+		const streams = ids.map((id) => a.streamOf(id));
+		const at: number[] = [];
+		const s = b.c.session!;
+		const put = s.putCheckpoint.bind(s);
+		s.putCheckpoint = (stream, c, prev, bytes) => {
+			at.push(b.c.ckpt.condSince.get(stream)! + b.c.ckpt.jitter.get(stream)!);
+			return put(stream, c, prev, bytes);
+		};
+		await converged([a, b], 30_000, clock);
+		// The same last activity everywhere: the 20 streams turn settle-idle in the same tick (same condSince).
+		const t = clock.monotonic();
+		for (const x of streams) b.c.ckpt.lastActivity.set(x, t);
+		await until(() => streams.every((x) => behind(relay, x) === 0), 30_000, "b checkpointed every stream", clock);
+		assert.equal(at.length, 20, "one put each");
+		assert.deepEqual(at, [...at].sort((x, y) => x - y), "in order of condSince + jitter");
+	} finally {
+		await drive(a.stop(), clock);
+		await drive(b.stop(), clock);
+	}
+});
