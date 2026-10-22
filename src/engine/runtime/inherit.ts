@@ -87,10 +87,11 @@ export async function inheritFromLineage(c: EngineCtx, inh: MetaInherit, side: (
 }
 
 /** A synced mirror entry as recovery imports it (§i.5 step 3); compose/syncedMirror.ts fromMirrorEntry. */
-function syncedRecordOf(e: { readonly docId: SyncedRecord["docId"]; readonly path: SyncedRecord["path"]; readonly kind: SyncedRecord["kind"]; readonly contentHash: SyncedRecord["contentHash"]; readonly nsTouchSeq: number; readonly blobRev: number }, nowMs: number): SyncedRecord {
+function syncedRecordOf(e: { readonly docId: SyncedRecord["docId"]; readonly path: SyncedRecord["path"]; readonly kind: SyncedRecord["kind"]; readonly contentHash: SyncedRecord["contentHash"]; readonly nsTouchSeq: number; readonly blobRev: number; readonly fileGone?: true; readonly renamedTo?: SyncedRecord["renamedTo"]; readonly heldHash?: SyncedRecord["heldHash"] }, nowMs: number): SyncedRecord {
 	return {
 		docId: e.docId, path: e.path, pathKey: pathKey(e.path), kind: e.kind, contentHash: e.contentHash, fingerprint: "" as DiskFingerprint,
 		size: -1, mtimeMs: 0, bodyVersion: null, blobRev: e.blobRev, nsTouchSeq: e.nsTouchSeq, hasBase: false, syncedAtMs: nowMs,
+		...(e.fileGone ? { fileGone: true as const } : {}), ...(e.renamedTo ? { renamedTo: e.renamedTo } : {}), ...(e.heldHash !== undefined ? { heldHash: e.heldHash } : {}),
 	};
 }
 

@@ -1718,18 +1718,28 @@ varuint unmirroredCount, unmirroredCount × varstring docId   (v3)
   the lineage dirs' mirror and snapshot files once its own outbox and synced mirrors are written.
 
 **Synced mirror** (`synced-a.bin` / `synced-b.bin`, written `SYNCED_MIRROR_DEBOUNCE_MS` (2 s,
-src/engine/compose/syncedMirror.ts:29) after the first change; a fixed delay, not reset by later changes):
+src/engine/compose/syncedMirror.ts) after the first change; a fixed delay, not reset by later changes):
 
 ```
 8B magic "YAOSSYN1", u8 version, varstring vaultId, varstring vaultEpoch, varstring deviceId,
 varuint generation, varuint writtenAtMs, varuint nsCoversSeq, varuint count,
-count × { varstring docId, varstring path, u8 kindCode, 32B contentHash, varuint nsTouchSeq, varuint bodyRemoteSeq, varuint blobRev },
+count × { varstring docId, varstring path, u8 kindCode, 32B contentHash, varuint nsTouchSeq, varuint bodyRemoteSeq, varuint blobRev,
+          u8 flags (v2: bit0 fileGone, bit1 renamedTo, bit2 heldHash),
+          [bit1] varstring renamedTo.to, varuint renamedTo.atMs, [bit2] 32B heldHash },
 32B sha256
 ```
 
 - Lets recovery tell "unchanged since sync" (hash equal) from "edited offline", so an IDB loss does not produce
   conflict copies.
 - Base texts are not mirrored. Recovered docs merge without a base only when both sides changed.
+- **Marks** (v2): a record's decided delete (`fileGone`), the user's rename that took the file away (`renamedTo`) and
+  the disk content a content merge the write gate refused left (`heldHash`, §f.6 rename inference pairs by it). They
+  are what the store alone knows of a file this device could not publish yet; recovered without them, the moved file
+  read as a new doc and the old one came back at its path (sim suite-1 wipe/revoke/roll seeds 40 and 112). Version 1
+  still decodes (no marks).
+- **Written at once**, not a debounce later, when a pass changes a record's marks (src/engine/compose/vaultRuntime.ts
+  `runPass`, also when the write gate stopped the pass), and when the outbox mirror newly lists a doc as unmirrored
+  (`MirrorWriter.onUnmirrored`): that doc's record is then all recovery has of it here.
 
 **Snapshots** (`snapshots/`): each snapshot's parts and its descriptor, plus the download cache for one remote
 snapshot (§j.4). A snapshot exists iff its descriptor decodes; parts without one are swept.
@@ -1969,11 +1979,19 @@ All are in `src/core/types.ts`.
   - *Missing* = synced docs whose `S.pathKey` has no L entry. *New* = L entries with no R or S match.
   - Pair by `(kind, contentHash)`. A unique pair is a rename. Several equal hashes are paired by score (same leaf
     name, then same parent folder), with ties broken by path code-unit order. Unpaired ones become delete + create.
+  - A missing doc also pairs by `SyncedEntry.heldHash`: the disk content of a content merge the write gate refused
+    (key missing, src/engine/reconcile/runner.ts `keepHeldContent`). S stays the merge base while the file moved on;
+    without it a file edited and then renamed before this device could write (or while the app was down) read as a
+    new doc. It is dropped with the next sync point (reconcile/store.ts). A file edited again after such a rename,
+    unobserved, still pairs with nothing (open: SIM-S1-HELD-EDIT-UNOBSERVED-RENAME).
   - Observed `rename` events that the scan verified (the target exists) win over inference, and may carry a content
     change (rename + edit).
-  - Observed renames live in memory. One that took a synced doc's file away while inference was off (ns not ready)
-    is kept in the doc's `fileGone` mark (`SyncedEntry.renamedTo`) and replayed after an engine restart. Without it
-    a new file at the old path merged into the doc as an edit (edit beats delete), deleting the old content.
+  - Observed renames live in memory. One that took a synced doc's file away while inference was off (ns not ready),
+    or whose `nsRename` the write gate refused, is kept in the doc's `fileGone` mark (`SyncedEntry.renamedTo`) and
+    replayed after an engine restart (and, through the synced mirror, after an IDB loss). Without it a new file at
+    the old path merged into the doc as an edit (edit beats delete), deleting the old content. A gated pass commits
+    the plan's marks before it throws, as they wait for nothing. While such a rename is known, a file at the doc's
+    remote path is not the doc's (planner `localFor`): the file is where the rename took it.
   - An observed rename wins even when the source path is re-occupied. If the file there holds exactly S's bytes, the
     engine re-materialized the doc there before the event arrived, so S describes that file and not the moved one.
     The moved file then merges with no base (`reconcileContent.noBase`): neither S's stored base nor its

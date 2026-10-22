@@ -19,7 +19,16 @@ import { decodeOutboxMirror, encodeOutboxMirror, nextMirrorSlot, pickOutboxMirro
 
 const FILES: readonly [SideFileName, SideFileName] = ["outbox-a.bin", "outbox-b.bin"];
 
-function identityOf(c: EngineCtx): MirrorIdentity {
+/** What MirrorWriter reads of the engine context. */
+export interface MirrorWriterCtx extends Pick<EngineCtx, "self" | "stopped" | "now" | "diag"> {
+	readonly outbox: Pick<EngineCtx["outbox"], "all">;
+	readonly ports: { readonly hash: EngineCtx["ports"]["hash"]; readonly clock: Pick<EngineCtx["ports"]["clock"], "setTimer" | "clearTimer"> };
+	readonly tuning: Pick<EngineCtx["tuning"], "mirrorDebounceMs">;
+	readonly opts: Pick<EngineCtx["opts"], "vaultId">;
+	readonly repo: { readonly identity: Pick<EngineCtx["repo"]["identity"], "vaultEpoch"> };
+}
+
+function identityOf(c: MirrorWriterCtx): MirrorIdentity {
 	return { vaultId: c.opts.vaultId, vaultEpoch: c.repo.identity.vaultEpoch, deviceId: c.self };
 }
 
@@ -31,8 +40,18 @@ export class MirrorWriter {
 	private dirty = false;
 	private writing: Promise<void> | null = null;
 	stats = { writes: 0, failures: 0, lastFrames: 0, lastBytes: 0 };
+	/** The unmirrored docs of the last mirror this writer put on disk (or found there). */
+	private lastUnmirrored: ReadonlySet<string> = new Set();
+	/**
+	 * Called after a write that lists a doc unmirrored the previous mirror did not (its frames left the mirror: an
+	 * own stale commit's unsealed copy, the size limit). Recovery then re-derives that doc from disk against its
+	 * synced-mirror record, so the synced mirror must hold the record now, not a debounce later: a store lost in
+	 * between recovered with neither, read the doc as never seen here, and put the remote text back at a path the
+	 * user had renamed or deleted it from (sim suite-1 wipe/revoke/roll seed 40). The composer flushes it.
+	 */
+	onUnmirrored: (() => void) | null = null;
 
-	constructor(private readonly c: EngineCtx, private readonly files: SideFilePort | null) {}
+	constructor(private readonly c: MirrorWriterCtx, private readonly files: SideFilePort | null) {}
 
 	get enabled(): boolean {
 		return this.files !== null;
@@ -54,6 +73,7 @@ export class MirrorWriter {
 					if (g > newest) {
 						newest = g;
 						this.onDisk = { frames: new Set(m.frames.map((f) => f.clientFrameId)), unmirrored: m.unmirrored ?? [] };
+						this.lastUnmirrored = new Set(m.unmirrored ?? []);
 					}
 				}
 			} catch {
@@ -135,6 +155,9 @@ export class MirrorWriter {
 				this.stats.writes++;
 				this.stats.lastFrames = frames.length;
 				this.stats.lastBytes = bytes.length;
+				const grew = unmirrored.some((d) => !this.lastUnmirrored.has(d));
+				this.lastUnmirrored = new Set(unmirrored);
+				if (grew) this.onUnmirrored?.();
 			} catch (e) {
 				this.stats.failures++;
 				this.dirty = true; // still behind: the next change or flush retries

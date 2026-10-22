@@ -570,6 +570,12 @@ export interface SyncedMirrorEntry {
 	readonly nsTouchSeq: Seq;
 	readonly bodyRemoteSeq: Seq;
 	readonly blobRev: Seq;
+	/** Mirror format 2: SyncedRecord.fileGone. */
+	readonly fileGone?: true;
+	/** Mirror format 2: SyncedRecord.renamedTo. */
+	readonly renamedTo?: { readonly to: VaultPath; readonly atMs: number };
+	/** Mirror format 2: SyncedRecord.heldHash. */
+	readonly heldHash?: ContentHash;
 }
 
 export interface SyncedMirror {

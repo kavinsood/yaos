@@ -17,7 +17,13 @@ import { docKindCode, docKindFromCode } from "./nsOps";
 export const OUTBOX_MIRROR_MAGIC = new Uint8Array([0x59, 0x41, 0x4f, 0x53, 0x4f, 0x42, 0x58, 0x31]);
 /** "YAOSSYN1" */
 export const SYNCED_MIRROR_MAGIC = new Uint8Array([0x59, 0x41, 0x4f, 0x53, 0x53, 0x59, 0x4e, 0x31]);
-export const MIRROR_FORMAT_VERSION = 1;
+/**
+ * The synced mirror's format: 2 adds each entry's decided delete (`fileGone`), the observed rename that took the
+ * file away (`renamedTo`) and the disk content a refused commit left (`heldHash`): a store lost after a rename the
+ * planner could not infer or carry out yet (ns not ready, write gate refused) would otherwise recover the record as a
+ * plain sync point and read the moved file as new. Version 1 still decodes (none of them).
+ */
+export const MIRROR_FORMAT_VERSION = 2;
 /**
  * The outbox mirror's format: 2 adds each frame's origins (identity-per-store §5.2: a frame inherited from a lost
  * predecessor store and re-issued under this one keeps the identity it had there, for the commit check); 3 adds the
@@ -76,6 +82,12 @@ export interface SyncedMirrorEntryData {
 	readonly nsTouchSeq: Seq;
 	readonly bodyRemoteSeq: Seq;
 	readonly blobRev: Seq;
+	/** Format 2: SyncedEntry.fileGone. */
+	readonly fileGone?: true;
+	/** Format 2: SyncedEntry.renamedTo (atMs floored to an integer). */
+	readonly renamedTo?: { readonly to: VaultPath; readonly atMs: number };
+	/** Format 2: SyncedEntry.heldHash. */
+	readonly heldHash?: ContentHash;
 }
 
 export interface SyncedMirrorData extends MirrorIdentity {
@@ -203,12 +215,15 @@ export function encodeSyncedMirror(m: SyncedMirrorData, hash: Sha): Promise<Uint
 	for (const e of m.entries) {
 		w.varstring(e.docId).varstring(e.path).u8(docKindCode(e.kind)).fixed(hashToBytes(e.contentHash), 32);
 		w.varuint(e.nsTouchSeq).varuint(e.bodyRemoteSeq).varuint(e.blobRev);
+		w.u8((e.fileGone ? 1 : 0) | (e.renamedTo ? 2 : 0) | (e.heldHash !== undefined ? 4 : 0));
+		if (e.renamedTo) w.varstring(e.renamedTo.to).varuint(Math.max(0, Math.floor(e.renamedTo.atMs)));
+		if (e.heldHash !== undefined) w.fixed(hashToBytes(e.heldHash), 32);
 	}
 	return seal(w, hash);
 }
 
 export function decodeSyncedMirror(bytes: Uint8Array, hash: Sha): Promise<MirrorDecodeResult<SyncedMirrorData>> {
-	return open(bytes, SYNCED_MIRROR_MAGIC, hash, (r) => {
+	return open(bytes, SYNCED_MIRROR_MAGIC, hash, (r, version) => {
 		const id = readIdentity(r);
 		const nsCoversSeq = r.varuint();
 		const n = r.varuint();
@@ -220,10 +235,22 @@ export function decodeSyncedMirror(bytes: Uint8Array, hash: Sha): Promise<Mirror
 			const contentHash = bytesToHash(r.copy(32));
 			const nsTouchSeq = r.varuint();
 			const bodyRemoteSeq = r.varuint();
-			entries.push({ docId, path, kind, contentHash, nsTouchSeq, bodyRemoteSeq, blobRev: r.varuint() });
+			const blobRev = r.varuint();
+			const flags = version >= 2 ? r.u8() : 0;
+			if (flags > 7) throw new CodecError("unknown synced entry flags");
+			let renamedTo: SyncedMirrorEntryData["renamedTo"];
+			if (flags & 2) {
+				const to = r.varstring();
+				renamedTo = { to, atMs: r.varuint() };
+			}
+			const heldHash = flags & 4 ? bytesToHash(r.copy(32)) : undefined;
+			entries.push({
+				docId, path, kind, contentHash, nsTouchSeq, bodyRemoteSeq, blobRev,
+				...(flags & 1 ? { fileGone: true as const } : {}), ...(renamedTo ? { renamedTo } : {}), ...(heldHash !== undefined ? { heldHash } : {}),
+			});
 		}
 		return { ...id, nsCoversSeq, entries };
-	});
+	}, [1, MIRROR_FORMAT_VERSION]);
 }
 
 /**
