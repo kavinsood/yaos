@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import { Text } from "@codemirror/state";
 import type { EditorBinding, EditorBindingSpec, ViewEvent } from "../ports/workspace";
 import { ObsidianWorkspace, type EditorAdapter, type MarkdownViewLike, type WorkspaceLike } from "./obsidianWorkspace";
+import { BindingManager } from "./binding";
+import { VirtualClock } from "../sim/clock";
+import { SimBodyEngine } from "../sim/bodyEngine";
 
 /** An Obsidian Editor stand-in: reading its whole value is the O(N) call the adapter must never make. */
 class FakeEditor {
@@ -44,6 +47,30 @@ class FakeMarkdownView implements MarkdownViewLike {
 		if (this.lastSavedData === o || this.lastSavedData === null) return;
 		this.lastSavedData = o;
 		this.log.push(`write:${o}`);
+	}
+	/** User typing: the editor changes and the view is dirty (Obsidian's requestSave is debounced). */
+	type(text: string): void {
+		this.editor.doc = Text.of(text.split("\n"));
+		this.dirty = true;
+	}
+	/** TextFileView.onUnloadFile (1.x): save, then clear the view (lastSavedData = null, the editor emptied). */
+	async onUnloadFile(): Promise<void> {
+		this.log.push("unload");
+		await this.save();
+		this.lastSavedData = null;
+		this.editor.doc = Text.of([""]);
+	}
+	/** leaf.detach -> view.onClose -> FileView.onClose -> onUnloadFile(file); file = null. Layout-change follows. */
+	async close(): Promise<void> {
+		await this.onUnloadFile();
+		this.file = null;
+	}
+	/** leaf.openFile: FileView.loadFile unloads the current file first, then onLoadFile: setViewData(text, clear = true). */
+	async openFile(path: string, text: string): Promise<void> {
+		await this.onUnloadFile();
+		this.file = { path };
+		this.setViewData(text, true);
+		this.lastSavedData = text;
 	}
 }
 
@@ -221,4 +248,69 @@ test("onInternalDataChange names its view as the source of the quick preview its
 	v1.onInternalDataChange();
 	v2.setViewData("reload", false);
 	assert.deepEqual(seen, [r1.viewId, null]);
+});
+
+test("held saves across Obsidian's close and file switch: onUnloadFile's save writes nothing, heldText keeps the editor until released", async () => {
+	for (const leave of ["close", "switch"] as const) {
+		const ws = new FakeWorkspace();
+		const v = new FakeMarkdownView({ path: "z.md" });
+		v.editor.doc = Text.of(["x body", ""]);
+		v.lastSavedData = "z body\n";
+		ws.leaves = [{ view: v }];
+		const w = new ObsidianWorkspace(ws, fakeEditors([]));
+		const ref = w.listMarkdownViews()[0];
+		assert.ok(ref);
+		assert.equal(ref.holdSaves(true), false);
+		assert.equal(ref.heldText(), null, "nothing skipped yet");
+		v.type("x body\nunsaved");
+		await v.save(); // the 2 s debounced save while held
+		assert.equal(ref.heldText()?.toString(), "x body\nunsaved");
+		ref.bind(noSpec); // a bind starts unheld (the host holds again), the skipped text stays
+		ref.holdSaves(true);
+		assert.equal(ref.heldText()?.toString(), "x body\nunsaved");
+		v.type("typed\nx body\nunsaved");
+		if (leave === "close") {
+			await v.close();
+			ws.leaves = [];
+		} else await v.openFile("other.md", "other");
+		ws.fire();
+		assert.equal(v.log.some((l) => l.startsWith("write:")), false, `${leave}: onUnloadFile's save wrote nothing`);
+		assert.deepEqual(v.log.filter((l) => l === "unload").length, 1);
+		assert.equal(ref.heldText()?.toString(), "typed\nx body\nunsaved", `${leave}: the editor at that save, after Obsidian cleared it`);
+		ref.holdSaves(false);
+		assert.equal(ref.heldText(), null, "released: forgotten");
+	}
+});
+
+test("binding over this adapter: a stray view closed (or switched) while its saves are held writes nothing and its text goes to heldEdits", async () => {
+	for (const [leave, phase] of [["close", "opening"], ["close", "attaching"], ["switch", "attaching"]] as const) {
+		const clock = new VirtualClock();
+		const ws = new FakeWorkspace();
+		const v = new FakeMarkdownView({ path: "x.md" });
+		v.editor.doc = Text.of(["x body", ""]);
+		v.lastSavedData = "x body\n";
+		ws.leaves = [{ view: v }];
+		const engine = new SimBodyEngine(clock);
+		const x = engine.add("x.md", "x body\n");
+		engine.add("z.md", "z body\n");
+		const bm = new BindingManager({ workspace: new ObsidianWorkspace(ws, fakeEditors([])), vault: { caseInsensitive: false }, clock, link: engine.link, notice: () => undefined });
+		engine.bm = bm;
+		bm.start();
+		await clock.advance(50);
+		assert.equal(bm.slotState(1), "bound");
+		v.file = { path: "z.md" }; // Obsidian moved view.file with a rename; the doc stayed at x.md
+		engine.delay = () => 400;
+		bm.onDocRetarget(x, { t: "renamed", path: "z.md" as never, stray: true });
+		for (let i = 0; i < 100 && bm.slotState(1) !== phase; i++) await clock.advance(50);
+		assert.equal(bm.slotState(1), phase, `${leave} ${phase}`);
+		v.type("x body\nunsaved");
+		if (leave === "close") {
+			await v.close();
+			ws.leaves = [];
+		} else await v.openFile("other.md", "other");
+		ws.fire(); // layout-change / file-open: closed or file-changed
+		await clock.advance(5_000);
+		assert.equal(v.log.some((l) => l.startsWith("write:")), false, `${leave} ${phase}: nothing written over z.md`);
+		assert.deepEqual(engine.held, [{ docId: x, path: "z.md", text: "x body\nunsaved" }], `${leave} ${phase}`);
+	}
 });

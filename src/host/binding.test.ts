@@ -397,3 +397,48 @@ test("binding: a stray retarget holds the view's saves until it binds the file's
 	assert.equal(vault.textOf("z.md"), "ONE\ntwo\nz\n", "the held save ran once bound");
 	assert.equal(engine.text("x.md"), "one\ntwo\nx\n");
 });
+
+test("binding: a view closed while a merged or pruned re-open is in flight saves its edits to its file", async () => {
+	for (const change of [{ t: "merged", into: "d-other" }, { t: "renamed", path: "a.md" }] as const) {
+		const s = setup();
+		const { clock, ws, engine, bm, vault } = s;
+		const docId = file(s, "a.md", "one\ntwo\n");
+		bm.start();
+		const v = ws.openFile("a.md");
+		assert.ok(v);
+		await clock.advance(5);
+		engine.delay = () => 400;
+		bm.onDocRetarget(docId, change as never);
+		v.edit(0, 3, "ONE"); // typed while the view re-opens
+		await ws.closeView(v.viewId);
+		await clock.advance(5_000);
+		assert.equal(vault.textOf("a.md"), "ONE\ntwo\n", change.t);
+	}
+});
+
+test("binding: a view that goes away while a stray retarget holds its saves sends its text to a conflict copy", async () => {
+	type Leave = "close" | "switch";
+	type Phase = "opening" | "attaching";
+	for (const [leave, phase] of [["close", "opening"], ["close", "attaching"], ["switch", "opening"]] as [Leave, Phase][]) {
+		const s = setup();
+		const { clock, ws, engine, bm, vault } = s;
+		const x = file(s, "x.md", "one\ntwo\nx\n");
+		file(s, "z.md", "one\ntwo\nz\n");
+		file(s, "other.md", "other\n");
+		bm.start();
+		const v = ws.openFile("x.md");
+		assert.ok(v);
+		await clock.advance(5);
+		v.path = "z.md";
+		engine.delay = () => 400;
+		bm.onDocRetarget(x, { t: "renamed", path: "z.md" as never, stray: true });
+		for (let i = 0; i < 100 && bm.slotState(v.viewId) !== phase; i++) await clock.advance(50);
+		assert.equal(bm.slotState(v.viewId), phase, `${leave} ${phase}`);
+		v.edit(0, 3, "ONE"); // typed while held: this view's text is its only copy
+		if (leave === "close") await ws.closeView(v.viewId);
+		else assert.ok(await ws.switchFile(v.viewId, "other.md"));
+		await clock.advance(5_000);
+		assert.equal(vault.textOf("z.md"), "one\ntwo\nz\n", `${leave} ${phase}: the held save never wrote z.md`);
+		assert.deepEqual(engine.held, [{ docId: x, path: "z.md", text: "ONE\ntwo\nx\n" }], `${leave} ${phase}: the text goes to a conflict copy`);
+	}
+});

@@ -72,6 +72,7 @@ export class SimEditorView implements EditorViewRef {
 	private binding: SimBinding | null = null;
 	private interceptor: ExternalReloadHandler | null = null;
 	private held = false;
+	private skippedDoc: Text | null = null;
 	private skipped = false;
 	private dirty = false;
 	private saveTimer: TimerHandle | null = null;
@@ -141,6 +142,7 @@ export class SimEditorView implements EditorViewRef {
 		const skipped = this.skipped;
 		this.held = hold;
 		this.skipped = false;
+		if (!hold) this.skippedDoc = null;
 		return !hold && skipped;
 	}
 
@@ -156,6 +158,10 @@ export class SimEditorView implements EditorViewRef {
 		this.lastSavedData = o;
 		this.counters.saves++;
 		this.ws.vault.editorSave(this.path, o);
+	}
+
+	heldText(): Text | null {
+		return this.skippedDoc;
 	}
 
 	isBound(): boolean {
@@ -200,6 +206,7 @@ export class SimEditorView implements EditorViewRef {
 			this.binding?.spec.onSaveRead();
 			if (this.held && this.lastSavedData !== null) {
 				this.skipped = true;
+				this.skippedDoc = this.doc;
 				return this.lastSavedData;
 			}
 		}

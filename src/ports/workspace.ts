@@ -69,6 +69,12 @@ export interface EditorViewRef {
 	 * skipped meanwhile. Used while the engine merges an external reload the editor does not show yet.
 	 */
 	holdSaves(hold: boolean): boolean;
+	/**
+	 * The editor document when a save last skipped while held (O(1): CodeMirror Text is immutable), kept across
+	 * binds and the view's close until holdSaves(false); null when none skipped. A close or file switch while held
+	 * reads the edits that save would have written here (Obsidian's onUnloadFile save runs before the view goes).
+	 */
+	heldText(): Text | null;
 	/** Force Obsidian's save now (instead of its 2 s debounce). */
 	save(): Promise<void>;
 }

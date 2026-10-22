@@ -10,6 +10,8 @@ import assert from "node:assert/strict";
 import type { VaultEpoch } from "../core/types";
 import { BLOB_TRANSFER_IDLE_MS } from "../core/limits";
 import { pathKey } from "../core/paths/pathKey";
+import { encodeUtf16 } from "../protocol/utf16";
+import type { ComposedEngine } from "../engine/compose/protocolEngine";
 import type { EngineResultValue, EngineSettings } from "../protocol/messages";
 import { VirtualClock } from "./clock";
 import { SIM_SETTINGS, SimDevice, type SimDeviceOptions } from "./device";
@@ -789,6 +791,27 @@ test("a stray bound editor with unsaved edits over another doc's file: neither t
 	assert.ok(view.isBound(), "the view is bound again");
 	assert.equal(view.getText(), "z body\n");
 	assert.deepEqual([...b.vault.snapshot().entries()].sort(), [...a.vault.snapshot().entries()].sort());
+});
+
+test("heldEdits: the text a held view left with goes to a conflict copy of the file it showed, on every device", async () => {
+	// The host sends it when a view closes or switches files while a stray retarget holds its saves (binding.ts
+	// keepHeldEdits); the sim's re-open is too quick for a close to land inside that window.
+	const { clock, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("z.md", "z body\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	const body = (a.vrt?.engine as unknown as { boundBody: ComposedEngine["boundBody"] } | undefined)?.boundBody;
+	assert.ok(body);
+	body.textChunk({ t: "textChunk", uploadId: 9_001, bytes: encodeUtf16("x body\nunsaved\n"), last: true });
+	const done = body.heldEdits({ t: "heldEdits", docId: "d-x" as never, path: "z.md" as never, text: 9_001 }); // runs on the virtual clock
+	await clock.advance(30_000);
+	await done;
+	for (const d of [a, b]) {
+		const files = [...d.vault.snapshot().entries()].sort();
+		assert.deepEqual(files.map(([, t]) => t), ["x body\nunsaved\n", "z body\n"], d.name);
+		assert.ok(files[0]?.[0].startsWith("z (conflict"), `${d.name}: ${files[0]?.[0]}`);
+	}
 });
 
 test("bound views on a file no doc is synced at re-open only when two pass ends saw it; a rename of the open note never does", async () => {

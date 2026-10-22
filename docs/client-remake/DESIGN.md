@@ -905,6 +905,11 @@ cold ──load──▶ resident ──bind──▶ bound
     the old doc's text over the file. The bind merges against the old doc's text (its mirror), so the file's doc
     keeps its content, and edits not yet pushed apply on top or go to a conflict copy. With the file's doc's own
     base, the editor read as an edit replacing that doc's text.
+  - The hold lasts from the retarget to `bound`; a bind starts unheld, so the host holds again right after it. If the
+    view closes or switches files while held, Obsidian's save in `onUnloadFile` is skipped. The port's `heldText()`
+    gives the editor document at that save, and the host sends it as `heldEdits`. The engine writes it to a conflict
+    copy of the file, unless it is just the old doc's text. Merged and pruned re-opens hold nothing: a save meanwhile
+    writes the view's own file, whose synced base is the old doc's text, so the engine reads it as an ordinary edit.
 - **Engine death** (§g.4): the runtime stops, and `stop` flushes and unbinds every view; the edits stay in the
   editors. The user's restart is a new runtime, which binds every view as at a first open. Text the dead engine took
   but never committed is still in the editor: the bind merge brings it back, or keeps the editor side as a conflict

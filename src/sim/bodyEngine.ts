@@ -36,6 +36,8 @@ export class SimBodyEngine {
 	bm: BindingManager | null = null;
 	/** Delay of the next message in either direction (ms); FIFO is kept per direction. */
 	delay: () => number = () => 0;
+	/** heldEdits received (the engine writes each to a conflict copy of `path`). */
+	readonly held: { docId: DocId; path: string; text: string | null }[] = [];
 	private readonly uploads = new Map<number, string[]>();
 	private readonly done = new Map<number, string>();
 	private toEngineAt = 0;
@@ -123,6 +125,9 @@ export class SimBodyEngine {
 
 	private receive(m: MainToEngine): void {
 		switch (m.t) {
+			case "heldEdits":
+				this.held.push({ docId: m.docId, path: m.path, text: this.take(m.text) });
+				return;
 			case "textChunk": {
 				const parts = this.uploads.get(m.uploadId) ?? [];
 				parts.push(decodeUtf16(m.bytes));

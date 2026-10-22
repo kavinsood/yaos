@@ -73,6 +73,8 @@ interface ViewSlot {
 	heldStray: boolean;
 	/** Merge base of the next bind after a stray retarget: the old doc's text (onDocRetarget). */
 	carryBase: Text | null;
+	/** The stray retarget's old doc and the file the view showed (keepHeldEdits). */
+	stray: { readonly docId: DocId; readonly path: VaultPath } | null;
 }
 
 export interface BindingStats {
@@ -87,6 +89,8 @@ export interface BindingStats {
 	uploads: number;
 	uploadUnits: number;
 	creditsSent: number;
+	/** Held views that went away after a stray retarget, their text sent to a conflict copy (keepHeldEdits). */
+	heldEdits: number;
 }
 
 /** A text to upload: a CodeMirror Text (sliceString) or a string, read one chunk at a time. */
@@ -109,7 +113,7 @@ export class BindingManager {
 	private nextPush = 1;
 	private credit = 0;
 	private creditQueued = false;
-	readonly stats: BindingStats = { pushes: 0, rejects: 0, entries: 0, bounds: 0, resyncs: 0, reloads: 0, siblingCopies: 0, saveMarks: 0, uploads: 0, uploadUnits: 0, creditsSent: 0 };
+	readonly stats: BindingStats = { pushes: 0, rejects: 0, entries: 0, bounds: 0, resyncs: 0, reloads: 0, siblingCopies: 0, saveMarks: 0, uploads: 0, uploadUnits: 0, creditsSent: 0, heldEdits: 0 };
 
 	constructor(private readonly deps: BindingDeps) {}
 
@@ -254,12 +258,34 @@ export class BindingManager {
 		this.releaseStray(s);
 	}
 
-	/** End a stray retarget's save hold (the view bound again, or stays unbound); a skipped save runs now. */
-	private releaseStray(slot: ViewSlot): void {
+	/**
+	 * End a stray retarget's save hold (the view bound again, or stays unbound): a skipped save runs now (`save`),
+	 * unless the view went away or shows another file (keepHeldEdits kept its text).
+	 */
+	private releaseStray(slot: ViewSlot, save = true): void {
 		slot.carryBase = null;
+		slot.stray = null;
 		if (!slot.heldStray) return;
 		slot.heldStray = false;
-		if (slot.view.holdSaves(false)) void slot.view.save().catch(() => undefined);
+		if (slot.view.holdSaves(false) && save) void slot.view.save().catch(() => undefined);
+	}
+
+	/**
+	 * The view closes or switches files while its saves are held after a stray retarget: Obsidian's save of it
+	 * (onUnloadFile) was skipped, and the view's text is the only copy of the edits not pushed to the old doc and of
+	 * those typed since. The engine writes it to a conflict copy of the file the view showed (heldEdits). Nothing
+	 * beyond the old doc's text (all of it in that doc's replica): nothing to keep.
+	 */
+	private keepHeldEdits(slot: ViewSlot): void {
+		const stray = slot.stray;
+		const text = slot.heldStray ? slot.view.heldText() : null;
+		this.releaseStray(slot, false);
+		if (!stray || !text || !this.running) return;
+		if (slot.carryBase?.eq(text)) return;
+		this.stats.heldEdits++;
+		void this.upload(ofText(text), () => true).then((id) => {
+			if (id !== null) this.deps.link.post({ t: "heldEdits", docId: stray.docId, path: stray.path, text: id });
+		});
 	}
 
 	onDocRetarget(docId: DocId, change: { readonly t: "renamed"; readonly path: VaultPath; readonly stray?: true } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" }): void {
@@ -278,6 +304,7 @@ export class BindingManager {
 				if (!slot.heldStray) slot.view.holdSaves(true);
 				slot.heldStray = true;
 				slot.carryBase = carry;
+				slot.stray = { docId, path: slot.view.path ?? change.path };
 			}
 			void this.open(slot);
 		}
@@ -344,7 +371,7 @@ export class BindingManager {
 		return {
 			viewId: view.viewId, view, seq: 0, state: "idle", doc: null, binding: null, client: null, unintercept: null,
 			attachDoc: null, attachId: 0, attachPosted: false, timer: null, lastLocalMono: -1, reload: 0, reloadText: null, reloadChain: Promise.resolve(),
-			heldStray: false, carryBase: null,
+			heldStray: false, carryBase: null, stray: null,
 		};
 	}
 
@@ -366,7 +393,10 @@ export class BindingManager {
 		switch (e.t) {
 			case "opened": {
 				const existing = this.slots.get(e.view.viewId);
-				if (existing) this.unbindSlot(existing);
+				if (existing) {
+					this.keepHeldEdits(existing);
+					this.unbindSlot(existing);
+				}
 				const slot = this.newSlot(e.view);
 				this.slots.set(slot.viewId, slot);
 				void this.open(slot);
@@ -377,15 +407,18 @@ export class BindingManager {
 				if (!slot) {
 					slot = this.newSlot(e.view);
 					this.slots.set(slot.viewId, slot);
-				} else this.unbindSlot(slot);
+				} else {
+					this.keepHeldEdits(slot);
+					this.unbindSlot(slot);
+				}
 				slot.reloadText = null; // another file now: its pending reload is moot
-				this.releaseStray(slot);
 				void this.open(slot);
 				return;
 			}
 			case "closed": {
 				const slot = this.slots.get(e.viewId);
 				if (!slot) return;
+				this.keepHeldEdits(slot);
 				this.unbindSlot(slot);
 				this.slots.delete(e.viewId);
 				return;
@@ -458,6 +491,7 @@ export class BindingManager {
 			this.idle(slot, "idle");
 			return;
 		}
+		if (slot.heldStray) slot.view.holdSaves(true); // a bind starts unheld; held until `bound`
 		Object.assign(slot, { binding, client, doc, state: "attaching", attachPosted: false });
 		doc.slots.add(slot);
 		this.intercept(slot);

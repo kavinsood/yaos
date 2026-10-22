@@ -69,6 +69,7 @@ class ObsidianViewRef implements EditorViewRef {
 	private handler: ExternalReloadHandler | null = null;
 	private held = false;
 	private skipped = false;
+	private skippedDoc: Text | null = null;
 	private readonly orig = new Map<Wrapped, { fn: (...a: never[]) => unknown; own: boolean }>();
 
 	constructor(
@@ -124,9 +125,14 @@ class ObsidianViewRef implements EditorViewRef {
 		const skipped = this.skipped;
 		this.held = hold;
 		this.skipped = false;
+		if (!hold) this.skippedDoc = null;
 		if (hold) this.wrap();
 		else if (!this.binding && !this.handler) this.unwrap();
 		return !hold && skipped;
+	}
+
+	heldText(): Text | null {
+		return this.skippedDoc;
 	}
 
 	save(): Promise<void> {
@@ -178,6 +184,7 @@ class ObsidianViewRef implements EditorViewRef {
 				self.spec?.onSaveRead();
 				if (self.held && typeof this.lastSavedData === "string") {
 					self.skipped = true;
+					self.skippedDoc = self.editors.doc(this.editor) ?? self.skippedDoc;
 					return this.lastSavedData;
 				}
 			}
