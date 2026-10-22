@@ -252,6 +252,12 @@ Kept here until `sim-port` merges; then git history holds them.
   doc's own: the new canvas merged into the doc over D's edge and resize (lost), and the renamed canvas became a new
   doc. The planner takes a file at the remote path only when no known rename took S's file elsewhere. Test in
   `planner.test.ts`; plan `renamed-away-doc-takes-new-file-at-moved-path.json`.
+- **SIM-UNTRACKED-RENAME-UNFILLED-BODY** (integrate-3; sweep "3 devices, seeded faults" seed 133, data loss,
+  introduced by cb98904a): after an epoch reset A renamed its canvas, still untracked, while the new doc's body
+  (B's create) had not arrived. `movedUntracked` merged the file into the empty replica, so A's records were created
+  again beside B's, and B's older fields won (A's resize lost). The moved doc now waits `body-empty` as a file at
+  the path does, and a lost create body drops the empty doc. Test in `planner.test.ts`; plan
+  `renamed-untracked-merged-into-unfilled-body.json`.
 - **Canvas concurrent record create** (`fix-integrity`, fix-epoch soak `971197958-35`): after an epoch reset C
   re-created a canvas empty, and A and D each merged their file into it before seeing the other's rows. A record
   new to a replica is a new Y.Map, so the two maps competed and A's survived whole; D's synced base kept D's colour

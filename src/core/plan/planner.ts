@@ -915,6 +915,14 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 			if (moved.hash === null) return wait({ op: "needHash", path: moved.path });
 			if (r.pendingLocal) return wait(waitOp(docId, "pending-ns"));
 			if (!r.body || !r.body.caughtUp) return wait(waitOp(docId, "body-not-caught-up"));
+			// The doc's content not here yet (its create's body still on the way): merged now, the file's records would be
+			// created anew beside the creator's, and the concurrent create wins over this side's fields (sim seeded faults
+			// seed 133: an edit made before an epoch reset lost to the creator's older values). As for a file at the path.
+			if (!r.body.hasContent && r.createHash !== EMPTY_CONTENT_HASH) {
+				if (!ctx.lostCreateBody.has(docId)) return wait(waitOp(docId, "body-empty"));
+				// Lost create body: drop the empty doc; the renamed file is a new create once that folds.
+				return push([{ op: "nsDelete", docId, baseBodySeq: 0 }]);
+			}
 			return push([
 				{ op: "nsRename", docId, path: moved.path },
 				{ op: "reconcileContent", docId, path: moved.path, kind: r.kind as ContentKind, hasBase: false, basePath: r.path },

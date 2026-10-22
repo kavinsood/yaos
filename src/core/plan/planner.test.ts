@@ -231,6 +231,15 @@ test("an untracked file of a remote doc renamed away (observed): the doc moves w
 	// wipe/revoke/roll seed 40, 16 steps: dropped after this wait, the file became a new doc on the next pass)
 	assert.deepEqual(behind.keepRenames, [{ from: "a.md", to: "b.md", atMs: 1 }]);
 	assert.equal(p.keepRenames, undefined, "moved: nothing to keep");
+	// Sim seeded faults seed 133: the doc's content not here yet (its creator's body still on the way). Merged into the
+	// empty replica, the file's records were created anew beside the creator's and lost their fields to them: wait,
+	// as for a file at the path (keeping the rename); a lost create body drops the empty doc, and the file is a new
+	// create after.
+	const empty = { ...R("d1", "a.md").body!, hasContent: false, version: V(0) };
+	const unfilled = run({ ...sc, remote: [R("d1", "a.md", { body: empty })] });
+	assert.deepEqual(unfilled.ops, [{ op: "wait", docId: "d1", reason: "body-empty" }]);
+	assert.deepEqual(unfilled.keepRenames, [{ from: "a.md", to: "b.md", atMs: 1 }]);
+	assert.deepEqual(run({ ...sc, remote: [R("d1", "a.md", { body: empty })] }, { lostCreateBody: new Set([id("d1")]) }).ops, [{ op: "nsDelete", docId: "d1", baseBodySeq: 0 }]);
 });
 
 test("a rename onto the same path key (case only, or the same path) does not hold the doc's edits while ns is not ready", () => {
