@@ -4,18 +4,22 @@ import { test } from "node:test";
 import { CFG_STREAM, NS_STREAM, type ClientFrameId, type DeviceId, type StreamName, type VaultId } from "../../core/types";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebHash } from "../adapters/webHash";
+import type { OutboxChange } from "../store/repo";
 import type { OutboxRecord } from "../store/schema";
 import { SeededRandom } from "../../sim/random";
-import type { EngineCtx } from "./context";
-import { Resealer } from "./reseal";
+import { Resealer, type ResealCtx } from "./reseal";
 
 const hash = createWebHash();
 
 async function reseal(stream: StreamName, sealed: Uint8Array): Promise<{ readonly from: ClientFrameId; readonly to: ClientFrameId }> {
 	const ops: { clientFrameId: ClientFrameId; next: { clientFrameId: ClientFrameId } }[] = [];
+	const take = (changes: readonly OutboxChange[]) => {
+		for (const ch of changes) if (ch.t === "reseal") ops.push(ch);
+		return Promise.resolve({ removed: [], updated: [], renamed: [] });
+	};
 	let done!: () => void;
 	const settled = new Promise<void>((r) => (done = r));
-	const c = {
+	const c: ResealCtx = {
 		gate: () => null,
 		stopped: false,
 		self: "dev-x" as DeviceId,
@@ -23,10 +27,10 @@ async function reseal(stream: StreamName, sealed: Uint8Array): Promise<{ readonl
 		deps: { crypto: createNoopCrypto(hash) },
 		opts: { vaultId: "v1" as VaultId },
 		keyring: { minSendEpoch: () => 0 },
-		repo: { tOutbox: async (o: typeof ops) => (ops.push(...o), { renamed: [] }) },
+		repo: { tOutbox: take },
 		applyOutboxResult: () => done(),
 		diag: () => undefined,
-	} as unknown as EngineCtx;
+	};
 	const rec: OutboxRecord = {
 		clientFrameId: "cf-old" as ClientFrameId, order: 1, stream, kind: stream === NS_STREAM ? "nsOps" : "cfgOps", state: "pending", sealed, content: new Uint8Array([1, 2]),
 		authorNsSeq: 0, flags: 0, frameNo: 4, keyEpoch: 1, dependsOn: null, adoptOf: null, createdAtMs: 0,

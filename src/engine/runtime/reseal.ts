@@ -22,10 +22,19 @@ import { sealFrame } from "../ingest/envelope";
 import type { OutboxRecord } from "../store/schema";
 import type { EngineCtx } from "./context";
 
+/** What the re-seal reads of the engine context. */
+export interface ResealCtx extends Pick<EngineCtx, "gate" | "stopped" | "self" | "applyOutboxResult" | "diag"> {
+	readonly ports: Pick<EngineCtx["ports"], "random" | "hash">;
+	readonly deps: Pick<EngineCtx["deps"], "crypto">;
+	readonly opts: Pick<EngineCtx["opts"], "vaultId">;
+	readonly keyring: Pick<EngineCtx["keyring"], "minSendEpoch">;
+	readonly repo: Pick<EngineCtx["repo"], "tOutbox">;
+}
+
 export class Resealer {
 	private readonly busy = new Set<ClientFrameId>();
 
-	constructor(private readonly c: EngineCtx) {}
+	constructor(private readonly c: ResealCtx) {}
 
 	request(rec: OutboxRecord): void {
 		if (this.busy.has(rec.clientFrameId) || this.c.gate() !== null || this.c.stopped) return;
