@@ -455,7 +455,7 @@ export class LogEngine {
 	}
 
 	/**
-	 * Nothing open, queued, unreceipted, stale or above V: converged with the relay. A stream whose read is deferred
+	 * Nothing open, queued, unreceipted (own `k` appends included), stale or above V: converged with the relay. A stream whose read is deferred
 	 * (skipped rows, DESIGN §d.7) is stale, so it keeps the engine busy until read; tests that wait for quiescence
 	 * use tuning skipSettleMs 0 (FAST_TUNING). Status staleStreams leaves deferred streams out (nothing is fetched).
 	 */
@@ -463,7 +463,7 @@ export class LogEngine {
 		const c = this.c;
 		if (!c.session || !c.live.enabled || !c.docs.editIdle || !c.live.idle || c.sess.readsInFlight > 0 || c.sess.isFeeding) return false;
 		for (const h of c.handles.all()) if (!h.builder.empty) return false;
-		if (c.outbox.unreceipted() > 0) return false;
+		if (c.outbox.unreceipted() > 0 || c.keyring.busy()) return false;
 		for (const r of c.outbox.values()) if (r.state === "held") return false;
 		const onlyK = c.keyring.readsOnlyK();
 		for (const r of c.repo.streams()) if (r.stale && r.cls !== "other" && (!onlyK || r.cls === "keyring") && !(r.frozen && r.frozenReason === "checkpoint-disputed") && !c.sess.isHeld(r.stream)) return false;

@@ -1,0 +1,107 @@
+{
+	"seed": 102,
+	"config": {
+		"devices": 3,
+		"faults": {
+			"engineCrash": 3,
+			"appCrash": 2,
+			"commitCrash": 2,
+			"idbWipe": 3,
+			"idbLost": 2,
+			"offline": 4,
+			"ioFail": 2,
+			"background": 3,
+			"socketDrop": 4,
+			"relayRestart": 1,
+			"relayDrain": 1,
+			"httpFail": 1,
+			"dailyLimit": 0.5,
+			"epochReset": 0.3,
+			"clockSkew": 1,
+			"keyStoreLoss": 1,
+			"keyRoll": 2,
+			"revoke": 2,
+			"epochRestore": 0.5,
+			"hostileReplay": 2,
+			"hostileDowngrade": 1,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"crypto": "suite1",
+		"faultRate": 0.3,
+		"seed": 102
+	},
+	"minimizedPlan": [
+		{
+			"i": 104,
+			"gapMs": 45,
+			"fault": {
+				"t": "background",
+				"dev": 0,
+				"event": "freeze",
+				"durationMs": 20961
+			}
+		},
+		{
+			"i": 105,
+			"gapMs": 221,
+			"user": {
+				"t": "diskInsert",
+				"dev": 2,
+				"file": 0.7869294825941324,
+				"pos": 0.8924837722443044,
+				"by": "external"
+			}
+		},
+		{
+			"i": 113,
+			"gapMs": 931,
+			"fault": {
+				"t": "dailyLimit",
+				"durationMs": 46229
+			}
+		},
+		{
+			"i": 115,
+			"gapMs": 756,
+			"fault": {
+				"t": "revoke",
+				"dev": 0,
+				"by": 2,
+				"rekeyMs": 3591,
+				"rkSeed": 151171541
+			}
+		},
+		{
+			"i": 116,
+			"gapMs": 661,
+			"fault": {
+				"t": "background",
+				"dev": 1,
+				"event": "freeze",
+				"durationMs": 25841
+			}
+		},
+		{
+			"i": 117,
+			"gapMs": 661,
+			"user": {
+				"t": "type",
+				"dev": 0,
+				"view": 0.6003791664261371,
+				"pos": 0.9473358104005456,
+				"nl": true
+			}
+		}
+	]
+}

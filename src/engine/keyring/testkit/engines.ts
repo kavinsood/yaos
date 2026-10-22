@@ -8,6 +8,7 @@
 import type { EnvelopeKind } from "../../../core/envelope";
 import { type ClientFrameId, type DeviceId, type StreamName, type VaultId } from "../../../core/types";
 import type { StoragePort } from "../../../ports/storage";
+import type { VirtualClock } from "../../../sim/clock";
 import type { SimRelay } from "../../../sim/relay";
 import { createWebCryptoSuite1 } from "../../adapters/webCryptoSuite1";
 import { createWebRandom } from "../../adapters/webRandom";
@@ -57,13 +58,13 @@ export interface Dev {
 
 export type Pin = 0 | { readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; readonly records: readonly Uint8Array[] };
 
-export async function start(relay: SimRelay, deviceId: string, pin: Pin, o: { storage?: StoragePort; tuning?: Partial<EngineTuning>; extra?: TestEngineOpts["extra"] } = {}): Promise<Dev> {
+export async function start(relay: SimRelay, deviceId: string, pin: Pin, o: { storage?: StoragePort; tuning?: Partial<EngineTuning>; extra?: TestEngineOpts["extra"]; clock?: VirtualClock } = {}): Promise<Dev> {
 	const changes: KeyringChange[] = [];
 	const persist = async (ch: KeyringChange) => void changes.push({ keys: ch.keys.map((x) => ({ e: x.e, k: x.k.slice() })), records: ch.records, pending: ch.pending });
 	const e2ee: EngineE2ee = pin === 0 ? { suite: 0 } : { suite: 1, records: pin.records, persist };
 	const keys = pin === 0 ? [] : pin.keys.map((x) => ({ e: x.e, k: x.k.slice() }));
 	const crypto = pin === 0 ? undefined : await createWebCryptoSuite1({ vaultId: VAULT, random: createWebRandom(), keys });
-	const r = await startTestEngine({ relay, deviceId, vaultId: VAULT, e2ee, ...(crypto ? { crypto } : {}), ...(o.storage ? { storage: o.storage } : {}), ...(o.tuning ? { tuning: o.tuning } : {}), ...(o.extra ? { extra: o.extra } : {}) });
+	const r = await startTestEngine({ relay, deviceId, vaultId: VAULT, e2ee, ...(crypto ? { crypto } : {}), ...(o.storage ? { storage: o.storage } : {}), ...(o.tuning ? { tuning: o.tuning } : {}), ...(o.extra ? { extra: o.extra } : {}), ...(o.clock ? { clock: o.clock } : {}) });
 	return { engine: r.engine, storage: r.storage, changes };
 }
 

@@ -6,8 +6,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { KEYRING_STREAM, type VaultPath } from "../../core/types";
+import { VirtualClock } from "../../sim/clock";
 import { SimRelay } from "../../sim/relay";
-import { converged, until, createDoc, editDoc } from "../runtime/testHarness";
+import { converged, sleep, until, createDoc, editDoc } from "../runtime/testHarness";
 import { keyMissing, live, rawAppend, start } from "./testkit/engines";
 import { K, genesis } from "./testkit/world";
 
@@ -49,6 +50,29 @@ describe("suite 1 in the engine", () => {
 			await createDoc(x.engine, "b.md" as VaultPath, "after the reset");
 			await converged([x.engine]);
 			assert.equal(relay.rows(KEYRING_STREAM).length, 1, "published once");
+		} finally {
+			await x.engine.stop();
+		}
+	});
+
+	it("a k append refused cf_daily_limit keeps the engine busy until its resend commits", async () => {
+		// Sim suite-1 wipe/revoke/roll seed 102: C's revoke record was refused on the daily limit and resent 45 s later,
+		// after the engine had reported idle: the resend was activity after quiescence.
+		const clock = new VirtualClock(Date.UTC(2026, 0, 1, 12, 0));
+		const relay = new SimRelay({ clock });
+		const g = await genesis();
+		relay.setDailyLimit(true, 60_000);
+		const x = await start(relay, "dev-x", { keys: [{ e: 1, k: K(1) }], records: [g] }, { clock });
+		try {
+			await until(() => relay.counters().dailyLimitRejects > 0, 10_000, "the re-publish refused", clock);
+			relay.setDailyLimit(false);
+			for (let i = 0; i < 5; i++) {
+				await sleep(10_000, clock);
+				assert.equal(relay.rows(KEYRING_STREAM).length, 0, "not resent before the relay's reset");
+				assert.equal(x.engine.isIdle(), false, `busy at +${(i + 1) * 10} s: the resend is still to come`);
+			}
+			await until(() => relay.rows(KEYRING_STREAM).length === 1 && x.engine.isIdle(), 20_000, "resent, then idle", clock);
+			assert.deepEqual(relay.rows(KEYRING_STREAM)[0]!.payload, g);
 		} finally {
 			await x.engine.stop();
 		}

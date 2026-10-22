@@ -55,6 +55,8 @@ export class KeyringRuntime {
 	private flow: OwnFlow | null = null;
 	/** Own `k` appends without a receipt yet (the flow's record, re-publishes): cfid -> bytes. */
 	private readonly unreceipted = new Map<ClientFrameId, Uint8Array>();
+	/** Those of them appended on this session, no receipt or refusal yet. */
+	private readonly onWire = new Set<ClientFrameId>();
 	private retryTimer: TimerHandle | null = null;
 	/** Own seals under `epoch` (§4.2), and what MetaKeyring holds. */
 	private seals = { epoch: 0, n: 0 };
@@ -157,6 +159,15 @@ export class KeyringRuntime {
 	 * with a `k` record (§9.3, §12.4), and under suite 1 a session before its `k` read. Nothing is judged before
 	 * that read (kComplete): a row gated then would be held, quarantined and its doc frozen until a re-gate.
 	 */
+	/**
+	 * An own `k` append is on the wire with no receipt or refusal yet, or waits out a daily-limit refusal for its
+	 * resend: the engine is not idle (LogEngine.isIdle). The resend was the only activity left, and it came after the
+	 * sim's quiescence (suite-1 wipe/revoke/roll seed 102: C's revoke record refused cf_daily_limit, resent 45 s later).
+	 */
+	busy(): boolean {
+		return this.retryTimer !== null || this.onWire.size > 0;
+	}
+
 	readsOnlyK(): boolean {
 		return this.kr.keyMissing() === "encrypted-vault" || (this.suite === 1 && this.c.session !== null && this.kReadGen !== this.c.gen);
 	}
@@ -207,6 +218,7 @@ export class KeyringRuntime {
 		for (const r of k) {
 			if (r.deviceId !== this.c.self) continue;
 			this.unreceipted.delete(r.clientFrameId);
+			this.onWire.delete(r.clientFrameId);
 			if (this.flow?.cfid === r.clientFrameId) this.flow.seq = r.seq;
 		}
 		await this.ingestTail();
@@ -248,6 +260,7 @@ export class KeyringRuntime {
 		this.unreceipted.set(cfid, bytes);
 		const s = this.c.session;
 		if (!s || !s.canWrite || this.kReadGen !== this.c.gen) return; // sent again after the next session's `k` read
+		this.onWire.add(cfid);
 		s.append({ stream: KEYRING_STREAM, clientFrameId: cfid, payload: bytes });
 	}
 
@@ -283,6 +296,7 @@ export class KeyringRuntime {
 	/** A refusal on `k` (sessionLoop). true: it was a `k` frame. */
 	onRefused(ev: Extract<RelayEvent, { t: "refused" }>): boolean {
 		if (ev.stream !== KEYRING_STREAM) return false;
+		this.onWire.delete(ev.clientFrameId);
 		const bytes = this.unreceipted.get(ev.clientFrameId);
 		if (!bytes) return true;
 		if (ev.reason === "durability") this.send(ev.clientFrameId, bytes);
@@ -302,6 +316,7 @@ export class KeyringRuntime {
 
 	/** Session closed: re-publishes are recomputed next session; the own record is resent after the `k` read. */
 	onClosed(): void {
+		this.onWire.clear();
 		for (const cfid of [...this.unreceipted.keys()]) if (cfid !== this.flow?.cfid) this.unreceipted.delete(cfid);
 	}
 
