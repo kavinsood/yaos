@@ -412,6 +412,20 @@ test("a doc whose file the user renamed away does not take a new file at the pat
 	assert.ok(!opsOf(plain).includes("nsCreate"), JSON.stringify(plain.ops));
 });
 
+test("rename inference pairs a missing doc's file by the content a refused commit left (heldHash)", () => {
+	// Sim suite-1 wipe/revoke/roll seed 112: the write gate refused B's canvas edit (key missing), then the canvas was
+	// renamed while the app was down. By S's content alone the file is new: a delete + a create, and a peer's edit
+	// restored the doc at its old path with the records B had deleted.
+	const held = S("d1", "a.canvas", { heldHash: h("c1") });
+	const p = run({ remote: [R("d1", "a.canvas")], synced: [held], local: [L("b.canvas", h("c1"))] });
+	assert.deepEqual(find(p, "nsRename"), { op: "nsRename", docId: "d1", path: "b.canvas" });
+	assert.equal(find(p, "reconcileContent").path, "b.canvas");
+	assert.ok(!opsOf(p).includes("nsCreate") && !opsOf(p).includes("nsDelete"), JSON.stringify(p.ops));
+	// without it: a delete + a create
+	const none = run({ remote: [R("d1", "a.canvas")], synced: [S("d1", "a.canvas")], local: [L("b.canvas", h("c1"))] });
+	assert.ok(opsOf(none).includes("nsCreate") && opsOf(none).includes("nsDelete"), JSON.stringify(none.ops));
+});
+
 test("a file renamed onto a fileGone path with the gone doc's bytes is a new file, and the fresh-id budget counts it", () => {
 	// The file is new (goneHere -> planNewLocal takes a fresh docId) although it matches the synced record at its path
 	// by hash. A budget that counted only files differing from their record by hash handed this plan no id: the file

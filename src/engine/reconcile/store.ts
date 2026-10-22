@@ -92,10 +92,23 @@ export class ReconcileStore {
 		return rec ? readBase(rec, this.hash) : null;
 	}
 
+	/**
+	 * SyncedEntry.heldHash lasts until the next sync point: a record with another content hash than the stored one (the
+	 * held content committed, or merged into something else) drops it, as one whose content is the held one does.
+	 * Records spread from the old one (`{ ...s, contentHash }`) would carry it on otherwise.
+	 */
+	private heldKept(r: SyncedRecord): SyncedRecord {
+		const prior = this.synced.get(r.docId);
+		if (r.heldHash !== r.contentHash && (!prior || prior.contentHash === r.contentHash)) return r;
+		const { heldHash: _held, ...rest } = r;
+		return rest;
+	}
+
 	async commit(c: DiskChange): Promise<void> {
 		const empty = !c.syncedPut?.length && !c.syncedDrop?.length && !c.basePut?.length && !c.baseDrop?.length && !c.baseMove?.length
 			&& !c.localPut?.length && !c.localDrop?.length && !c.intentPut?.length && !c.intentDrop?.length;
 		if (empty) return;
+		if (c.syncedPut?.some((r) => r.heldHash !== undefined)) c = { ...c, syncedPut: c.syncedPut.map((r) => this.heldKept(r)) };
 		await this.db.tx(TX_STORES, "readwrite", async (tx) => {
 			for (const m of c.baseMove ?? []) {
 				const rec = await tx.get(STORE.baseText, m.from);

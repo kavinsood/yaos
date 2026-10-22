@@ -121,6 +121,21 @@ async function keepObservedRenames(env: Env, ns: readonly NsOp[], ops: readonly 
 	if (keep.size > 0) await ctx.commit({ syncedPut: [...keep.values()] });
 }
 
+/**
+ * A content merge the write gate refused (key missing): the file's content stays out of the log and S stays the merge
+ * base, so the next pass merges it again. Record that content on S (`heldHash`): rename inference pairs the file by
+ * it, otherwise a file edited and then renamed before this device could write again, or while the app was down after
+ * the store was lost (the synced mirror carries it), reads as a delete + a create, and a peer's edit restores the doc
+ * at its old path with what the user had removed (sim suite-1 wipe/revoke/roll seed 112).
+ */
+async function keepHeldContent(env: Env, docId: DocId, path: VaultPath): Promise<void> {
+	const { ctx } = env;
+	const s = ctx.store.synced.get(docId);
+	const held = ctx.localAt(path)?.hash ?? null;
+	if (!s || held === null || held === s.contentHash || held === s.heldHash) return;
+	await ctx.commit({ syncedPut: [{ ...s, heldHash: held }] });
+}
+
 export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunReport> {
 	const { ctx } = env;
 	const skip = new Set<DocId>(ctx.intentDocs());
@@ -234,7 +249,13 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 		if (blocked(op)) continue;
 		if (toNsOp(op) !== null) throw new Error(`ns op out of order: ${op.op}`);
 		if (stopping()) break;
-		const res = await runOne(env, op);
+		let res: JobOutcome;
+		try {
+			res = await runOne(env, op);
+		} catch (e) {
+			if (e instanceof KeyMissingError && op.op === "reconcileContent") await keepHeldContent(env, op.docId, op.path);
+			throw e;
+		}
 		note(op, res);
 		if (res === "ok" && op.op === "diskRename") vacated.push(op.from);
 		if (res === "ok" && op.op === "diskTrash") vacated.push(op.path);

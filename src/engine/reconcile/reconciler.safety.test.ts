@@ -293,6 +293,34 @@ test("write gate shut (key-missing): a bound replica's unframed typing is never 
 	assert.equal(w.log.text(id), "one\n");
 });
 
+test("write gate shut (key-missing): an edit the gate refused is kept on the synced record (heldHash) and pairs the file renamed while the app was down", async () => {
+	// Sim suite-1 wipe/revoke/roll seed 112: key-missing after a revoke, B deleted a canvas record (the merge refused);
+	// the canvas was then renamed while the app was down. By S's content the renamed file was new: a delete + a create,
+	// and a peer's edit restored the doc at its old path with the record B had deleted.
+	const w = new World();
+	await w.boot();
+	const id = w.log.remoteCreate(P("a.md"), "one\ntwo\nthree\nfour\n");
+	await w.sync();
+	const base = w.synced(id)!.contentHash;
+	w.log.writeGate = "revoked-epoch";
+	w.vault.userWrite("a.md", "one\nthree\nfour\n");
+	await assert.rejects(w.sync(3), KeyMissingError);
+	const held = w.synced(id)!;
+	assert.equal(held.contentHash, base, "S stays the merge base");
+	assert.ok(held.heldHash !== undefined && held.heldHash !== base, "the refused content is kept");
+	w.vault.userRename("a.md", "b.md"); // the event dies with the app
+	await w.crashAndReboot();
+	w.log.writeGate = null;
+	await w.sync();
+	assert.equal(w.vault.text("a.md"), null, "the doc is not back at the old path");
+	assert.equal(w.vault.text("b.md"), "one\nthree\nfour\n");
+	assert.equal(w.log.view().remote.get(id)?.path, "b.md");
+	assert.equal(w.log.text(id), "one\nthree\nfour\n", "the delete merged against the synced base");
+	assert.deepEqual(w.conflictCopies(), []);
+	assert.equal([...w.log.view().remote.values()].filter((r) => r.state === "live").length, 1, "no new doc");
+	assert.equal(w.synced(id)!.heldHash, undefined, "dropped with the next sync point");
+});
+
 test("write gate shut (key-missing): a pass the gate stops at another doc's ns op still marks a file gone from its record", async () => {
 	// Sim suite-1 wipe/revoke/roll seed 40: a frozen canvas renamed while a note's rename waited on the gate. The plan
 	// marked the canvas's record (fileGone, renamedTo), but the mark came after the refused ns ops: no pass reached it,

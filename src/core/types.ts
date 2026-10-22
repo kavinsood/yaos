@@ -455,6 +455,13 @@ export interface SyncedEntry {
 	 * live in memory; this keeps the one that took the file away across an engine restart (the planner replays it).
 	 */
 	readonly renamedTo?: { readonly to: VaultPath; readonly atMs: number };
+	/**
+	 * The disk content a content job could not commit (the write gate refused it, key missing): S stays the merge
+	 * base, the file has moved on. Rename inference pairs a missing doc's file by it as by contentHash, so a file the
+	 * user edited and then renamed while this device could not write (or while the app was down, the store lost) is
+	 * still the doc's, not a delete + a create. Dropped with the next sync point (reconcile/store.ts commit).
+	 */
+	readonly heldHash?: ContentHash;
 }
 
 /** Vault event hint: a rename observed live; verified by the next reconcile. */
