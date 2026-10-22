@@ -15,4 +15,5 @@ Status as of integrate-3 (2026-10-22): every file below still fails. "base": als
 
 | File | Reproduces | BACKLOG |
 | --- | --- | --- |
+| `flood-retire-backlog-past-heal-horizon.json` | soak 979386157 #245 (FLOOD_FAULTS small-cap, 5 devices; also at ac7aff61, worse there; full 256-step plan, the soak's exact-detail minimization cannot shrink it): 1,400 to 2,400 dead streams per device are still to retire / drop when the 600 s heal horizon ends. Not data loss: with a 3,600 s horizon the same plan quiesces at 1,105 s with no violation | SOAK-FLOOD-RETIRE-BACKLOG |
 | `gated-edit-renamed-and-edited-unobserved.json` | suite-1 wipe/revoke/roll seed 112 (base): a canvas record B deleted while key-missing is back in the doc after B's file was renamed and edited again unobserved. Not data loss: B's text survives in the renamed file, a new doc | SIM-S1-HELD-EDIT-UNOBSERVED-RENAME |
