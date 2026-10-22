@@ -153,7 +153,9 @@ Kept here until `sim-port` merges; then git history holds them.
   included. That check found two real gaps, fixed: the room a load made did not know its bytes (a bind loading a big
   note left clean replicas resident past the budget), and rows grew clean replicas past it; either waited for the next
   maintenance tick, which backs off when idle. A load now evicts again once loaded (not the doc itself), and applied
-  rows evict after the apply. Plan `src/sim/regressions/bound-big-notes-past-resident-byte-budget.json`, tests in
+  rows evict after the apply. Since eviction then runs at more awaits, every handle holder across an await was
+  audited: each pins it or re-checks residency (DESIGN §d.1), and a sim / test guard throws on an evicted handle's
+  use (reported by the sim even when caught). Plan `src/sim/regressions/bound-big-notes-past-resident-byte-budget.json`, tests in
   `src/engine/runtime/residency.test.ts` and `src/sim/coverage.test.ts` (eviction disabled is reported).
 - **SIM-GATED-RESIDENCY** (`fix-refold`, soak seed 2006566456, invariant 6 "5 resident docs, budget 3"): an engine
   bound violation, not a tolerance issue. While C waited revoked-epoch for its QR, each pass's merge jobs applied the

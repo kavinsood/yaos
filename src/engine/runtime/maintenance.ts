@@ -311,7 +311,9 @@ export class Maintenance {
 				drops--;
 				if (!(await c.repo.tDropStream(stream, rec, held ?? []))) continue;
 				if (held && held.length > 0) c.applyOutboxResult({ removed: held.flatMap((id) => c.outbox.get(id) ?? []), updated: [] });
-				c.handles.drop(stream);
+				// Bound or pinned during the drop's transaction: its holder keeps it, and it goes clean like any replica.
+				const resident = c.handles.peek(stream);
+				if (!resident || c.handles.isClean(resident)) c.handles.drop(stream);
 				for (const m of [c.ckpt.condSince, c.ckpt.jitter, c.ckpt.lastActivity, c.ckpt.backoffUntil, c.ckpt.tooLarge]) m.delete(stream);
 				st.forget(stream, rec.docId);
 				st.stats.dropped++;

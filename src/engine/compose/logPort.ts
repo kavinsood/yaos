@@ -166,6 +166,7 @@ export class ComposedLog implements LogPort {
 		const log = this.log;
 		let added = false;
 		for (const h of [...log.c.handles.all()]) {
+			if (log.c.handles.peek(h.stream) !== h) continue; // evicted during an earlier digest
 			if (!hashable(h)) continue;
 			const kind = h.cls === "canvas" ? "canvas" : "markdown";
 			const body = log.bodyInfo(h.docId, kind);

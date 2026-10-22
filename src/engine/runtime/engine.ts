@@ -294,7 +294,9 @@ export class LogEngine {
 		const version = (): BodyVersion => c.repo.stream(stream)?.bodyVersion ?? { remoteSeq: 0, localOrder: 0 };
 		return {
 			docId,
-			doc: h.doc,
+			get doc() {
+				return h.doc; // through the handle: the evicted-handle guard sees a use after an explicit drop
+			},
 			mergeOrigin: ORIGIN.MERGE,
 			get bound() {
 				return h.bound > 0;
@@ -392,8 +394,7 @@ export class LogEngine {
 	async bind(docId: DocId): Promise<void> {
 		const c = this.c;
 		const stream = this.streamOf(docId);
-		const h = await c.handles.load(stream);
-		h.bound++;
+		await c.handles.withResident(stream, (h) => void h.bound++);
 		this.boundStreams.set(docId, stream);
 		// Subscribed (debounced) and read at once: a bound stream is never deferred, and first in catch-up order.
 		c.subs.noteBound(stream);

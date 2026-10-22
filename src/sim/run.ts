@@ -39,6 +39,7 @@ import { realWorkFor, type RealWork } from "./delayedCrypto";
 import type { SimBlobLiveness } from "./blobStore";
 import { CANVAS_NAME_POOL, CANVAS_OPS, CanvasWorld, generateCanvasAction, type CanvasAction, type CanvasStats, type CanvasWeights } from "./canvas";
 import { canvasMergeStats } from "../engine/reconcile/canvasMerge";
+import { evictedHandleUses } from "../engine/body/handles";
 
 export interface SimConfig {
 	readonly seed: number;
@@ -507,6 +508,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 	const c = full(cfg);
 	const plan = explicitPlan ?? generatePlan(cfg);
 	seedEntropy(cfg.seed);
+	const evicted0 = evictedHandleUses.length;
 	// A promise whose failure engine code drops (a worker only logs it; Node would end the process): a violation of
 	// this run, minimizable like any other.
 	const unhandled: Violation[] = [];
@@ -699,6 +701,8 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		violations.push(...(faults.hostile?.check() ?? []));
 		canvasWorld.finalize();
 		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkIdentity(devs), ...checkClean(devs, net, (i) => faults.isDown(i)), ...checkBlobLiveness(net), ...checkCheckpoints(devs, net), ...checkCanvas(devs, canvasWorld.oracle), ...checkOutboxAndCursor(devs, net), ...bounds.values());
+		// An engine path used a handle after its eviction (the guard throws; a caught throw is still recorded).
+		for (const detail of evictedHandleUses.slice(evicted0)) violations.push({ inv: "bounds", detail });
 		violations.push(...(await checkQuiet(clock, devs, net)));
 		// Invariant 4: refold the relay's rows (gates may await crypto on the clock, so it runs).
 		let fold: Violation[] | null = null;

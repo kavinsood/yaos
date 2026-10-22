@@ -7,6 +7,7 @@ import { VirtualClock } from "../../sim/clock";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { drive, startTestEngine, until, createDoc, editDoc } from "./testHarness";
+import { EvictedHandleError, evictedHandleUses, type HandleHooks } from "../body/handles";
 
 const BUDGETS = { maxResidentDocs: 16, maxResidentBytes: 8 * 1024 };
 /** No maintenance tick in the test's horizon: only the load / apply path can evict. */
@@ -64,6 +65,58 @@ test("residency: rows that grow a clean replica past the byte budget evict it", 
 		await drive(editDoc(a, id, (t) => t.insert(t.length, BIG)), clock);
 		await caughtUp(clock, a, b, [id]);
 		assert.equal(b.c.handles.isResident(b.streamOf(id)), false, "evicted once the rows grew it past the budget");
+	} finally {
+		await drive(a.stop(), clock);
+		await drive(b.stop(), clock);
+	}
+});
+
+test("residency: acquire returns a pinned, resident handle even when an eviction runs before its caller resumes", async () => {
+	const clock = new VirtualClock(Date.UTC(2026, 0, 1, 12, 0));
+	const { a, b } = await pair(clock);
+	try {
+		const id = await drive(createDoc(a, "note.md" as VaultPath, "note\n"), clock);
+		await caughtUp(clock, a, b, [id]);
+		const hs = b.c.handles;
+		const stream = b.streamOf(id);
+		assert.equal(hs.isResident(stream), false);
+		// The first load is evicted in the microtask after it registers, before acquire's continuation runs.
+		const hooks = (hs as unknown as { hooks: HandleHooks }).hooks;
+		const onLoaded = hooks.onLoaded.bind(hooks);
+		let once = true;
+		hooks.onLoaded = (h) => {
+			onLoaded(h);
+			if (once) queueMicrotask(() => hs.evictAllClean());
+			once = false;
+		};
+		const loads = hs.loads;
+		const h = await drive(hs.acquire(stream), clock);
+		assert.equal(hs.loads, loads + 2, "loaded again after the eviction");
+		assert.equal(hs.peek(stream), h, "the handle returned is the resident one");
+		assert.equal(h.pins, 1);
+		hs.unpin(h);
+	} finally {
+		await drive(a.stop(), clock);
+		await drive(b.stop(), clock);
+	}
+});
+
+test("residency: the debug guard throws (and records) when an evicted handle is used", async () => {
+	const clock = new VirtualClock(Date.UTC(2026, 0, 1, 12, 0));
+	const { a, b } = await pair(clock);
+	try {
+		const id = await drive(createDoc(a, "note.md" as VaultPath, "note\n"), clock);
+		await caughtUp(clock, a, b, [id]);
+		await residentClean(clock, b, id);
+		const hs = b.c.handles;
+		const h = hs.peek(b.streamOf(id))!;
+		void h.doc.getText("text").length; // resident: usable
+		const n = evictedHandleUses.length;
+		assert.equal(hs.evictAllClean(), 1);
+		assert.throws(() => h.doc, EvictedHandleError);
+		assert.throws(() => hs.grow(h, 1), EvictedHandleError);
+		assert.equal(evictedHandleUses.length, n + 2, "recorded for the sim");
+		evictedHandleUses.length = n;
 	} finally {
 		await drive(a.stop(), clock);
 		await drive(b.stop(), clock);

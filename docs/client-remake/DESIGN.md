@@ -912,6 +912,12 @@ cold ──load──▶ resident ──bind──▶ bound
     (`HandleCache.enforceBudget`, `src/engine/body/handles.ts`). Once loaded it evicts again for the doc's bytes
     (never the doc just loaded). Applied rows that grow resident replicas evict after the apply; unpin, unbind and
     every maintenance tick evict too.
+  - Eviction can run at any await, so no path holds a handle across one unpinned: merge jobs, remote-row applies
+    and ref retries pin it (`acquire`, `pins`), a bind takes it in the same turn the load is checked resident
+    (`withResident`: a load evicted before its waiter resumes is loaded again), and the rest re-check residency
+    after the await (provisional adopt, thaw, `warmTextHashes`, retire's drop). Sim and engine-test builds turn on a
+    guard (`setEvictedHandleGuard`): an evicted handle's `doc`, or `grow` on it, throws, and the sim reports every
+    such use as a violation even when the engine caught the throw.
   - While the write gate is shut (e2ee-design §9.3) a merge job edits nothing: `BodyHandle.assertWritable` throws
     before the first edit (the commit would be refused anyway, and the file still holds the change for the pass after
     the gate opens). Otherwise every file merged while key-missing would leave an unframed edit in its builder and
