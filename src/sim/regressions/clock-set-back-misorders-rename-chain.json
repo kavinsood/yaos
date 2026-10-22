@@ -434,5 +434,6 @@
  ],
  "gitSha": "3a83659fc28b9619c7cd52aebe2f5380bc010740",
  "masterSeed": 12,
- "label": "BLOB_FAULTS[9] short d2 s82 tuned races"
+ "label": "BLOB_FAULTS[9] short d2 s82 tuned races",
+ "note": "blob faults seed 1370759151 (SIM-BLOB-STALE-DISK; the blob faults are incidental). A renames seed1 -> r1 -> r5, its clock is set back, then n5 -> r1, all observed before one plan. Renames were ordered by wall-clock stamps, so n5 -> r1 sorted first and chained n5 -> r1 -> r5: both docs claimed r5.md, the editor bound to n5's doc followed the file to r1.md, its content job deferred for good and A's disk stayed stale. Fixed: rename stamps are strictly increasing in event order (scan.ts), floored by the stamps kept across restarts."
 }

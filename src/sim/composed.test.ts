@@ -9,6 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { VaultEpoch } from "../core/types";
 import { BLOB_TRANSFER_IDLE_MS } from "../core/limits";
+import { pathKey } from "../core/paths/pathKey";
 import type { EngineResultValue, EngineSettings } from "../protocol/messages";
 import { VirtualClock } from "./clock";
 import { SIM_SETTINGS, SimDevice, type SimDeviceOptions } from "./device";
@@ -789,6 +790,106 @@ test("a rename of the open note that loses to a concurrent remote move: the view
 	assert.ok(want.some(([, t]) => t === "other\n"), "A's own file at r2 is kept");
 	assert.ok(view?.isBound(), "the view is bound again");
 	assert.equal(view?.getText(), a.vault.textOf("r4.md"));
+});
+
+test("a bound doc whose views show another doc's file: the views re-open on that file, the doc's own file gets its edits", async () => {
+	// The state the clock-set-back rename chain left (SIM-BLOB-STALE-DISK), built directly: the views of doc X follow
+	// z.md, a file of another doc Z with the same text (X's file moved there), while X stays synced at x.md. An
+	// editor save only ever reaches z.md, so X's merges waited for a save that never came (x.md stale for good) and
+	// went into Z's file through the editor instead.
+	const { clock, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "body\n");
+	a.vault.userWrite("z.md", "body\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("x.md"), "body\n");
+	const view = a.workspace.openFile("x.md");
+	await clock.advance(1_000);
+	assert.ok(view?.isBound(), "bound");
+	const engine = a.vrt?.engine;
+	assert.ok(view && engine);
+	const x = [...engine.bound.byId.keys()];
+	view.path = "z.md";
+	engine.bound.followRename(pathKey("x.md"), "z.md", pathKey);
+	a.vault.userWrite("w.md", "w\n"); // a pass ends with the state
+	await clock.advance(5_000);
+	b.vault.userWrite("x.md", "body\nB edit\n");
+	await clock.advance(30_000);
+	assert.equal(a.vault.textOf("x.md"), "body\nB edit\n", "X's file gets B's edit");
+	assert.equal(a.vault.textOf("z.md"), "body\n", "Z's file is untouched");
+	assert.ok(view.isBound(), "the view is bound again");
+	assert.equal(x.length, 1);
+	assert.deepEqual([...engine.bound.byId.values()].map((d) => [d.docId === x[0], d.path]), [[false, "z.md"]], "the view is on Z's doc");
+	for (const d of [a, b]) assert.deepEqual([...d.vault.snapshot().entries()].sort(), [["w.md", "w\n"], ["x.md", "body\nB edit\n"], ["z.md", "body\n"]], d.name);
+});
+
+test("a stray bound editor with unsaved edits over another doc's file: neither the file nor the edits are lost", async () => {
+	// As above, but the views moved onto z.md show other text than z.md holds, with an edit neither pushed nor saved.
+	// Before: the bind of Z read the editor as an edit replacing Z's text (boundBody attachNow merged against Z's
+	// own base) and Obsidian's autosave wrote it over z.md.
+	const { clock, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "x body\n");
+	a.vault.userWrite("z.md", "z body\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("z.md"), "z body\n");
+	const view = a.workspace.openFile("x.md");
+	await clock.advance(1_000);
+	const engine = a.vrt?.engine;
+	assert.ok(view && engine && view.isBound(), "bound");
+	view.edit(view.getText().length, 0, "unsaved\n"); // not pushed yet, not saved (2 s debounce)
+	assert.ok(view.isDirty());
+	view.path = "z.md";
+	engine.bound.followRename(pathKey("x.md"), "z.md", pathKey);
+	a.vrt?.viewsMoved();
+	await clock.advance(30_000);
+	// The edit never reached X's replica (pushed after the retarget dropped the binding): the bind merges the editor
+	// against X's text, and the edit, conflicting with Z's text, goes to a conflict copy of z.md.
+	const files = [...a.vault.snapshot().entries()].sort();
+	assert.deepEqual(files.filter(([p]) => !p.includes("conflict")), [["x.md", "x body\n"], ["z.md", "z body\n"]], "Z's file is kept");
+	assert.deepEqual(files.filter(([p]) => p.includes("conflict")).map(([, t]) => t), ["x body\nunsaved\n"], "the unsaved edit is kept");
+	assert.ok(view.isBound(), "the view is bound again");
+	assert.equal(view.getText(), "z body\n");
+	assert.deepEqual([...b.vault.snapshot().entries()].sort(), [...a.vault.snapshot().entries()].sort());
+});
+
+test("bound views on a file no doc is synced at re-open only when two pass ends saw it; a rename of the open note never does", async () => {
+	const { clock, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "x body\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	const view = a.workspace.openFile("x.md");
+	await clock.advance(1_000);
+	const rt = a.vrt;
+	assert.ok(view && rt && view.isBound(), "bound");
+	// A user rename of the open note: the views move one pass before the doc. Not re-opened.
+	assert.ok(a.vault.userRename("x.md", "y.md"));
+	await clock.advance(10_000);
+	assert.equal(rt.stats.retargets, 0, "a rename of the open note keeps the binding");
+	assert.ok(view.isBound());
+	assert.equal(b.vault.textOf("y.md"), "x body\n");
+	// Built directly: the views follow q.md, a path no doc is synced at, while the doc stays at y.md.
+	view.path = "q.md";
+	rt.engine.bound.followRename(pathKey("y.md"), "q.md", pathKey);
+	rt.viewsMoved();
+	assert.equal(rt.stats.retargets, 0, "no owner: not at once");
+	const ends: number[] = []; // retargets made by each pass end's check
+	const check = rt["retargetStrayViews"].bind(rt);
+	rt["retargetStrayViews"] = (passEnd: boolean) => {
+		const r0 = rt.stats.retargets;
+		check(passEnd);
+		if (passEnd) ends.push(rt.stats.retargets - r0);
+	};
+	a.vault.userWrite("w.md", "w\n"); // passes run
+	await clock.advance(10_000);
+	assert.deepEqual(ends.slice(0, 2), [0, 1], `re-opened at the second pass end, not the first (${ends.join(",")})`);
+	assert.equal(rt.stats.retargets, 1);
+	b.vault.userWrite("y.md", "x body\nB edit\n");
+	await clock.advance(30_000);
+	assert.equal(a.vault.textOf("y.md"), "x body\nB edit\n", "the doc's own file gets B's edit");
 });
 
 /** B's writes of `path` fail (EIO) while `broken()`; `heal()` ends it. */

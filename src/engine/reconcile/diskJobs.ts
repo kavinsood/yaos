@@ -85,9 +85,8 @@ export async function rebind(env: Env, op: Op<"rebind">): Promise<JobOutcome> {
 		return "ok";
 	}
 	// A merged alias restarts at the winner's create, as the planner planned it; an identical collapse (live loser) keeps S.
-	const view = ctx.log.view().remote;
-	const winner = view.get(op.toDocId);
-	const from = winner && view.get(op.fromDocId)?.state !== "live" ? restartAtCreate(s, winner.createHash) : s;
+	const winner = ctx.remote(op.toDocId);
+	const from = winner && ctx.remote(op.fromDocId)?.state !== "live" ? restartAtCreate(s, winner.createHash) : s;
 	// S now mirrors the winner as folded: its touch seq, not the loser's (0 for an own create merged before it folded).
 	// With 0 it read as an own create the fold never committed, and a remote rename of the winner as the fold's
 	// suffixing of it: the identical-loser collapse deleted the winner (soak seed 1394654959).
@@ -152,7 +151,7 @@ export async function diskTrash(env: Env, op: Op<"diskTrash">): Promise<JobOutco
 /** Create a file for a remote doc that is absent locally (precondition absent). */
 export async function diskMaterialize(env: Env, op: Op<"diskMaterialize">): Promise<JobOutcome> {
 	const { ctx } = env;
-	const r = ctx.log.view().remote.get(op.docId);
+	const r = ctx.remote(op.docId);
 	if (!r || r.state !== "live") return "fail";
 	if (r.kind === "blob") return materializeBlob(env, op, r.blob);
 	if (r.kind === "canvas") return "fail"; // the runner routes canvas docs to canvasJob.diskMaterializeCanvas

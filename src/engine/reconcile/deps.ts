@@ -101,6 +101,13 @@ export interface SubmitNsOptions {
 export interface LogPort {
 	view(): RemoteView;
 	/**
+	 * view().remote.get(docId) without building the whole view (a job reads one doc after commitEdits / submitNs
+	 * dropped the memo). Optional: a log without it answers from view().
+	 */
+	peekRemote?(docId: DocId): RemoteEntry | undefined;
+	/** view().remoteByPathKey.has(key), without building the whole view. Optional, as peekRemote. */
+	nsPathTaken?(key: PathKey): boolean;
+	/**
 	 * Take the textHash of resident replicas through HashPort before a plan reads view() (which never awaits a
 	 * digest: a replica changed since has a textHash there only when it is small).
 	 */

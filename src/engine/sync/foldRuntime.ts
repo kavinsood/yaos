@@ -99,6 +99,8 @@ export abstract class FoldRuntime<Op, E> {
 	private busy: Promise<unknown> = Promise.resolve();
 	/** Own frames whose outbox record is gone (receipted) but whose row is not folded yet, in receipt order. */
 	private committedOwn: OwnPendingFrame<Op>[] = [];
+	/** Bumped whenever committedOwn changes (overlay memo key). */
+	private ownGen = 0;
 	/** Highest own frameNo seen outside the fold state and the outbox (tail above the fold, receipts, allocations). */
 	private ownFrameNoSeen = 0;
 	/** coversSeq of a stored snapshot reset() could not use (the state started empty), else null. */
@@ -181,6 +183,7 @@ export abstract class FoldRuntime<Op, E> {
 			this.committedOwn = rest
 				.filter((r) => r.deviceId === this.self && !(r.flags & LOCAL_FLAG_UNOPENED))
 				.map((r) => ({ clientFrameId: r.clientFrameId, authorNsSeq: r.authorNsSeq, frameNo: r.frameNo ?? 0, ops: this.decodeOps(r.content) ?? [] }));
+			this.ownGen++;
 			for (const f of this.committedOwn) this.seeFrameNo(f.frameNo);
 			return folded;
 		};
@@ -217,7 +220,10 @@ export abstract class FoldRuntime<Op, E> {
 				return out;
 			}
 			this.foldedRows++;
-			if (row.deviceId === this.self) this.committedOwn = this.committedOwn.filter((f) => f.clientFrameId !== row.clientFrameId);
+			if (row.deviceId === this.self) {
+				this.committedOwn = this.committedOwn.filter((f) => f.clientFrameId !== row.clientFrameId);
+				this.ownGen++;
+			}
 			if (this.isCandidate(prev, row.seq)) this.candidate = { seq: row.seq, bytes: this.encodeState(), authoredBySelf: row.deviceId === this.self, rulesVersion: this.rulesVersion };
 			out.push({ seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, ops, events });
 		}
@@ -304,6 +310,12 @@ export abstract class FoldRuntime<Op, E> {
 		if (seq !== null && seq <= this.coversSeq) return;
 		if (this.committedOwn.some((f) => f.clientFrameId === rec.clientFrameId)) return;
 		this.committedOwn.push({ clientFrameId: rec.clientFrameId, authorNsSeq: rec.authorNsSeq, frameNo: rec.frameNo ?? 0, ops: this.decodeOps(rec.content) ?? [] });
+		this.ownGen++;
+	}
+
+	/** Changes whenever the committed own frames pendingFrames() starts from change. */
+	protected get committedOwnGen(): number {
+		return this.ownGen;
 	}
 
 	private seeFrameNo(f: number): void {

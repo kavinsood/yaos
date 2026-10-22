@@ -36,6 +36,8 @@ export interface MarkdownViewLike {
 	editor: unknown;
 	dirty?: boolean;
 	lastSavedData?: string | null;
+	/** TextFileView.data: the text last loaded or saved. */
+	data?: string;
 	getViewType(): string;
 	getMode(): string;
 	getViewData(): string;
@@ -69,6 +71,7 @@ class ObsidianViewRef implements EditorViewRef {
 	private handler: ExternalReloadHandler | null = null;
 	private held = false;
 	private skipped = false;
+	private onSkipped: ((doc: Text) => void) | null = null;
 	private readonly orig = new Map<Wrapped, { fn: (...a: never[]) => unknown; own: boolean }>();
 
 	constructor(
@@ -120,13 +123,22 @@ class ObsidianViewRef implements EditorViewRef {
 		};
 	}
 
-	holdSaves(hold: boolean): boolean {
+	holdSaves(hold: boolean, onSkipped?: (doc: Text) => void): boolean {
 		const skipped = this.skipped;
 		this.held = hold;
 		this.skipped = false;
+		this.onSkipped = hold ? onSkipped ?? null : null;
 		if (hold) this.wrap();
 		else if (!this.binding && !this.handler) this.unwrap();
 		return !hold && skipped;
+	}
+
+	loadFileText(text: string): void {
+		const v = this.view;
+		v.setViewData(text, true);
+		v.lastSavedData = text;
+		v.dirty = false;
+		if (typeof v.data === "string") v.data = text;
 	}
 
 	save(): Promise<void> {
@@ -143,6 +155,7 @@ class ObsidianViewRef implements EditorViewRef {
 		this.spec = null;
 		this.held = false;
 		this.skipped = false;
+		this.onSkipped = null;
 		b?.detach();
 	}
 
@@ -178,6 +191,8 @@ class ObsidianViewRef implements EditorViewRef {
 				self.spec?.onSaveRead();
 				if (self.held && typeof this.lastSavedData === "string") {
 					self.skipped = true;
+					const doc = self.editors.doc(this.editor);
+					if (doc) self.onSkipped?.(doc);
 					return this.lastSavedData;
 				}
 			}

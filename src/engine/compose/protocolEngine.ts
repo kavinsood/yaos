@@ -651,6 +651,7 @@ export class ComposedEngine {
 			case "vaultEvents":
 				this.recordEvents(m.events);
 				for (const e of m.events) if (e.t === "rename") this.bound.followRename(pathKey(e.from), e.to, pathKey);
+				if (m.events.some((e) => e.t === "rename")) rt?.viewsMoved();
 				rt?.vaultEvents(m.events);
 				this.boundDisk.onVaultEvents(m.events);
 				return;

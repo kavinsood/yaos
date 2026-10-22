@@ -111,37 +111,7 @@ Each has a minimized plan in `src/sim/open-repros/` (README there: replay with `
 replayed by the regressions test). All checked still failing on `integrate-3` (2026-10-21); "base" = also failing on
 `client-remake-next` 6a1fb3e5 before the reclaim / generators / governance merges.
 
-
-### SIM-CANVAS-FOLDER-REVIVE: a folder rename revives deleted canvas edges
-
-`20701862-41-min.json` (7 steps, base): A fixes a dangling edge (`cBroken`), then renames the canvas's folder; the
-edges A deleted come back with no concurrent edit and no conflict copy.
-
-### SIM-BLOB-STALE-DISK: blob faults leave A's disk stale
-
-`1370759151-13-min.json` (blob faults, 2 devices, delete / restore races): no convergence; A's body replica and the
-relay hold the newer text of `notes/r5.md`, A's disk the old one.
-
-### SIM-CLONE-BODYLESS-WAIT: a clone waits on a creator that never sends the body
-
-`532933571-114.json` (clone faults, 4 devices; found on 70c67349, base): no quiescence, D waits on the creator of a
-body-less doc whose body never comes.
-
-
-### SIM-CANVAS-REORDER: a canvas reorder to the front lost
-
-`canvas-reorder-lost-1025898366.json` (E2EE faults, 2 devices, suite 1, delete / restore races; 251 steps): B's
-reorder of a node to the front loses against three nodes. Fails the same on `generators`.
-
-### SIM-FLOOD-FLAP: the conflict-flood profile never settles
-
-`flood-flapping-1557069770.json` (FLOOD_FAULTS, 5 devices, storms, delete / restore races, clean-ups; 256 steps, not
-minimized: a run takes minutes): no quiescence, "flapping". Fails the same on `generators`.
-
-### SIM-SOAK-OOM: a soak process ran out of memory
-
-Soak master seed 4 reached ~4 GB and was killed at ~580 s (Node's default heap). Not minimized: find the run (its
-config is drawn from the master seed) and whether a run or the soak's coverage / failure bookkeeping grows.
+None open on `integrate-3` after the fix-refold / fix-prune / fix-s1edit / fix-integrity merges.
 
 ## Landed on `sim-port` since 33bdf49b
 
@@ -216,6 +186,56 @@ Kept here until `sim-port` merges; then git history holds them.
   later record of its epoch, the own one included (e2ee-design §11.3); re-sealed ns / cfg
   records take a fresh id, and own receipts are judged by the committed bytes' keyEpoch (§14.2 step 4). Regression
   `s1-mutual-revoke-canvas-create.json`.
+- **Canvas concurrent record create** (`fix-integrity`, fix-epoch soak `971197958-35`): after an epoch reset C
+  re-created a canvas empty, and A and D each merged their file into it before seeing the other's rows. A record
+  new to a replica is a new Y.Map, so the two maps competed and A's survived whole; D's synced base kept D's colour
+  (an unsent old-epoch edit), and D's next merge read its absence as A removing it. A merge now drops base fields
+  the record's live map never had (`baseSeenBy`, DESIGN §j.2). Regression `canvas-concurrent-record-create-loses-field.json`.
+- **Canvas broken, renamed, deleted** (`fix-integrity`, fix-epoch soak `1542948623-23`): sim oracle. A file deleted
+  while a broken save is pending deletes what the app shows, but the oracle matched the pending save by its old
+  path, so after a rename it counted the canvas's records as lost. It now follows the broken bytes, as the save
+  does. Regression `canvas-broken-renamed-deleted-records-go.json`.
+- **Hot canvas seeds 89, 211** (`fix-integrity`, sim oracle): a deleted canvas file's root removals go with it like
+  its root values; a deleted conflict copy takes its maker's superseded removals too. Regressions
+  `canvas-deleted-vault-root-removal-revived-lineage.json`, `canvas-deleted-copy-takes-superseded-removal.json`.
+- **SIM-FLOOD-FLAP** (`fix-integrity`): not a flap. After a wave of writes to thousands of streams (a mass restore
+  at heal) every non-duty device re-read each stream's remote checkpoint seq before standing in (relay checkpoints
+  are not broadcast), one `read` per stream and two per maintenance tick: the relay kept serving those reads for
+  longer than the 600 s heal horizon, so the run never had 5 quiet seconds. Fallback refreshes now share one
+  `readBatch` per tick from `fallbackMs` on (DESIGN §d.9). The flood plan settles at heal + ~90 s. Focused test in
+  `settleCheckpoint.test.ts`; the 256-step plan (5 min a replay) is not promoted.
+- **SIM-SOAK-OOM** (`fix-integrity`): no leak. Run #20 of master seed 4 is the conflict-flood profile (seed
+  1623917393, 5 devices): ~28k files per device by the end, ~200k vault versions kept. Three costs per size made it
+  blow up. Engine: every synced write read its doc's ns touch seq through `view()`, which `commitEdits`
+  invalidates, so each write refolded every own pending ns frame and built bodyInfo for every entry: O(N x entries)
+  per pass, >50% of CPU and most of the garbage. The ns overlay is memoized and jobs read one entry
+  (`peekRemote`). Sim: the heal loop printed every file's text on every device each virtual second (two ~150 MB
+  strings live), and path listings decoded every file; it now uses a vault content generation and
+  `visiblePaths()`. The run now completes in ~12 min wall with no violation, heap peak 2.8 GB (RSS 5.7 GB), under
+  Node's default heap; between runs the soak's heap returns to ~30-90 MB. Residual, by world size: the sim's
+  MemStorage copies every touched store's record array per write transaction (the main remaining churn), and the
+  vault keeps every version's bytes for the invariants.
+- **SIM-CANVAS-REORDER** (`fix-integrity`): a reorder re-ranks whichever records the order reconciliation moves
+  (the longest ordered run keeps its ranks), often not the one the user moved; a concurrent edit of such a record made
+  its line differ on both sides, and the record conflict kept the CRDT's line with its old rank. `mergeRecordLines`
+  merges a record's rank apart from its fields (DESIGN §j.2 updated). Regression
+  `canvas-reorder-rerank-lost-in-record-conflict.json`.
+- **SIM-CLONE-BODYLESS-WAIT** (`fix-integrity`): a view() while a creator-status request was in flight queued the
+  same creator again; its second "live" answer counted as a recheck and doubled the backoff (10 min instead of 5), so
+  docs of a creator removed meanwhile waited past the heal horizon. A creator being asked is neither queued again nor
+  timed (`creatorStatus.ts`). Nothing was at risk while waiting: the files stay on disk and abandonment re-creates
+  them. Regression `creator-asked-twice-doubles-recheck.json`.
+- **SIM-BLOB-STALE-DISK** (`fix-integrity`): observed renames were ordered by wall-clock stamps; a clock set back
+  between seed1 -> r1 -> r5 and n5 -> r1 chained n5 into r5 (both docs claimed r5.md, the editor bound to n5's doc
+  sat at r1.md, its content job deferred for good, A's disk stale). Rename stamps are now strictly increasing in event
+  order, floored by the `renamedTo` stamps kept across restarts. Regression `clock-set-back-misorders-rename-chain.json`.
+- **SIM-CANVAS-FOLDER-REVIVE** (`fix-integrity`): a save, then a rename before the pass that hashes the save reads
+  the file. The host held the rename's event in its 50 ms batch (§g.3) while the read of the source came back
+  "missing", and an observed rename was dropped after a pass that could only ask for the target's hash, so the doc
+  was deleted and a new one created at the target; a peer's concurrent edit then restored the old doc with records
+  the user had deleted (canvas edges back). The host now flushes its batch before it answers reads and disk ops, the
+  scanner drops a read result for a path hinted while the read was in flight, and an observed rename whose target is
+  not hashed yet survives the pass. Regression `rename-before-read-revives-canvas-deletes.json`.
 - **CLONED-ID, FRAMENO-IDB** (identity-per-store phases 1–4, `client-remake-next`): a deviceId is used by exactly one
   store, ever. The identity lives in the store (`meta.identity`), data.json holds a pairing grant, a clone or a new
   IndexedDB registers a new device, an IndexedDB loss fences its predecessor and re-issues its mirrored frames, a

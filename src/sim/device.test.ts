@@ -275,3 +275,29 @@ test("a store that catches up under the relay's daily-limit hold still plans: ne
 	assert.equal(b.vault.textOf("during-hold.md"), "made during the hold\n");
 	assert.equal(b.vault.textOf("seed.md"), "seed\nheld edit\n");
 });
+
+/**
+ * Sim canvas seed 20701862: a rename's event sat in the host's 50 ms batch while the engine's read of the source
+ * (hashing the save just before) came back "missing", so the engine deleted the doc and created a new one for the
+ * target; the peer trashed the file. The host flushes its batch before it answers a read or disk ops (§g.3).
+ */
+test("a save, then a rename before the pass reads it: the doc moves (the peer renames, nothing is trashed)", async () => {
+	for (const gap of [20, 40, 60, 80, 100, 120]) {
+		const { clock, devs } = world();
+		const a = dev(devs, 0);
+		const b = dev(devs, 1);
+		a.vault.userWrite("x/a.md", "one\n");
+		await boot(clock, devs);
+		await clock.advance(3_000);
+		assert.equal(b.vault.textOf("x/a.md"), "one\n");
+		a.vault.userWrite("x/a.md", "two\n");
+		await clock.advance(gap);
+		assert.ok(a.vault.userRename("x/a.md", "y/b.md"));
+		await clock.advance(5_000);
+		assert.equal(b.vault.textOf("y/b.md"), "two\n", `gap ${gap}`);
+		assert.equal(b.vault.textOf("x/a.md"), null, `gap ${gap}`);
+		assert.deepEqual(b.vault.trashed.map((t) => t.path), [], `gap ${gap}: B renamed the file, it did not trash it`);
+		for (const d of devs) d.runtime.stop().catch(() => undefined);
+		await clock.advance(5_000);
+	}
+});

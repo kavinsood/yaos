@@ -344,7 +344,7 @@ export type EngineToMain =
 	 * Doc identity changed under a bound view (merged alias, remote rename, delete, freeze), or (`resync`) the
 	 * engine dropped body events past 4x the credit window: the host re-binds those views.
 	 */
-	| { readonly t: "docRetarget"; readonly docId: DocId; readonly change: { readonly t: "renamed"; readonly path: VaultPath } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" } }
+	| { readonly t: "docRetarget"; readonly docId: DocId; readonly change: { readonly t: "renamed"; readonly path: VaultPath; readonly stray?: true } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" } }
 	/** A path became bindable (e.g. its create was planned): host retries openDoc for open views. */
 	| { readonly t: "bindable"; readonly path: VaultPath }
 	| { readonly t: "readRequest"; readonly rid: RequestId; readonly reads: readonly DiskReadRequest[] }

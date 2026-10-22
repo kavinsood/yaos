@@ -976,6 +976,26 @@ cold ──load──▶ resident ──bind──▶ bound
   - For `renamed`, `merged` and `frozen`, the host re-opens the doc. `frozen` binds read-only.
   - For `resync`, every view of the doc re-binds: upload, then `bodyAttach` with the mirror's durable text as the
     base.
+  - A bound doc whose views show another file than its synced path gets `renamed{stray}` (`retargetStrayViews`,
+    `vaultRuntime.ts`). A bound doc's merge never writes its file, and a save only reaches the views' file, so the
+    doc's own file would wait for good. Views on a file another doc is synced at re-open at once, at a pass end or
+    right after the vault rename that moved them. Otherwise they re-open at the second pass end that sees the same
+    pair, because a user rename of an open note moves the views one pass before the doc.
+  - On `stray` the host holds the views' saves until they bind again or stay unbound. A save meanwhile would write
+    the old doc's text over the file. The bind merges against the old doc's text (its mirror), so the file's doc
+    keeps its content, and edits not yet pushed apply on top or go to a conflict copy. With the file's doc's own
+    base, the editor read as an edit replacing that doc's text.
+  - Held text never depends on the engine, and a release never writes it over a file that is another doc's.
+    The hold lasts until the view binds again. A bind ends a hold, so the host holds again right after it. Each
+    save skipped meanwhile, including Obsidian's `onUnloadFile` save at a close or file switch, hands its editor
+    text to the host (`holdSaves(hold, onSkipped)`). Unless that text is the old doc's, or the last one kept, the
+    host writes it to a conflict copy of the file through the vault, named like the engine's (`keepHeld`). The
+    engine takes the copy as a new file.
+  - Release: bound, or `notBindable` untracked/excluded (no doc's file), runs the skipped save. A close or file
+    switch drops it, since it is in a copy. An open that fails (engine dead) keeps holding. On host stop the editor
+    text goes to a copy, the view shows its file's disk text (`loadFileText`), and the hold ends without a save.
+  - Merged and pruned re-opens hold nothing: a save meanwhile writes the view's own file, whose synced base is the
+    old doc's text, so the engine reads it as an ordinary edit.
 - **Engine death** (§g.4): the runtime stops, and `stop` flushes and unbinds every view; the edits stay in the
   editors. The user's restart is a new runtime, which binds every view as at a first open. Text the dead engine took
   but never committed is still in the editor: the bind merge brings it back, or keeps the editor side as a conflict
@@ -1439,7 +1459,10 @@ The planner does no destructive work until ns is caught up (§f.2).
   - A fallback device first re-reads the stream's checkpoint seq with `read(stream, appliedSeq, false)`
     (`refreshRemote`, checkpoints.ts:175; maintenance.ts:157). Relay checkpoints are not broadcast, and the duty
     device has usually written one. If it covers `appliedSeq`, the counters reset and nothing is compacted, sealed
-    or written.
+    or written. Streams past `fallbackMs` (jitter not counted: it spreads puts, not reads) share one `readBatch`
+    per tick, as wide as catch-up batches (`refreshRemoteBatch`, `Maintenance.refreshFallbacks`); a stream it
+    served is then put at its jittered time without a second read for 60 s (the put is a CAS anyway). After a wave
+    of writes to N streams a device learns of the duty device's checkpoints in about N / width requests, not N.
   - Only streams this device has caught up on (`stale = 0`) and that are not frozen. Catch-up is eager, so every
     device can stand in for every stream. The doc does not have to be open (compaction reads the store).
   - Settle puts are capped at `REMOTE_CHECKPOINT_SETTLE_DAILY` (1000) per device per 24 h, every put counting
@@ -2652,6 +2675,11 @@ is touched (`sweepOrphanStores`, no timer).
   lines into one hunk, so one record's conflict would swallow the disk's edit of the record on the next line.
   - The CRDT apply is record-level: changed fields are set, and the `text` field gets a minimal `Y.Text` diff. Node
     maps are never replaced wholesale.
+  - A record new to the replica is a new map, so two devices that merge the same file into a doc lacking its records
+    (an epoch reset onto a peer's empty create, a copied vault) create competing maps and one survives whole. A merge
+    therefore drops from its base every field whose key has no item at all in the record's live map (a map keeps a
+    deleted item per key, so a peer's removal still shows): the loser's fields are then its disk's changes and are set
+    in the surviving map, per field (`baseSeenBy`, sim seed 971197958).
   - Canvas views are not bound. Every user edit reaches the CRDT through a disk save and merge.
   - *Subscriptions* (§d.7): an unbound canvas is never in the set unless it has own outbox records, so other
     devices' rows reach it as skips. A save to it while it is stale waits for the read (`body-not-caught-up`, which
@@ -2672,7 +2700,10 @@ is touched (`sweepOrphanStores`, no timer).
     concurrent reorders of the same node keep one.
   - *Disk against CRDT on one device* (the line merge): different records merge. The same record changed on both
     sides, or changed on one and deleted on the other, conflicts: the CRDT keeps its side and the exact disk bytes go
-    to a conflict copy. Without a base (store lost, or the synced record describes another file) a differing disk
+    to a conflict copy. A record's rank merges on its own: a reorder re-ranks whichever records the order
+    reconciliation moves (the longest already-ordered run keeps its ranks), often not the one the user moved, so a
+    record whose rank changed on one side and whose fields changed on the other takes both, and a record conflict
+    keeps the side's rank that changed it (soak seed 1025898366). Without a base (store lost, or the synced record describes another file) a differing disk
     file is a conflict copy too. A user's deletion of a record is never undone except by a concurrent unseen edit, a
     conflict copy, or a store wipe that lost the unsent delete.
   - *No silent loss:* a field write is never undone back to a value it replaced, a created record survives unless a

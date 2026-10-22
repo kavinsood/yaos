@@ -19,8 +19,8 @@ import type { Handle } from "../body/handles";
 import { prunedRestoreDuty } from "../../core/ns/pruned";
 import { canvasDocHashInput } from "../reconcile/canvasDoc";
 import {
-	docStream, type BodyVersion, type CfgFoldState, type CfgOp, type ContentHash, type DeviceId, type DocId, type NsOp,
-	type PathKey, type RemoteEntry, type Seq, type StreamName,
+	docStream, type BodyVersion, type CfgFoldState, type CfgOp, type ContentHash, type DeviceId, type DocId, type NsEntry,
+	type NsOp, type PathKey, type RemoteEntry, type Seq, type StreamName,
 } from "../../core/types";
 import type { BodyHandle, LogPort, RemoteView, SubmitNsOptions } from "../reconcile/deps";
 import type { LogEngine } from "../runtime/engine";
@@ -44,6 +44,26 @@ export class ComposedLog implements LogPort {
 
 	// ---- RemoteView --------------------------------------------------------------
 
+	/** view().remote.get(docId): from the memoized view, else built for this doc alone (the ns overlay is memoized). */
+	peekRemote(docId: DocId): RemoteEntry | undefined {
+		if (this.memo) return this.memo.remote.get(docId);
+		const ns = this.log.nsView();
+		const e = ns.state.entries.get(docId);
+		return e ? this.entryOf(e, ns.pendingDocs.has(e.docId)) : undefined;
+	}
+
+	private entryOf(e: NsEntry, pendingLocal: boolean): RemoteEntry {
+		return {
+			docId: e.docId, kind: e.kind, path: e.path, pathKey: e.pathKey, state: e.state, lastTouchSeq: e.lastTouchSeq,
+			deletedSeq: e.deletedSeq, deleteBaseBodySeq: e.deleteBaseBodySeq, createHash: e.createHash, blob: e.blob,
+			aliasOf: e.aliasOf, pendingLocal, body: e.kind === "blob" ? null : this.log.bodyInfo(e.docId, e.kind),
+		};
+	}
+
+	nsPathTaken(key: PathKey): boolean {
+		return this.memo ? this.memo.remoteByPathKey.has(key) : this.log.nsView().index.byPathKey.has(key);
+	}
+
 	view(): RemoteView {
 		if (this.memo) {
 			this.stats.viewMemoHits++;
@@ -64,12 +84,9 @@ export class ComposedLog implements LogPort {
 		const pending = log.docsWithPendingBody();
 		for (const h of c.handles.all()) if (!h.builder.empty) pending.add(h.docId);
 		for (const e of ns.state.entries.values()) {
-			const body = e.kind === "blob" ? null : log.bodyInfo(e.docId, e.kind);
-			remote.set(e.docId, {
-				docId: e.docId, kind: e.kind, path: e.path, pathKey: e.pathKey, state: e.state, lastTouchSeq: e.lastTouchSeq,
-				deletedSeq: e.deletedSeq, deleteBaseBodySeq: e.deleteBaseBodySeq, createHash: e.createHash, blob: e.blob,
-				aliasOf: e.aliasOf, pendingLocal: ns.pendingDocs.has(e.docId), body,
-			});
+			const entry = this.entryOf(e, ns.pendingDocs.has(e.docId));
+			const body = entry.body;
+			remote.set(e.docId, entry);
 			if (!body) continue;
 			const rec = c.repo.stream(body.stream);
 			if (rec) appliedSeq.set(e.docId, Math.max(rec.appliedSeq, rec.lastOwnSeq));
@@ -191,10 +208,10 @@ export class ComposedLog implements LogPort {
 	}
 
 	async acquireBody(docId: DocId, kind: "markdown" | "canvas"): Promise<BodyHandle | null> {
-		const view = this.view();
-		const known = view.remote.get(docId);
-		// A pruned doc with a restore duty: its replica is merged into the file before the re-create (§c.9).
-		const pruned = !known && view.prunedBody.has(docId) && this.log.c.repo.stream(docStream(kind, docId)!) !== undefined;
+		const known = this.peekRemote(docId);
+		// A pruned doc with a restore duty: its replica is merged into the file before the re-create (§c.9). Only a doc
+		// the ns view lacks builds the whole view.
+		const pruned = !known && this.view().prunedBody.has(docId) && this.log.c.repo.stream(docStream(kind, docId)!) !== undefined;
 		if (!pruned && (!known || known.kind !== kind)) return null;
 		this.stats.acquires++;
 		const h = await this.log.openBody(docId, kind);

@@ -285,11 +285,11 @@ function pickOf<T>(items: readonly T[], pick: number): T | undefined {
 }
 
 export function markdownFiles(d: SimDevice): string[] {
-	return [...d.vault.snapshot().keys()].filter((p) => p.endsWith(".md")).sort();
+	return d.vault.visiblePaths().filter((p) => p.endsWith(".md")).sort();
 }
 
 export function attachmentFiles(d: SimDevice): string[] {
-	return [...d.vault.snapshot().keys()].filter((p) => p.endsWith(".png")).sort();
+	return d.vault.visiblePaths().filter((p) => p.endsWith(".png")).sort();
 }
 
 function boundViews(d: SimDevice): SimEditorView[] {
@@ -497,7 +497,7 @@ export async function runUserAction(w: ActorWorld, a: UserAction, step: number):
 			if (!from) return `skip ${tag}: no folder`;
 			const to = `moved${a.name}`;
 			const n = markdownFiles(d).filter((p) => p.startsWith(`${from}/`)).length;
-			const moved = [...d.vault.snapshot().keys()].filter((p) => p.startsWith(`${from}/`));
+			const moved = d.vault.visiblePaths().filter((p) => p.startsWith(`${from}/`));
 			if (!d.vault.userRenameFolder(from, to)) return `skip ${tag}: ${from} -> ${to} refused`;
 			// Obsidian updates canvas links to every file the move renamed, as for a single rename.
 			for (const p of moved) w.onUserRename?.(a.dev, p, `${to}${p.slice(from.length)}`, step);

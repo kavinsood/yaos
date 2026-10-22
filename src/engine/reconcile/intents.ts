@@ -156,7 +156,7 @@ async function resumeCanvasCopy(env: Env, i: IntentRecord, docId: DocId, from: V
 }
 
 async function resumeKeepBoth(env: Env, i: IntentRecord, docId: DocId, from: VaultPath, to: VaultPath, subject: ContentHash): Promise<boolean> {
-	const r = env.ctx.log.view().remote.get(docId);
+	const r = env.ctx.remote(docId);
 	const copy = await hashAt(env, to, "blob");
 	const orig = await hashAt(env, from, "blob");
 	if (!r?.blob || r.state !== "live" || !copy || copy.hash !== subject || !orig || orig.hash !== subject) {

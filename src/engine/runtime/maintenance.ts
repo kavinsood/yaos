@@ -15,7 +15,8 @@
 import { TAIL_HARD_ROWS } from "../../core/limits";
 import { NS_STREAM, SNAP_STREAM, type DocId, type StreamName } from "../../core/types";
 import type { TimerHandle } from "../../ports/clock";
-import { bodyCheckpointDue, foldCheckpointDue, writeBodyCheckpoint, writeFoldCheckpoint } from "../body/checkpoints";
+import type { RelaySession } from "../../ports/relay";
+import { bodyCheckpointDue, foldCheckpointDue, refreshRemoteBatch, writeBodyCheckpoint, writeFoldCheckpoint } from "../body/checkpoints";
 import { compactBody, compactFold, needsCompaction } from "../body/compaction";
 import { deadReason, writeRetired, DROPS_PER_TICK, RETIRES_PER_TICK, type DeadReason, type FoldCompleteness } from "../body/retire";
 import type { StreamRecord } from "../store/schema";
@@ -25,14 +26,18 @@ const COMPACTIONS_PER_TICK = 4;
 const CHECKPOINTS_PER_TICK = 2;
 const COMPACT_SKIP_BACKOFF_MS = 30_000;
 const CHECKPOINT_ERROR_BACKOFF_MS = 60_000;
+/** A batched refresh stands in for a write's own refreshFirst read this long (the put is a CAS on it anyway). */
+const REFRESH_FRESH_MS = 60_000;
 
 export class Maintenance {
 	private timer: TimerHandle | null = null;
 	private running: Promise<void> | null = null;
 	private readonly compactSkip = new Map<StreamName, number>();
+	/** Fallback streams a batched refresh served, at (mono): not re-read for REFRESH_FRESH_MS. */
+	private readonly refreshedAt = new Map<StreamName, number>();
 	/** Idle ticks in a row (no pending work, no work done): the next interval is maintenanceMs * 2^idle, capped. */
 	private idle = 0;
-	stats = { ticks: 0, gapFeeds: 0, compactions: 0, checkpoints: 0, retires: 0, drops: 0, checkpointOutcomes: {} as Record<string, number> };
+	stats = { ticks: 0, gapFeeds: 0, compactions: 0, checkpoints: 0, retires: 0, drops: 0, refreshBatches: 0, checkpointOutcomes: {} as Record<string, number> };
 
 	constructor(private readonly c: EngineCtx) {
 		c.onActivity = () => this.kick();
@@ -93,7 +98,7 @@ export class Maintenance {
 		const c = this.c;
 		if (c.stopped) return;
 		this.stats.ticks++;
-		const work = () => this.stats.gapFeeds + this.stats.compactions + this.stats.checkpoints + this.stats.retires + this.stats.drops;
+		const work = () => this.stats.gapFeeds + this.stats.compactions + this.stats.checkpoints + this.stats.retires + this.stats.drops + this.stats.refreshBatches;
 		const work0 = work();
 		const steps: [string, () => Promise<void> | void][] = [
 			["gap", () => this.gap()],
@@ -180,6 +185,8 @@ export class Maintenance {
 		if (!s || !s.canWrite || c.readOnly || c.phase !== "live" || c.background || c.gate() !== null) return;
 		const now = c.mono();
 		c.ckpt.markLive(now);
+		await this.refreshFallbacks(s, now);
+		const fresh = (stream: StreamName) => now - (this.refreshedAt.get(stream) ?? -Infinity) < REFRESH_FRESH_MS;
 		let budget = CHECKPOINTS_PER_TICK;
 		for (const r of [...c.repo.streams()]) {
 			if (budget <= 0 || c.session !== s) return;
@@ -189,7 +196,7 @@ export class Maintenance {
 			if (!bodyCheckpointDue(r, duty, c.ckpt, c.tuning.checkpoint, now, this.jitter(r.stream))) continue;
 			budget--;
 			try {
-				const o = await writeBodyCheckpoint(c.deps, c.ckpt, s, r.stream, { refreshFirst: !duty });
+				const o = await writeBodyCheckpoint(c.deps, c.ckpt, s, r.stream, { refreshFirst: !duty && !fresh(r.stream) });
 				this.count(o.t);
 				if (o.t === "ok") this.stats.checkpoints++;
 				else if (o.t === "skipped") c.ckpt.backoffUntil.set(r.stream, now + CHECKPOINT_ERROR_BACKOFF_MS);
@@ -324,6 +331,36 @@ export class Maintenance {
 				st.backoffUntil.set(stream, now + CHECKPOINT_ERROR_BACKOFF_MS);
 				c.diag("checkpoint-failed", { cls: rec.cls, error: String(e) });
 			}
+		}
+	}
+
+	/**
+	 * Body / canvas streams due on the fallback (not this device's duty) re-read their remote checkpoint seq in one
+	 * batched request per tick, as wide as catch-up batches (DESIGN §d.9): the ones someone else checkpointed meanwhile
+	 * stop being due without a read each; the others are put at their jittered time without a second read (within
+	 * REFRESH_FRESH_MS). Width 1 (single reads only): none, writeBodyCheckpoint refreshes per stream.
+	 */
+	private async refreshFallbacks(s: RelaySession, now: number): Promise<void> {
+		const c = this.c;
+		const width = Math.min(s.limits.readBatchStreams, c.tuning.readBatchStreams);
+		if (width < 2) return;
+		for (const [stream, at] of this.refreshedAt) if (now - at >= REFRESH_FRESH_MS) this.refreshedAt.delete(stream);
+		const due: StreamRecord[] = [];
+		for (const r of c.repo.streams()) {
+			if (due.length >= width) break;
+			if (r.cls !== "body" && r.cls !== "canvas") continue;
+			if (r.stale || r.appliedSeq <= r.remoteCheckpointCoversSeq || this.refreshedAt.has(r.stream) || c.sess.isReading(r.stream) || c.repo.hasCkptDuty(r.stream)) continue;
+			// From fallbackMs on, without the jitter: the jitter spreads the fallback devices' puts, and a read is no put;
+			// streams whose condition started together then share a request instead of trickling in one by one.
+			if (bodyCheckpointDue(r, false, c.ckpt, c.tuning.checkpoint, now, 0)) due.push(r);
+		}
+		if (due.length < 2) return;
+		try {
+			for (const stream of await refreshRemoteBatch(c.deps, c.ckpt, s, due)) this.refreshedAt.set(stream, now);
+			this.stats.refreshBatches++;
+		} catch (e) {
+			this.count("refresh-batch-error");
+			c.diag("checkpoint-failed", { cls: "body", error: String(e) });
 		}
 	}
 

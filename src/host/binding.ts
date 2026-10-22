@@ -15,12 +15,15 @@
  */
 
 import { ChangeSet, type Text } from "@codemirror/state";
-import type { DocId, VaultPath } from "../core/types";
+import type { DocId, PathKey, VaultPath } from "../core/types";
+import { conflictCopyNotice, conflictName } from "../core/plan/conflictName";
+import { pathKey } from "../core/paths/pathKey";
 import { kindOfPath } from "../core/types";
 import { MAIN_UPDATE_COALESCE_MS } from "../core/limits";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { Unsubscribe } from "../ports/common";
 import type { EditorBinding, EditorViewRef, ViewEvent, WorkspacePort } from "../ports/workspace";
+import type { VaultPort } from "../ports/vault";
 import type { BindInfo, BodyChanges, BodyEvent, EngineResultValue, MainToEngine } from "../protocol/messages";
 import { encodeUtf16, TEXT_CHUNK_UNITS } from "../protocol/utf16";
 import { DocMirror, ViewClient } from "./bodyClient";
@@ -32,9 +35,17 @@ export interface BindingLink {
 	openDoc(path: VaultPath, viewId: number): Promise<EngineResultValue>;
 }
 
+/** Conflict copy writes of held text: tries (a name taken, a disk error) and the wait after a disk error. */
+const HELD_COPY_TRIES = 8;
+const HELD_COPY_RETRY_MS = 2_000;
+
 export interface BindingDeps {
 	readonly workspace: WorkspacePort;
-	readonly vault: { readonly caseInsensitive: boolean };
+	/** write / stat / readBytes: held text kept by main (keepHeld, settleHeld). */
+	readonly vault: { readonly caseInsensitive: boolean } & Partial<Pick<VaultPort, "write" | "stat" | "readBytes">>;
+	/** Conflict copy names (as the engine's): the device label and the local time zone. */
+	readonly conflictLabel?: () => string;
+	readonly tzOffsetMinutes?: () => number;
 	readonly clock: ClockPort;
 	readonly link: BindingLink;
 	readonly notice: (level: "info" | "warn" | "error", code: string, message: string) => void;
@@ -69,6 +80,21 @@ interface ViewSlot {
 	reload: number;
 	reloadText: string | null;
 	reloadChain: Promise<void>;
+	/** Saves held since a stray retarget (onDocRetarget), until the view binds again, leaves, or the host stops. */
+	held: StrayHold | null;
+}
+
+/** A stray retarget's hold on one view (onDocRetarget). */
+interface StrayHold {
+	/** The old doc, and the file the view showed: another doc's (or none's). */
+	readonly docId: DocId;
+	readonly path: VaultPath;
+	/** The old doc's text as main last knew it (its mirror): the next bind's merge base; nothing beyond it is new. */
+	readonly carry: Text | null;
+	/** The last text kept in a conflict copy (keepHeld). */
+	kept: Text | null;
+	/** Conflict copy writes, one after another. */
+	chain: Promise<void>;
 }
 
 export interface BindingStats {
@@ -83,6 +109,8 @@ export interface BindingStats {
 	uploads: number;
 	uploadUnits: number;
 	creditsSent: number;
+	/** Conflict copies of held text written by main (keepHeld). */
+	heldCopies: number;
 }
 
 /** A text to upload: a CodeMirror Text (sliceString) or a string, read one chunk at a time. */
@@ -105,7 +133,7 @@ export class BindingManager {
 	private nextPush = 1;
 	private credit = 0;
 	private creditQueued = false;
-	readonly stats: BindingStats = { pushes: 0, rejects: 0, entries: 0, bounds: 0, resyncs: 0, reloads: 0, siblingCopies: 0, saveMarks: 0, uploads: 0, uploadUnits: 0, creditsSent: 0 };
+	readonly stats: BindingStats = { pushes: 0, rejects: 0, entries: 0, bounds: 0, resyncs: 0, reloads: 0, siblingCopies: 0, saveMarks: 0, uploads: 0, uploadUnits: 0, creditsSent: 0, heldCopies: 0 };
 
 	constructor(private readonly deps: BindingDeps) {}
 
@@ -125,7 +153,10 @@ export class BindingManager {
 	/** Plugin unload or the engine stopped (fatal): flush and unbind everything. */
 	stop(): void {
 		this.flushAll();
-		for (const slot of [...this.slots.values()]) this.unbindSlot(slot);
+		for (const slot of [...this.slots.values()]) {
+			this.unbindSlot(slot);
+			void this.settleHeld(slot);
+		}
 		this.slots.clear();
 		this.bases.clear();
 		this.offWorkspace?.();
@@ -247,13 +278,93 @@ export class BindingManager {
 		s.client.bound(c);
 		if ([...doc.slots].every((o) => o.state === "bound")) this.bases.delete(doc.docId);
 		this.flushSlot(s);
+		this.releaseHeld(s, true);
 	}
 
-	onDocRetarget(docId: DocId, change: { readonly t: "renamed"; readonly path: VaultPath } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" }): void {
+	/**
+	 * Hold the saves of a view a stray retarget moved off its doc (§d.2). Its text is the old doc's (all of it in that
+	 * doc's replica, except edits not pushed yet, and those typed since), and its file is another doc's (or none's):
+	 * a save would write that text over the file. Each save skipped meanwhile keeps its text in a conflict copy
+	 * written here, so it never depends on the engine being alive (keepHeld).
+	 */
+	private holdStray(slot: ViewSlot): void {
+		const h = slot.held;
+		if (h) slot.view.holdSaves(true, (doc) => this.keepHeld(h, doc));
+	}
+
+	/**
+	 * End a view's stray hold. `save`: the view is bound to its file's doc again (or its file is no doc's): a skipped
+	 * save runs now. Otherwise (it closed or shows another file) the skipped saves are in conflict copies already.
+	 */
+	private releaseHeld(slot: ViewSlot, save: boolean): void {
+		if (!slot.held) return;
+		slot.held = null;
+		if (slot.view.holdSaves(false) && save) void slot.view.save().catch(() => undefined);
+	}
+
+	/**
+	 * Keep a held view's text in a conflict copy of the file it showed, written by main through the vault (the engine
+	 * may be dead), named like the engine's copies; the engine takes it as a new file. Only text beyond the old doc's
+	 * and beyond the last copy: a save repeated without edits writes nothing.
+	 */
+	private keepHeld(h: StrayHold, doc: Text): void {
+		if (h.carry?.eq(doc) || h.kept?.eq(doc)) return;
+		h.kept = doc;
+		const text = doc.toString();
+		h.chain = h.chain.then(() => this.writeCopy(h, text)).catch(() => undefined);
+	}
+
+	private async writeCopy(h: StrayHold, text: string): Promise<void> {
+		const vault = this.deps.vault;
+		if (!vault.write) return;
+		const taken = new Set<PathKey>();
+		for (let attempt = 0; attempt < HELD_COPY_TRIES; attempt++) {
+			const target = conflictName({
+				path: h.path, docId: h.docId, deviceLabel: this.deps.conflictLabel?.() ?? "", nowMs: this.deps.clock.now(), tzOffsetMinutes: this.deps.tzOffsetMinutes?.() ?? 0,
+				pathKey, isTaken: (k) => taken.has(k),
+			});
+			const out = await vault.write(target, text, { t: "absent" }).catch((e: unknown) => ({ ok: false as const, reason: "io" as const, message: String(e) }));
+			if (out.ok) {
+				this.stats.heldCopies++;
+				this.deps.notice("warn", "conflict-copy", conflictCopyNotice({ from: h.path, to: target }, 1));
+				return;
+			}
+			if (out.reason === "precondition") taken.add(pathKey(target));
+			else await new Promise<void>((resolve) => this.deps.clock.setTimer(HELD_COPY_RETRY_MS, resolve));
+		}
+		this.deps.notice("error", "conflict-copy-failed", `Could not keep the unsaved text of ${h.path} in a conflict copy; it is still in the editor history.`);
+	}
+
+	/**
+	 * The host stops with a view held: its hold cannot outlive the plugin, and once released Obsidian's next save
+	 * writes the editor over a file that is another doc's. The editor text goes to a conflict copy, then the view
+	 * shows its file's disk text (unless the file is gone: then no doc's), then the hold ends without a save.
+	 */
+	private async settleHeld(slot: ViewSlot): Promise<void> {
+		const h = slot.held;
+		if (!h) return;
+		const doc = slot.view.editorDoc();
+		if (doc) this.keepHeld(h, doc);
+		await h.chain;
+		const path = slot.view.path;
+		const vault = this.deps.vault;
+		if (path !== null && this.samePath(path, h.path) && vault.stat && vault.readBytes) {
+			const bytes = (await vault.stat(path).catch(() => null)) ? await vault.readBytes(path).catch(() => null) : null;
+			const text = bytes ? new TextDecoder().decode(bytes) : null;
+			if (text !== null && slot.held === h && slot.view.path !== null && this.samePath(slot.view.path, h.path)) slot.view.loadFileText(text);
+		}
+		if (slot.held === h) this.releaseHeld(slot, false);
+	}
+
+	onDocRetarget(docId: DocId, change: { readonly t: "renamed"; readonly path: VaultPath; readonly stray?: true } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" }): void {
 		const doc = this.docs.get(docId);
 		if (!doc) return;
 		// resync: the worker dropped events (main fell behind its window); the mirror is behind but consistent.
 		if (change.t === "resync") return this.resync(doc, doc.mirror?.text ?? null);
+		// Stray (the views show another doc's file): saves held (holdStray) until the view binds that file's doc, and
+		// that bind merges against this doc's text: the file's doc keeps its content, the unpushed edits apply on
+		// top. Bound with no base, the editor read as an edit replacing the file's text.
+		const carry = change.t === "renamed" && change.stray ? doc.mirror?.text ?? null : null;
 		for (const slot of [...doc.slots]) {
 			// Frozen: the engine dropped the doc's binding first, so the keystrokes unbindSlot pushes now are refused, and
 			// the re-open stays unbound ("edits are kept locally"). The editor is then their only copy until Obsidian's
@@ -263,6 +374,10 @@ export class BindingManager {
 			const unsaved = change.t === "frozen" && slot.view.isDirty();
 			this.unbindSlot(slot);
 			if (unsaved) void slot.view.save().catch(() => undefined);
+			if (change.t === "renamed" && change.stray) {
+				slot.held ??= { docId, path: slot.view.path ?? change.path, carry, kept: null, chain: Promise.resolve() };
+				this.holdStray(slot);
+			}
 			void this.open(slot);
 		}
 	}
@@ -328,6 +443,7 @@ export class BindingManager {
 		return {
 			viewId: view.viewId, view, seq: 0, state: "idle", doc: null, binding: null, client: null, unintercept: null,
 			attachDoc: null, attachId: 0, attachPosted: false, timer: null, lastLocalMono: -1, reload: 0, reloadText: null, reloadChain: Promise.resolve(),
+			held: null,
 		};
 	}
 
@@ -349,7 +465,10 @@ export class BindingManager {
 		switch (e.t) {
 			case "opened": {
 				const existing = this.slots.get(e.view.viewId);
-				if (existing) this.unbindSlot(existing);
+				if (existing) {
+					this.releaseHeld(existing, false);
+					this.unbindSlot(existing);
+				}
 				const slot = this.newSlot(e.view);
 				this.slots.set(slot.viewId, slot);
 				void this.open(slot);
@@ -360,7 +479,10 @@ export class BindingManager {
 				if (!slot) {
 					slot = this.newSlot(e.view);
 					this.slots.set(slot.viewId, slot);
-				} else this.unbindSlot(slot);
+				} else {
+					this.releaseHeld(slot, false); // its save of the old file (skipped) is in a conflict copy
+					this.unbindSlot(slot);
+				}
 				slot.reloadText = null; // another file now: its pending reload is moot
 				void this.open(slot);
 				return;
@@ -368,6 +490,7 @@ export class BindingManager {
 			case "closed": {
 				const slot = this.slots.get(e.viewId);
 				if (!slot) return;
+				this.releaseHeld(slot, false); // its close save (skipped) is in a conflict copy
 				this.unbindSlot(slot);
 				this.slots.delete(e.viewId);
 				return;
@@ -401,6 +524,9 @@ export class BindingManager {
 			return;
 		}
 		if (res.t !== "bind") {
+			// No doc's file (untracked, excluded): the view's saves may write it. Otherwise (oversize, a frozen doc
+			// below) the file is a doc's: a held view stays held.
+			if (res.t === "notBindable" && (res.reason === "untracked" || res.reason === "excluded")) this.releaseHeld(slot, true);
 			this.idle(slot, "waiting");
 			return;
 		}
@@ -439,12 +565,13 @@ export class BindingManager {
 			this.idle(slot, "idle");
 			return;
 		}
+		this.holdStray(slot); // a bind ends a hold: held until `bound`
 		Object.assign(slot, { binding, client, doc, state: "attaching", attachPosted: false });
 		doc.slots.add(slot);
 		this.intercept(slot);
 		const editor = binding.doc();
 		slot.attachDoc = editor;
-		const base = this.bases.get(info.docId) ?? null;
+		const base = this.bases.get(info.docId) ?? slot.held?.carry ?? null;
 		// Every bind of a dirty view says what is on disk: after an engine restart the engine has no disk text for
 		// the doc, and taking this editor's unsaved text for it would turn a sibling view's (older) disk text into
 		// an edit that reverts this one (sim seed 62).

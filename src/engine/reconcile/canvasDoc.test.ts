@@ -8,7 +8,7 @@ import { rankCanvasInFileOrder } from "../../core/hash/testkit/canvasRanks";
 import { canvasHashRef, refHashPort as H } from "../../core/hash/testkit/hashRef";
 import { utf8Encode } from "../../core/codec/lib0";
 import { DEFAULT_MERGE_LIMITS } from "../../core/merge/merge";
-import { applyCanvas, canvasDocHashInput, emptyCanvas, projectCanvasBytes, projectionHash, projectRanked, readCanvas, type CanvasProjection } from "./canvasDoc";
+import { applyCanvas, baseSeenBy, canvasDocHashInput, emptyCanvas, projectCanvasBytes, projectionHash, projectRanked, readCanvas, type CanvasProjection } from "./canvasDoc";
 import { canvasMergeStats, mergeCanvasSides, parseDiskCanvas, parseMergeText } from "./canvasMerge";
 
 type Obj = Record<string, unknown>;
@@ -147,6 +147,12 @@ function sides(baseJson: string, diskJson: string, crdtEdit: (d: Y.Doc) => void)
 	return { d, out: mergeCanvasSides({ base, disk: disk.data, crdt, limits: DEFAULT_MERGE_LIMITS }) };
 }
 
+function diskOf(json: string) {
+	const disk = parseDiskCanvas(utf8Encode(json));
+	assert.ok(disk.ok);
+	return disk.data;
+}
+
 const BASE = canvasJson([textNode("a", "A"), textNode("b", "B"), textNode("c", "C")], [edge("e", "a", "b")]);
 
 test("canvasMerge: edits to different nodes merge cleanly", () => {
@@ -227,19 +233,18 @@ test("canvasMerge: no base -> identical when equal (formatting ignored), else co
 	assert.deepEqual(p.hashInput, crdt.hashInput);
 });
 
-test("canvasMerge: disk re-ranks a node the CRDT edited: that node conflicts, the other disk edit merges", () => {
+test("canvasMerge: disk re-ranks a node the CRDT edited: the rank and the edit both merge, and the other disk edit", () => {
 	// Disk brings a to the front (a new rank on its line) and moves c, the CRDT resizes a. A line diff3 saw a's line
 	// move as a delete plus an insert and produced two lines for a, a text that was rejected whole, c's move with it.
-	// Per record: a changed on both sides keeps the CRDT's line, c changed on disk only takes the disk's.
+	// Per record: a's fields changed on the CRDT side only and its rank on the disk side only (the rank merges on its
+	// own: an uncontested reorder holds, §j.2), c changed on disk only takes the disk's.
 	const disk = canvasJson([textNode("b", "B"), textNode("c", "C", 7), textNode("a", "A")], [edge("e", "a", "b")]);
 	const rejected0 = canvasMergeStats.rejected;
-	const { d, out } = sides(BASE, disk, (doc) => nodeMap(doc, "a").set("width", 300));
+	const { out } = sides(BASE, disk, (doc) => nodeMap(doc, "a").set("width", 300));
 	assert.equal(canvasMergeStats.rejected - rejected0, 0);
-	assert.equal(out.kind, "conflict");
-	assert.equal(out.reason, "both-edited");
-	const crdt = project(d).ranked;
+	assert.equal(out.kind, "clean");
 	assert.equal(out.target.data.nodes.get("a")!.size.width, 300);
-	assert.equal(out.target.nodeRanks.get("a"), crdt.nodeRanks.get("a"), "a keeps the CRDT's rank");
+	assert.deepEqual(out.target.data.nodeOrder, ["b", "c", "a"], "a is in front (the disk's rank)");
 	assert.equal(out.target.data.nodes.get("c")!.position.x, 7, "c's disk move is merged");
 });
 
@@ -270,4 +275,63 @@ test("canvasDoc: hostile CRDT records (not a map, bad rank, invalid edge, nested
 	assert.equal(projectCanvasBytes(docOf(BASE)).ok, true);
 	const big = parseDiskCanvas(utf8Encode(JSON.stringify({ nodes: Array.from({ length: 20_001 }, (_, i) => ({ ...textNode(`n${i}`, ""), id: `n${i}` })), edges: [] })));
 	assert.deepEqual(big.ok ? null : big.reason, "oversized nodes 20001 > 20000");
+});
+
+/**
+ * Soak seed 1025898366: bringing a to the front of [a, b] re-ranks b (the order reconciliation keeps the longest
+ * ordered run, here a's rank). A concurrent edit of b's text made b's line differ on both sides, and the conflict kept
+ * the CRDT's line, old rank included: the reorder was lost. The rank merges apart from the record's fields.
+ */
+test("canvasMerge: a reorder that re-ranked a node merges with a concurrent edit of that node", () => {
+	const base = canvasJson([textNode("a", "A"), textNode("b", "B")]);
+	const disk = canvasJson([textNode("b", "B"), textNode("a", "A")]);
+	const { d, out } = sides(base, disk, (doc) => (nodeMap(doc, "b").get("text") as Y.Text).insert(1, " crdt"));
+	assert.equal(out.kind, "clean", "the disk changed b's rank only, the CRDT its text");
+	applyCanvas(d, null, out.target);
+	const j = parseCanvas(project(d).text);
+	assert.deepEqual(j.nodes.map((n) => n.id), ["b", "a"], "a is in front");
+	assert.equal(j.nodes[0]?.text, "B crdt");
+});
+
+test("canvasMerge: a conflicting edit of a re-ranked node keeps the CRDT's fields and the disk's order", () => {
+	const base = canvasJson([textNode("a", "A"), textNode("b", "B")]);
+	const disk = canvasJson([textNode("b", "B disk"), textNode("a", "A")]);
+	const { d, out } = sides(base, disk, (doc) => (nodeMap(doc, "b").get("text") as Y.Text).insert(1, " crdt"));
+	assert.equal(out.kind, "conflict");
+	applyCanvas(d, null, out.target);
+	const j = parseCanvas(project(d).text);
+	assert.deepEqual(j.nodes.map((n) => n.id), ["b", "a"], "the reorder is not part of the conflict");
+	assert.equal(j.nodes[0]?.text, "B crdt", "the conflicting record keeps the CRDT's side (the copy has the disk's)");
+});
+
+test("canvasMerge: a field whose map lost a concurrent create of the record is this side's, not a removal", () => {
+	// Two devices merge the same file into a doc lacking its records (an epoch reset onto a peer's empty create):
+	// each creates the record's map, and the replica keeps one of them. D's base and disk hold a colour its own map
+	// had; the surviving map (A's) never had the key, so the colour is set again, not read as A removing it.
+	const withColor = canvasJson([{ ...textNode("n1", "hi"), color: "5" }, textNode("n2", "x", 10)]);
+	const plain = canvasJson([textNode("n1", "hi"), textNode("n2", "x", 10)]);
+	const a = docOf(plain);
+	const d = new Y.Doc();
+	applyCanvas(d, null, ranked(withColor));
+	// D's map for n1 loses to A's: D's replica ends up with A's maps (and D's own n2 map is replaced alike).
+	const lost = new Y.Doc();
+	Y.applyUpdate(lost, Y.encodeStateAsUpdate(a));
+	const base = ranked(withColor);
+	const seen = baseSeenBy(base, lost);
+	assert.equal(seen.data.nodes.get("n1")?.extensions.color, undefined, "the colour was never in the surviving map");
+	assert.equal(baseSeenBy(base, d), base, "D's own maps hold every based key: the base is unchanged");
+	const crdt = project(lost);
+	const m = mergeCanvasSides({ base: seen, disk: diskOf(withColor), crdt, limits: DEFAULT_MERGE_LIMITS });
+	assert.notEqual(m.kind, "conflict");
+	assert.equal((parseCanvas(m.projection.text).nodes.find((n) => n.id === "n1") as Obj).color, "5", "the colour survives");
+	// A real removal leaves a deleted item for the key: the base keeps the field and the removal wins.
+	const removed = docOf(withColor);
+	applyCanvas(removed, null, ranked(plain));
+	assert.equal(baseSeenBy(base, removed), base);
+	const r = mergeCanvasSides({ base, disk: diskOf(withColor), crdt: project(removed), limits: DEFAULT_MERGE_LIMITS });
+	assert.equal((parseCanvas(r.projection.text).nodes.find((n) => n.id === "n1") as Obj).color, undefined, "a peer's removal still applies");
+	// A deleted item survives a snapshot round trip (the replica loaded from a checkpoint).
+	const reloaded = new Y.Doc();
+	Y.applyUpdate(reloaded, Y.encodeStateAsUpdate(removed));
+	assert.equal(baseSeenBy(base, reloaded), base);
 });

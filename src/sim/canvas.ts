@@ -491,7 +491,7 @@ export function isConflictCopy(path: string): boolean {
 }
 
 export function canvasFiles(d: SimDevice): string[] {
-	return [...d.vault.snapshot().keys()].filter((p) => p.endsWith(".canvas")).sort();
+	return d.vault.visiblePaths().filter((p) => p.endsWith(".canvas")).sort();
 }
 
 /** Canvases the user edits: not conflict copies (their records share ids with the canvas they copy). */
@@ -645,7 +645,7 @@ export class CanvasWorld {
 	}
 
 	private notes(d: SimDevice): string[] {
-		return [...d.vault.snapshot().keys()].filter((p) => p.endsWith(".md") || p.endsWith(".png")).sort();
+		return d.vault.visiblePaths().filter((p) => p.endsWith(".md") || p.endsWith(".png")).sort();
 	}
 
 	private write(d: SimDevice, path: string, text: string, by: Writer): void {
@@ -736,8 +736,9 @@ export class CanvasWorld {
 		// The user deletes what they see: the file, what the engine had integrated (nsDelete's baseBodySeq) and, while
 		// a save is half-written, the canvas their app still shows: the one before the broken write, or their own save
 		// (fault-heavy seed 122, hot seed 163: a broken file deleted before its save completed; its records were
-		// never marked deleted).
-		const showing = [...this.fixes.values()].filter((f) => f.dev === a.dev && f.path === path).flatMap((f) => [f.before, f.full]);
+		// never marked deleted). The save follows the broken bytes (complete()): a rename since moves it with them
+		// (suite-1 seed 1542948623: broken, renamed, deleted; the records were counted as lost).
+		const showing = [...this.fixes.values()].filter((f) => f.dev === a.dev && (f.path === path || noBom(f.broken) === cur)).flatMap((f) => [f.before, f.full]);
 		const seen = [cur, engineCanvasText(d, path) ?? "", ...showing];
 		for (const text of seen) for (const t of tokensIn(text)) this.w.ledger.deleted(t);
 		const atMs = this.clock.now();
@@ -760,10 +761,22 @@ export class CanvasWorld {
 			// which that value replaced there, unless another canvas still holds them (hot canvas seed 570: a no-base
 			// merge put A's two successive colours into a conflict copy, the user deleted it, the first colour was
 			// counted as lost).
+			// A removal in that chain goes too, and the chain goes on through what it removed (hot canvas seed 211:
+			// offline B set a colour, cleared it, set another; the copy held the last, the user deleted it, and the
+			// clear and the first colour were counted as lost).
 			const discard = (rec: string, f: string, v: string): void => {
 				this.oracle.discarded.add(`${rec}|${f}|${v}`);
 				const w = this.oracle.writes.get(`${rec}|${f}|${v}`);
-				for (let cur = w; cur && cur.saw !== null && cur.saw !== ABSENT; ) {
+				for (let cur = w; cur && cur.saw !== null; ) {
+					if (cur.saw === ABSENT) {
+						const at = cur.atMs;
+						const rms = (this.oracle.removals.get(`${rec}|${f}`) ?? []).filter((r) => r.dev === w!.dev && r.path === w!.path && r.atMs <= at && r !== cur);
+						const rm = rms[rms.length - 1];
+						if (!rm || this.oracle.discardedRemovals.has(rm)) break;
+						this.oracle.discardedRemovals.add(rm);
+						cur = rm;
+						continue;
+					}
 					const prev = this.oracle.writes.get(`${rec}|${f}|${cur.saw}`);
 					const k = `${rec}|${f}|${cur.saw}`;
 					if (!prev || prev.dev !== w!.dev || prev.path !== w!.path || held.has(k) || this.oracle.discarded.has(k)) break;
@@ -818,6 +831,17 @@ export class CanvasWorld {
 					this.oracle.discarded.add(`root|${k}|${v}`);
 					const w = this.oracle.writes.get(`root|${k}|${v}`);
 					if (w) for (const a of this.oracle.ancestors(w)) this.oracle.discarded.add(`root|${k}|${a}`);
+				}
+				// And the root fields the file lacks because a user removed them in it: the removals go with the file too
+				// (hot canvas seed 89: A removed a root field, renamed and deleted the canvas; B's own copy of the vault,
+				// never synced before, came back as a new doc of the same lineage still holding the field).
+				if (m) {
+					const lin = lineageOf(m.root);
+					const doc = docIdOf(d, path);
+					for (const [k, list] of this.oracle.removals) {
+						if (!k.startsWith("root|") || m.root[k.slice(5)] !== undefined) continue;
+						for (const r of list) if (r.atMs <= atMs && ((lin !== null && r.lineage === lin) || (doc !== null && r.doc === doc))) this.oracle.discardedRemovals.add(r);
+					}
 				}
 			}
 		}

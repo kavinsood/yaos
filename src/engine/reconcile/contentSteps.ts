@@ -74,10 +74,9 @@ export async function writeConflictCopy(
 	const { ctx } = env;
 	const docId = op.docId;
 	const copyHash = await textContentHash(ctx.deps.hash, kind, bytes);
-	const view = ctx.log.view();
 	const copyPath = conflictName({
 		path: op.path, docId, deviceLabel: ctx.deps.deviceLabel, nowMs: ctx.now(), tzOffsetMinutes: ctx.deps.tzOffsetMinutes?.() ?? 0,
-		pathKey: ctx.pk, isTaken: (k) => ctx.local.has(k) || view.remoteByPathKey.has(k),
+		pathKey: ctx.pk, isTaken: (k) => ctx.local.has(k) || ctx.remotePathTaken(k),
 	});
 	const intent: IntentRecord = {
 		id: intentId("conflict-copy", docId, op.path), docId, kind: "conflict-copy", subjectHash,

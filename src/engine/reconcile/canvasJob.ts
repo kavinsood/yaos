@@ -27,7 +27,7 @@ import { exactFingerprint } from "../../core/hash/markdownLf";
 import { canvasLogicalHash, canvasToMergeText, type CanvasRanked } from "../../core/hash/canvasCanonical";
 import { isShrinkingOverwrite } from "../../core/plan/brake";
 import type { IntentRecord } from "../store/schema";
-import { applyCanvas, emptyCanvas, projectCanvasBytes, projectionHash, readCanvas, visibleCanvas } from "./canvasDoc";
+import { applyCanvas, baseSeenBy, emptyCanvas, projectCanvasBytes, projectionHash, readCanvas, visibleCanvas } from "./canvasDoc";
 import { isEmptyCanvas, mergeCanvasSides, parseDiskCanvas, parseMergeText, rankDisk, withEpochDeletes, type CanvasMergeOutput } from "./canvasMerge";
 import { epochBaseOf, MAX_CAS_ATTEMPTS, overwriteAllowed, trustedEpochBase, writeConflictCopy, type ReconcileOp } from "./contentSteps";
 import type { BodyHandle } from "./deps";
@@ -81,8 +81,10 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 		// No stored base: a side still at the synced content is the base (see mergeJob).
 		const trusted = trustedEpochBase(epochBase, token, "line");
 		const epochRanked = trusted === null ? null : parseMergeText(trusted);
-		const base = storedBase ?? (epochRanked && epochDeleted ? withEpochDeletes(epochRanked, crdt.ranked, disk.data, epochDeleted) : epochRanked)
+		const base0 = storedBase ?? (epochRanked && epochDeleted ? withEpochDeletes(epochRanked, crdt.ranked, disk.data, epochDeleted) : epochRanked)
 			?? (isEmptyCanvas(crdt.ranked) ? emptyCanvas() : !s || op.noBase || op.pathBase ? null : diskHash === s.contentHash ? rankDisk(disk.data, null, crdt.ranked) : (await projectionHash(port, crdt)) === s.contentHash ? crdt.ranked : null);
+		// Fields of a record whose map lost a concurrent create are not the replica's: the disk's are this side's change.
+		const base = base0 && baseSeenBy(base0, h.doc);
 		await ctx.deps.clock.yieldNow();
 		const m = mergeCanvasSides({ base, disk: disk.data, crdt, limits: ctx.mergeLimits });
 		const mHash = await projectionHash(port, m.projection);
@@ -165,7 +167,7 @@ type MaterializeOp = Extract<PlannerOp, { op: "diskMaterialize" }>;
 
 /** diskMaterialize of a canvas doc (the runner routes canvas docs here): write the projection (precondition absent), S + base. */
 export async function diskMaterializeCanvas(env: Env, op: MaterializeOp): Promise<JobOutcome> {
-	const r = env.ctx.log.view().remote.get(op.docId);
+	const r = env.ctx.remote(op.docId);
 	if (!r || r.state !== "live" || r.kind !== "canvas") return "fail";
 	const h = await env.ctx.log.acquireBody(op.docId, "canvas");
 	if (!h) return "fail";

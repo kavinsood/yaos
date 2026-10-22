@@ -214,6 +214,7 @@ class BenchView implements EditorViewRef {
 	holdSaves(): boolean {
 		return false;
 	}
+	loadFileText(): void {}
 	async save(): Promise<void> {}
 	/** A keystroke: the transaction, then its ChangeSet to the binding (collab.ts ViewPlugin.update). */
 	type(at: number, ch: string): void {

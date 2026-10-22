@@ -199,6 +199,35 @@ async function refreshRemote(deps: CheckpointDeps, st: CheckpointState, session:
 	return { t: "not-advancing", refreshed: cur };
 }
 
+/**
+ * refreshRemote for several fallback streams in one readBatch (relay checkpoints are not broadcast, so after a wave of
+ * writes every other device re-reads each stream's checkpoint seq: one read per stream, a few per tick, was a
+ * trickle of thousands of requests that kept a 5000-note vault busy for an hour after a mass edit). Returns the
+ * streams the batch served: refreshed now, so their write goes without refreshFirst.
+ */
+export async function refreshRemoteBatch(deps: CheckpointDeps, st: CheckpointState, session: RelaySession, recs: readonly StreamRecord[]): Promise<Set<StreamName>> {
+	const pages = await session.readBatch(recs.map((r) => ({ stream: r.stream, afterSeq: r.appliedSeq, preferCheckpoint: false })));
+	const served = new Set<StreamName>();
+	const patches: { stream: StreamName; patch: (r: Mut<StreamRecord>) => void }[] = [];
+	recs.forEach((rec, i) => {
+		const page = pages[i];
+		if (!page) return;
+		served.add(rec.stream);
+		const cur = page.checkpointSeq;
+		if (cur <= rec.remoteCheckpointCoversSeq) return;
+		const want = rec.appliedSeq;
+		patches.push({ stream: rec.stream, patch: (r) => {
+			r.remoteCheckpointCoversSeq = Math.max(r.remoteCheckpointCoversSeq, cur);
+			if (cur >= want) coveredTo(r, cur);
+		} });
+		if (cur < want) return;
+		st.condSince.delete(rec.stream);
+		st.count("refreshed");
+	});
+	if (patches.length > 0) await deps.repo.tPatchStreams(patches);
+	return served;
+}
+
 /** Nothing above the remote checkpoint here: counters that still say otherwise are stale (a refresh without reset). */
 async function clearCounters(deps: CheckpointDeps, rec: StreamRecord): Promise<void> {
 	if (rec.rowsSinceRemoteCheckpoint === 0 && rec.bytesSinceRemoteCheckpoint === 0) return;

@@ -87,6 +87,8 @@ export class HostRuntime {
 			workspace: deps.workspace,
 			vault: deps.vault,
 			clock: deps.clock,
+			conflictLabel: () => deps.identity.deviceLabel,
+			tzOffsetMinutes: () => -new Date().getTimezoneOffset(),
 			notice: (level, code, message) => deps.ui.onNotice(level, code, message),
 			link: {
 				post: (m) => void this.engine.post(m as Parameters<EngineHost["post"]>[0]), // binding posts events only
@@ -285,10 +287,20 @@ export class HostRuntime {
 
 	private async onEngineRequest(m: EngineRequestMessage): Promise<MainResultValue> {
 		switch (m.t) {
-			case "readRequest":
-				return { t: "reads", results: await this.disk.read(m.reads) };
-			case "diskOps":
-				return { t: "diskOps", results: await this.disk.run(m.lane, m.ops) };
+			// A result reflects the disk now: the events that changed it go out first (§g.3). Batched, a rename's
+			// event reached the engine after a read of its source said "missing", and the engine deleted the doc
+			// and created a new one for the target (sim canvas seed 20701862: a concurrent edit then restored the
+			// old doc with the records the user had deleted).
+			case "readRequest": {
+				const results = await this.disk.read(m.reads);
+				this.batcher.flush();
+				return { t: "reads", results };
+			}
+			case "diskOps": {
+				const results = await this.disk.run(m.lane, m.ops);
+				this.batcher.flush();
+				return { t: "diskOps", results };
+			}
 			case "saveViews":
 				return { t: "viewSaved", saved: await this.bindings.saveViews(m.docIds) };
 			case "sideFileWrite":

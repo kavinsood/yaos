@@ -1,0 +1,190 @@
+{
+ "seed": 532933571,
+ "config": {
+  "seed": 532933571,
+  "devices": 4,
+  "steps": 101,
+  "faults": {
+   "engineCrash": 0.909,
+   "appCrash": 1.024,
+   "commitCrash": 0,
+   "idbWipe": 0.381,
+   "idbLost": 0,
+   "offline": 0,
+   "ioFail": 3.196,
+   "background": 0,
+   "socketDrop": 1.308,
+   "relayRestart": 2.05,
+   "relayDrain": 0,
+   "httpFail": 0.427,
+   "dailyLimit": 1.873,
+   "epochReset": 0.097,
+   "clockSkew": 0,
+   "keyStoreLoss": 0,
+   "keyRoll": 0,
+   "revoke": 0,
+   "epochRestore": 0,
+   "hostileReplay": 0,
+   "hostileDowngrade": 0,
+   "blobStall": 0,
+   "blobSlow": 0,
+   "relaySubsLost": 0,
+   "suspendKill": 0,
+   "clone": 0.481,
+   "syncedConfig": 0
+  },
+  "faultRate": 0.363,
+  "randomTuning": true
+ },
+ "violations": [
+  {
+   "inv": "clean",
+   "detail": "no quiescence within 600000ms: D waits on a body-less doc's creator"
+  }
+ ],
+ "minimizedPlan": [
+  {
+   "i": 12,
+   "gapMs": 564,
+   "fault": {
+    "t": "engineCrash",
+    "dev": 2
+   }
+  },
+  {
+   "i": 36,
+   "gapMs": 108,
+   "fault": {
+    "t": "clone",
+    "dev": 1,
+    "src": 0,
+    "downMs": 9474
+   }
+  },
+  {
+   "i": 67,
+   "gapMs": 577,
+   "fault": {
+    "t": "relayRestart"
+   }
+  },
+  {
+   "i": 68,
+   "gapMs": 843,
+   "user": {
+    "t": "type",
+    "dev": 3,
+    "view": 0.4584837006404996,
+    "pos": 0.8503784043714404,
+    "nl": true
+   }
+  },
+  {
+   "i": 69,
+   "gapMs": 1466,
+   "fault": {
+    "t": "engineCrash",
+    "dev": 3
+   }
+  },
+  {
+   "i": 92,
+   "gapMs": 663,
+   "fault": {
+    "t": "clone",
+    "dev": 0,
+    "src": 2,
+    "downMs": 562
+   }
+  },
+  {
+   "i": 94,
+   "gapMs": 1333,
+   "fault": {
+    "t": "dailyLimit",
+    "durationMs": 15579
+   }
+  },
+  {
+   "i": 95,
+   "gapMs": 439,
+   "fault": {
+    "t": "dailyLimit",
+    "durationMs": 28417
+   }
+  },
+  {
+   "i": 142,
+   "gapMs": 245,
+   "canvas": {
+    "t": "cMove",
+    "dev": 2,
+    "file": 0.06623082445003092,
+    "node": 0.22766869352199137
+   }
+  },
+  {
+   "i": 96,
+   "gapMs": 653,
+   "fault": {
+    "t": "appCrash",
+    "dev": 0,
+    "downMs": 1573
+   }
+  },
+  {
+   "i": 97,
+   "gapMs": 884,
+   "user": {
+    "t": "type",
+    "dev": 1,
+    "view": 0.9133421354927123,
+    "pos": 0.06363216252066195,
+    "nl": false
+   }
+  },
+  {
+   "i": 143,
+   "gapMs": 329,
+   "canvas": {
+    "t": "cResize",
+    "dev": 3,
+    "file": 0.03131398861296475,
+    "node": 0.5977519548032433
+   }
+  },
+  {
+   "i": 98,
+   "gapMs": 860,
+   "fault": {
+    "t": "ioFail",
+    "dev": 3,
+    "ops": 3
+   }
+  },
+  {
+   "i": 99,
+   "gapMs": 959,
+   "user": {
+    "t": "type",
+    "dev": 2,
+    "view": 0.6644048951566219,
+    "pos": 0.09557047695852816,
+    "nl": true
+   }
+  },
+  {
+   "i": 100,
+   "gapMs": 701,
+   "fault": {
+    "t": "socketDrop",
+    "dev": 3,
+    "code": 1011
+   }
+  }
+ ],
+ "gitSha": "70c673496a36ad0a88be4a136913f04804f28345",
+ "masterSeed": 5,
+ "label": "CLONE_FAULTS[10] short d4 s101 tuned",
+ "note": "clone faults seed 532933571 (SIM-CLONE-BODYLESS-WAIT), re-minimized 67 -> 15 steps. B's first store created the seed docs and was cloned over before their bodies went out; the sim removes the abandoned store at heal. A view() while a device's first creator-status request was in flight queued the creator again, and the second live answer doubled the backoff: the recheck came after 10 min, past the heal horizon with the 30 s grace. Content is not at risk while waiting (the files stay on disk; abandonment re-creates them). Fixed: a creator being asked is not queued again, and the timer skips it."
+}

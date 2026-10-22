@@ -60,6 +60,7 @@ export const FULL_READS = [
 export const FULL_READ_ALLOW = {
 	"host/binding.ts": {
 		"sliceString()": [1, "bind upload (attach, resync): TEXT_CHUNK_UNITS-unit slices of the editor Text, one chunk per macrotask, transferred"],
+		"toString()": [1, "keepHeld: a stray-held view's text into its conflict copy, once per skipped save with new text (a recovery path, not per keystroke)"],
 	},
 	"host/ui/pairing.ts": { "toString()": [1, "URLSearchParams of the pairing link, not a document"] },
 	"host/ui/pairFlow.ts": { "toString()": [1, "a number (countdown seconds)"] },

@@ -76,7 +76,7 @@ async function runOne(env: Env, op: PlannerOp): Promise<JobOutcome> {
 		case "rebind": return rebind(env, op);
 		case "diskRename": return diskRename(env, op);
 		case "diskMaterialize":
-			return env.ctx.log.view().remote.get(op.docId)?.kind === "canvas" ? diskMaterializeCanvas(env, op) : diskMaterialize(env, op);
+			return env.ctx.remote(op.docId)?.kind === "canvas" ? diskMaterializeCanvas(env, op) : diskMaterialize(env, op);
 		case "diskTrash": return diskTrash(env, op);
 		case "conflictCopy": return conflictCopy(env, op);
 		case "reconcileContent": return reconcileContent(env, op);
