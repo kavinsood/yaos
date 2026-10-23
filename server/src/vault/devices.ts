@@ -198,18 +198,16 @@ export interface RetiredRecord {
 }
 
 /**
- * The authority a D8b restore carries across the rewind: the device table, and (identity v2) the grants and the
- * tombstones, so a restore never brings back a revoked pairing or a retired deviceId ("a restore rewinds content,
- * never authority"). `grants` and `retired` are null in a journal row written before v2: finish then leaves those
- * tables as the rewind left them.
+ * The authority a D8b restore carries across the rewind: the device table, the grants and the tombstones, so a
+ * restore never brings back a revoked pairing or a retired deviceId ("a restore rewinds content, never authority").
  */
 export interface IdentitySnapshot {
 	devices: DeviceRecord[];
-	grants: GrantRecord[] | null;
-	retired: RetiredRecord[] | null;
+	grants: GrantRecord[];
+	retired: RetiredRecord[];
 	/**
-	 * The key-roll signal (identity v4, e2ee-design §14.5): a restore must not forget a removal nobody has covered with
-	 * a new vault key yet. null in a journal row written before v4: finish leaves the rewound counts.
+	 * The key-roll signal (e2ee-design §14.5): a restore must not forget a removal nobody has covered with a new vault
+	 * key yet.
 	 */
-	rekey: { removals: number; rekeyed: number } | null;
+	rekey: { removals: number; rekeyed: number };
 }

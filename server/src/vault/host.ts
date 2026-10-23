@@ -1409,8 +1409,7 @@ export class VaultHost {
 	 * gets one UPDATE),
 	 * likewise the grant table (G' differing rows), the snapshot's tombstones are inserted where missing (R'; a
 	 * tombstone is never deleted), every pairing code is deleted, and meta gets a new epoch, `last_restore_id`,
-	 * `last_restore_at` and no marker. Then the flag clears and every streams socket closes 1001. A snapshot without
-	 * grants or tombstones (a journal row from before identity v2) leaves those tables as the rewind left them.
+	 * `last_restore_at` and no marker. Then the flag clears and every streams socket closes 1001.
 	 */
 	finishRestore(restoreId: string, snapshot: IdentitySnapshot): FinishRestoreResult {
 		const { devices, grants, retired, rekey } = snapshot;
@@ -1423,7 +1422,7 @@ export class VaultHost {
 		if (this.relay.writesThisRuntime + this.identityWrites > 0) return { kind: "rewind_needed" };
 		const wanted = new Map(devices.map((device) => [device.tokenHash, device]));
 		const present = new Map([...state.devices.list()].map((device) => [device.tokenHash, device]));
-		const wantedGrants = grants ? new Map(grants.map((grant) => [grant.grantId, grant])) : null;
+		const wantedGrants = new Map(grants.map((grant) => [grant.grantId, grant]));
 		const presentGrants = new Map([...state.grants.list()].map((grant) => [grant.grantId, grant]));
 		const vaultGeneration = randomBase64Url(16);
 		const now = this.clock.now();
@@ -1445,47 +1444,41 @@ export class VaultHost {
 				if (have && sameDevice(have, device)) continue;
 				this.storage.sql.exec(DEVICE_INSERT, ...deviceRow(device));
 			}
-			if (wantedGrants) {
-				for (const [grantId, grant] of presentGrants) {
-					const keep = wantedGrants.get(grantId);
-					if (keep && sameGrant(keep, grant)) continue;
-					this.storage.sql.exec("DELETE FROM pairing_grant WHERE grant_id = ?", grantId);
-				}
-				for (const [grantId, grant] of wantedGrants) {
-					const have = presentGrants.get(grantId);
-					if (have && sameGrant(have, grant)) continue;
-					this.storage.sql.exec(GRANT_INSERT, ...grantRow(grant));
-				}
+			for (const [grantId, grant] of presentGrants) {
+				const keep = wantedGrants.get(grantId);
+				if (keep && sameGrant(keep, grant)) continue;
+				this.storage.sql.exec("DELETE FROM pairing_grant WHERE grant_id = ?", grantId);
 			}
-			for (const tombstone of retired ?? []) {
+			for (const [grantId, grant] of wantedGrants) {
+				const have = presentGrants.get(grantId);
+				if (have && sameGrant(have, grant)) continue;
+				this.storage.sql.exec(GRANT_INSERT, ...grantRow(grant));
+			}
+			for (const tombstone of retired) {
 				this.storage.sql.exec("INSERT OR IGNORE INTO retired_device (device_id, grant_id, retired_at) VALUES (?, ?, ?)",
 					tombstone.deviceId, tombstone.grantId, tombstone.retiredAt);
 			}
 			this.storage.sql.exec("DELETE FROM pairing_code");
-			// The key-roll signal crosses the rewind in the same meta row write (a snapshot without it keeps T's).
+			// The key-roll signal crosses the rewind in the same meta row write.
 			this.storage.sql.exec(
 				"UPDATE vault_meta SET vault_generation = ?, pending_restore_id = NULL, last_restore_id = ?,"
 					+ " last_restore_at = ?, removals = ?, rekeyed = ? WHERE id = 1",
-				vaultGeneration, restoreId, now, rekey?.removals ?? state.meta.removals, rekey?.rekeyed ?? state.meta.rekeyed,
+				vaultGeneration, restoreId, now, rekey.removals, rekey.rekeyed,
 			);
 		});
 		this.identityWrites++;
 		const map = new DeviceMap();
 		for (const device of wanted.values()) map.add({ ...device });
 		state.devices = map;
-		if (wantedGrants) {
-			const grantMap = new GrantMap();
-			for (const grant of wantedGrants.values()) grantMap.add({ ...grant });
-			state.grants = grantMap;
-		}
+		const grantMap = new GrantMap();
+		for (const grant of wantedGrants.values()) grantMap.add({ ...grant });
+		state.grants = grantMap;
 		state.meta.vaultGeneration = vaultGeneration;
 		state.meta.pendingRestoreId = null;
 		state.meta.lastRestoreId = restoreId;
 		state.meta.lastRestoreAt = now;
-		if (rekey) {
-			state.meta.removals = rekey.removals;
-			state.meta.rekeyed = rekey.rekeyed;
-		}
+		state.meta.removals = rekey.removals;
+		state.meta.rekeyed = rekey.rekeyed;
 		this.restoring = null;
 		this.relay.discardAll(1001, "vault restored");
 		return { kind: "finished", vaultEpoch: vaultGeneration };

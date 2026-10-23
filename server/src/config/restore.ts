@@ -123,9 +123,8 @@ export function isObjectResetError(error: unknown): boolean {
 
 /**
  * DECISIONS-GAP (G62). The journal's `devices` BLOB: JSON of the identity snapshot, `{v: 2, devices, grants,
- * retired}` (token, secret and retire-key hashes only). A row written before identity v2 holds a bare device array:
- * it decodes with `grants` and `retired` null, so finish leaves those tables alone. `rekey` (identity v4, the key-roll
- * signal `{removals, rekeyed}`) is null when absent: finish then leaves the rewound counts.
+ * retired, rekey}` (token, secret and retire-key hashes only; `rekey` is the key-roll signal `{removals, rekeyed}`).
+ * Any other shape is malformed.
  */
 function encodeSnapshot(snapshot: IdentitySnapshot): ArrayBuffer {
 	const bytes = new TextEncoder().encode(JSON.stringify({
@@ -135,15 +134,15 @@ function encodeSnapshot(snapshot: IdentitySnapshot): ArrayBuffer {
 			enrollmentRequestId: device.enrollmentRequestId, enrolledAt: device.enrolledAt, grantId: device.grantId,
 			retireHash: device.retireHash, lastSeenDay: device.lastSeenDay,
 		})),
-		grants: snapshot.grants?.map((grant) => ({
+		grants: snapshot.grants.map((grant) => ({
 			grantId: grant.grantId, secretHash: grant.secretHash, name: grant.name,
 			enrollmentRequestId: grant.enrollmentRequestId, createdAt: grant.createdAt, revokedAt: grant.revokedAt,
 			registeredDay: grant.registeredDay, registeredCount: grant.registeredCount, secretWrap: grant.secretWrap,
-		})) ?? null,
-		retired: snapshot.retired?.map((tombstone) => ({
+		})),
+		retired: snapshot.retired.map((tombstone) => ({
 			deviceId: tombstone.deviceId, grantId: tombstone.grantId, retiredAt: tombstone.retiredAt,
-		})) ?? null,
-		rekey: snapshot.rekey ? { removals: snapshot.rekey.removals, rekeyed: snapshot.rekey.rekeyed } : null,
+		})),
+		rekey: { removals: snapshot.rekey.removals, rekeyed: snapshot.rekey.rekeyed },
 	}));
 	const buffer = new ArrayBuffer(bytes.byteLength);
 	new Uint8Array(buffer).set(bytes);
@@ -157,30 +156,24 @@ const isNumberOrNull = (value: unknown): value is number | null => value === nul
 
 function decodeDevice(entry: Record<string, unknown>): DeviceRecord {
 	if (!isText(entry?.tokenHash) || !isText(entry.deviceId) || !isText(entry.deviceName)
-		|| !isText(entry.enrollmentRequestId) || !isNumber(entry.enrolledAt)) {
-		throw new Error("restore journal: malformed device");
-	}
-	// A pre-v2 entry has none of the three v2 fields: an old enroll.
-	const grantId = entry.grantId ?? null;
-	const retireHash = entry.retireHash ?? null;
-	const lastSeenDay = entry.lastSeenDay ?? null;
-	if (!isTextOrNull(grantId) || !isTextOrNull(retireHash) || !isNumberOrNull(lastSeenDay)) {
+		|| !isText(entry.enrollmentRequestId) || !isNumber(entry.enrolledAt) || !isTextOrNull(entry.grantId)
+		|| !isTextOrNull(entry.retireHash) || !isNumberOrNull(entry.lastSeenDay)) {
 		throw new Error("restore journal: malformed device");
 	}
 	return { tokenHash: entry.tokenHash, deviceId: entry.deviceId, deviceName: entry.deviceName,
-		enrollmentRequestId: entry.enrollmentRequestId, enrolledAt: entry.enrolledAt, grantId, retireHash, lastSeenDay };
+		enrollmentRequestId: entry.enrollmentRequestId, enrolledAt: entry.enrolledAt, grantId: entry.grantId,
+		retireHash: entry.retireHash, lastSeenDay: entry.lastSeenDay };
 }
 
 function decodeGrant(entry: Record<string, unknown>): GrantRecord {
 	if (!isText(entry?.grantId) || !isText(entry.secretHash) || !isText(entry.name) || !isText(entry.enrollmentRequestId)
 		|| !isNumber(entry.createdAt) || !isNumberOrNull(entry.revokedAt) || !isNumber(entry.registeredDay)
-		|| !isNumber(entry.registeredCount) || !(entry.secretWrap === undefined || isTextOrNull(entry.secretWrap))) {
+		|| !isNumber(entry.registeredCount) || !isTextOrNull(entry.secretWrap)) {
 		throw new Error("restore journal: malformed grant");
 	}
-	// Identity v3 (§3.4): a grant rotated before the prepare carries its wrapped secret; absent in an older journal row.
 	return { grantId: entry.grantId, secretHash: entry.secretHash, name: entry.name,
 		enrollmentRequestId: entry.enrollmentRequestId, createdAt: entry.createdAt, revokedAt: entry.revokedAt,
-		registeredDay: entry.registeredDay, registeredCount: entry.registeredCount, secretWrap: entry.secretWrap ?? null };
+		registeredDay: entry.registeredDay, registeredCount: entry.registeredCount, secretWrap: entry.secretWrap };
 }
 
 function decodeRetired(entry: Record<string, unknown>): RetiredRecord {
@@ -191,7 +184,6 @@ function decodeRetired(entry: Record<string, unknown>): RetiredRecord {
 }
 
 function decodeRekey(value: unknown): IdentitySnapshot["rekey"] {
-	if (value === undefined || value === null) return null;
 	const entry = typeof value === "object" ? value as Record<string, unknown> : null;
 	const count = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
 	if (!entry || !count(entry.removals) || !count(entry.rekeyed)) throw new Error("restore journal: malformed rekey");
@@ -200,17 +192,15 @@ function decodeRekey(value: unknown): IdentitySnapshot["rekey"] {
 
 function decodeSnapshot(blob: ArrayBuffer): IdentitySnapshot {
 	const value: unknown = JSON.parse(new TextDecoder().decode(new Uint8Array(blob)));
-	if (Array.isArray(value)) return { devices: value.map(decodeDevice), grants: null, retired: null, rekey: null };
-	const record = value && typeof value === "object" ? value as Record<string, unknown> : null;
-	if (!record || record.v !== 2 || !Array.isArray(record.devices)
-		|| !(record.grants === null || Array.isArray(record.grants))
-		|| !(record.retired === null || Array.isArray(record.retired))) {
+	const record = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+	if (!record || record.v !== 2 || !Array.isArray(record.devices) || !Array.isArray(record.grants)
+		|| !Array.isArray(record.retired)) {
 		throw new Error("restore journal: malformed identity snapshot");
 	}
 	return {
 		devices: record.devices.map(decodeDevice),
-		grants: Array.isArray(record.grants) ? record.grants.map(decodeGrant) : null,
-		retired: Array.isArray(record.retired) ? record.retired.map(decodeRetired) : null,
+		grants: record.grants.map(decodeGrant),
+		retired: record.retired.map(decodeRetired),
 		rekey: decodeRekey(record.rekey),
 	};
 }

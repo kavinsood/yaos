@@ -941,8 +941,8 @@ Gap calls (accepted with phase 1; marked `DECISIONS-GAP` in code where they sit 
   secrets (every frame carries one).
 - G61 Grants are folded into `GET …/devices` rather than a separate `GET …/grants`: one RPC, one consistent listing.
   Revoked grants are listed with `revokedAt` (the console counts them).
-- G62 The D8b snapshot (journal `devices` BLOB) is `{v: 2, devices, grants, retired}`; a pre-v2 bare array decodes
-  with grants and tombstones null, and finish then leaves those tables as rewound. Finish never deletes a tombstone.
+- G62 The D8b snapshot (journal `devices` BLOB) is `{v: 2, devices, grants, retired, rekey}`; any other shape is
+  malformed. Finish never deletes a tombstone.
   Residual: a self-retire or leave that lands in the rewind window (between the abort and finish) is erased by the
   re-rewind like D8b's enroll, so that store or grant comes back; operator revokes are frozen by the journal row.
 - G63 `last_seen_day` is bookkeeping: it is not an `identityWrites` write (a ticket in the rewind window must not
@@ -996,6 +996,5 @@ removal that blocks an install, the other devices' plugins ask the user to make 
 Gap calls:
 
 - G68 Both counters are authority (`identityWrites`): a count or an ack in a D8b rewind window forces the re-rewind.
-  The D8b snapshot carries `rekey: {removals, rekeyed}`; an older snapshot without it restores the counters as they
-  are now. A reset keeps them (authority, not content). An ack refused by the daily write limit is dropped; the
-  client resends it at its next session.
+  The D8b snapshot carries `rekey: {removals, rekeyed}` and finish writes both. A reset keeps them (authority, not
+  content). An ack refused by the daily write limit is dropped; the client resends it at its next session.
