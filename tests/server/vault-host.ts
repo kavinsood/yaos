@@ -10,9 +10,6 @@ import { ConfigHost, CONFIG_SCHEMA } from "../../server/src/config/host";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../../server/src/shared/socketCloseCodes";
 import { encodeAppendFrame } from "../../server/src/streams/protocol";
 import { OWNER_CAPABILITY_DIGEST } from "../../server/src/vault/host";
-import { IDENTITY_V2_MIGRATION, IDENTITY_V3_MIGRATION, IDENTITY_V4_MIGRATION, VAULT_IDENTITY_SCHEMA } from "../../server/src/vault/schema";
-import { STREAM_SCHEMA } from "../../server/src/streams/store";
-import { sha256Hex } from "../../server/src/hex";
 import { suite } from "../harness.ts";
 import { NodeSqliteStorage } from "./helpers/nodeSqliteStorage";
 import {
@@ -75,18 +72,15 @@ const VAULT_TABLES = {
 	vault_meta: { withoutRowid: true, columns: ["id INTEGER NOT NULL PK1", "vault_id TEXT NOT NULL",
 		"vault_generation TEXT NOT NULL", "ticket_key BLOB NOT NULL", "created_at INTEGER NOT NULL", "pending_restore_id TEXT",
 		"last_restore_id TEXT", "last_restore_at INTEGER",
-		// Identity v4 (the key-roll signal, e2ee-design §14.5).
 		"removals INTEGER NOT NULL", "rekeyed INTEGER NOT NULL"] },
 	device: { withoutRowid: true, columns: ["token_hash BLOB NOT NULL PK1", "device_id TEXT NOT NULL", "device_name TEXT NOT NULL",
 		"enrollment_request_id TEXT NOT NULL", "enrolled_at INTEGER NOT NULL",
-		// Identity v2 (identity-per-store §3.1).
 		"grant_id TEXT", "retire_hash BLOB", "last_seen_day INTEGER"] },
 	pairing_code: { withoutRowid: true, columns: ["code_hash BLOB NOT NULL PK1", "purpose TEXT NOT NULL",
 		"expires_at INTEGER NOT NULL", "used_at INTEGER", "used_request_id TEXT", "used_device_id TEXT", "used_grant_id TEXT"] },
 	pairing_grant: { withoutRowid: true, columns: ["grant_id TEXT NOT NULL PK1", "secret_hash BLOB NOT NULL",
 		"grant_name TEXT NOT NULL", "enrollment_request_id TEXT NOT NULL", "created_at INTEGER NOT NULL", "revoked_at INTEGER",
 		"registered_day INTEGER NOT NULL", "registered_count INTEGER NOT NULL",
-		// Identity v3 (identity-per-store §3.4, phase 5).
 		"secret_wrap BLOB"] },
 	retired_device: { withoutRowid: true, columns: ["device_id TEXT NOT NULL PK1", "grant_id TEXT", "retired_at INTEGER NOT NULL"] },
 };
@@ -187,40 +181,6 @@ s.test("§6.1: an unknown vault is cached after one probe; it answers 401 / 404 
 		object.host.init(vaultId);
 		assert.equal((await feed(object, bearer(stranger))).status, 401);
 		assert.deepEqual(schemaOf(object.storage), VAULT_TABLES);
-	});
-});
-
-s.test("G54: a vault initialized before identity v2 migrates once, at its first load; its rows survive, 0 CF rows", async () => {
-	await withCluster(async (cluster) => {
-		const vaultId = newVaultId();
-		const object = cluster.object(vaultId);
-		// A v1 vault as the previous server made it: the stream tables, the v1 identity tables, meta and one device.
-		object.storage.transactionSync(() => {
-			object.storage.sql.exec(STREAM_SCHEMA);
-			object.storage.sql.exec(VAULT_IDENTITY_SCHEMA);
-			object.storage.sql.exec("INSERT INTO vault_meta (id, vault_id, vault_generation, ticket_key, created_at)"
-				+ " VALUES (1, ?, ?, ?, ?)", vaultId, "G".repeat(22), new Uint8Array(32).buffer, object.timers.now);
-		});
-		const owner = newDevice("owner-device-0001");
-		const hash = Buffer.from(await sha256Hex(new TextEncoder().encode(owner.token)), "hex");
-		object.storage.sql.exec("INSERT INTO device (token_hash, device_id, device_name, enrollment_request_id, enrolled_at)"
-			+ " VALUES (?, ?, ?, ?, ?)", hash, owner.deviceId, "Owner", "req-owner-device-0001", object.timers.now);
-		object.model.forgetSchema();
-		object.restart();
-		object.model.reset();
-		object.statements.length = 0;
-		assert.equal((await feed(object, bearer(owner))).status, 200, "the v1 device authenticates after the migration");
-		assert.deepEqual(schemaOf(object.storage), VAULT_TABLES, "migrated == a fresh v4 init");
-		assert.equal(object.statements.filter((sql) => /^\s*(ALTER|CREATE)\b/i.test(sql)).length,
-			IDENTITY_V2_MIGRATION.length + IDENTITY_V3_MIGRATION.length + IDENTITY_V4_MIGRATION.length, "v2, v3 and v4 together");
-		assert.equal(object.model.totals.cf, 0, "DDL only: no row written");
-		const device = object.host.load()!.devices.byId(owner.deviceId)!;
-		assert.deepEqual([device.grantId, device.retireHash, device.lastSeenDay], [null, null, null], "an old enroll");
-		// Once: a new runtime reads the grant table and runs no DDL.
-		object.restart();
-		object.statements.length = 0;
-		assert.equal((await feed(object, bearer(owner))).status, 200);
-		assert.equal(object.statements.filter((sql) => /^\s*(ALTER|CREATE)\b/i.test(sql)).length, 0, "no second migration");
 	});
 });
 

@@ -41,10 +41,8 @@ locally (real workerd, local DO SQLite).
   deletions against the account's 500-namespace cap (error `10067`); an account at the cap deploys with `v3` alone
   first, then with `v4` (§9 P5);
 - the R2 binding `YAOS_BUCKET` to a bucket named `yaos` (see Attachments);
-- no tag for table changes: those are not class migrations. The vault DO migrates its own SQL schema. Identity v2
-  (pairing grants, tombstones, three device columns; DECISIONS §6.1, G54) runs once per existing vault, in one
-  transaction, on that vault's first request after the update; a new vault is created at v2. Nothing to run by hand,
-  and devices paired before it keep working;
+- no tag for table changes: those are not class migrations. The vault DO creates its whole SQL schema at vault init
+  and runs no DDL afterwards. Older vaults are re-created;
 - `observability.logs` on;
 - a `Text` rule that bundles `qrcode-generator`'s browser build into the console page.
 

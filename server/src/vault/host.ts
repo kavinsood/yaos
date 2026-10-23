@@ -23,7 +23,6 @@ import { WindowLimiter, tooManyAttempts } from "../limiter";
 import {
 	SYSTEM_CLOCK,
 	describeError,
-	isMissingColumnError,
 	isMissingTableError,
 	type ClockPort,
 	type SocketPort,
@@ -67,7 +66,7 @@ import {
 	type PairingPurpose,
 } from "./pairing";
 import { unwrapGrantSecret, wrapGrantSecret } from "./grantWrap";
-import { VAULT_SCHEMA, migrateIdentityV2, migrateIdentityV3, migrateIdentityV4 } from "./schema";
+import { VAULT_SCHEMA } from "./schema";
 import { TICKET_TTL_MS, importTicketKey, signTicket, verifyTicket } from "./ticket";
 
 /** D6: `capabilityDigestForRole("owner")` of the removed server/src/collaboration.ts:93-97, frozen as a literal. */
@@ -133,9 +132,9 @@ export interface VaultMeta {
 	/** D8b: the last finished restore (rewind skip, finish idempotency). */
 	lastRestoreId: string | null;
 	lastRestoreAt: number | null;
-	/** Identity v4, the key-roll signal (e2ee-design §14.5): blocking removals by the operator. */
+	/** The key-roll signal (e2ee-design §14.5): blocking removals by the operator. */
 	removals: number;
-	/** Identity v4: the highest `removals` a device has covered with a new vault key (never above `removals`). */
+	/** The highest `removals` a device has covered with a new vault key (never above `removals`). */
 	rekeyed: number;
 }
 
@@ -389,7 +388,7 @@ export class VaultHost {
 		if (this.state !== undefined) return this.state;
 		let row: MetaRow | undefined;
 		try {
-			row = this.readMeta();
+			row = this.storage.sql.exec<MetaRow>(META_SELECT).toArray()[0];
 		} catch (error) {
 			if (!isMissingTableError(error, "vault_meta")) throw error;
 		}
@@ -397,8 +396,7 @@ export class VaultHost {
 			this.state = null;
 			return null;
 		}
-		// Grants first: "no such table" here is a v1 vault, migrated before the device scan reads the v2 columns.
-		const grants = this.loadGrants();
+		const grants = GrantMap.load(this.storage);
 		this.state = {
 			meta: { vaultId: row.vault_id, vaultGeneration: row.vault_generation,
 				ticketKey: new Uint8Array(row.ticket_key), createdAt: row.created_at,
@@ -408,35 +406,6 @@ export class VaultHost {
 			grants,
 		};
 		return this.state;
-	}
-
-	/** The meta row, or the identity v4 migration of a vault before it (schema.ts) and the read again. */
-	private readMeta(): MetaRow | undefined {
-		try {
-			return this.storage.sql.exec<MetaRow>(META_SELECT).toArray()[0];
-		} catch (error) {
-			if (!isMissingColumnError(error, "removals")) throw error;
-		}
-		migrateIdentityV4(this.storage);
-		return this.storage.sql.exec<MetaRow>(META_SELECT).toArray()[0];
-	}
-
-	/**
-	 * The grant scan, or the identity v2 + v3 migration of a v1 vault (schema.ts G54), or the v3 migration of a v2 vault
-	 * (G65) and the scan again. Neither is an `identityWrites` write.
-	 */
-	private loadGrants(): GrantMap {
-		try {
-			return GrantMap.load(this.storage);
-		} catch (error) {
-			if (isMissingColumnError(error, "secret_wrap")) {
-				migrateIdentityV3(this.storage);
-				return GrantMap.load(this.storage);
-			}
-			if (!isMissingTableError(error, "pairing_grant")) throw error;
-		}
-		migrateIdentityV2(this.storage);
-		return new GrantMap();
 	}
 
 	/** The D7 gate: `deviceId` is enrolled in this vault right now (memory only after the first load). */
@@ -1404,7 +1373,7 @@ export class VaultHost {
 		}
 		this.restoring = { restoreId, until: this.clock.now() + RESTORE_FLAG_TTL_MS };
 		this.relay.discardAll(1013, "restore_in_progress");
-		// Identity v2: the grants and the tombstones cross the rewind with the devices (R rows read, cold path).
+		// The grants and the tombstones cross the rewind with the devices (R rows read, cold path).
 		const retired = this.storage.sql.exec<{ device_id: string; grant_id: string | null; retired_at: number }>(
 			"SELECT device_id, grant_id, retired_at FROM retired_device").toArray()
 			.map((row): RetiredRecord => ({ deviceId: row.device_id, grantId: row.grant_id, retiredAt: row.retired_at }));

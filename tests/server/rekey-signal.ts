@@ -3,17 +3,14 @@
 // `vault_meta.removals` in the revoke's own transaction and reach every remaining streams socket as VAULT_REKEY; a store
 // removed under a live grant, a leave and a self-retire do not count; VAULT_READY carries the signal to a device that
 // connects later; a device's VAULT_REKEYED covers removals up to the count it names (never above the vault's, never
-// backwards); both counts survive a new runtime and a D8b restore to a point before the removal; a vault made before
-// identity v4 migrates at its next load.
+// backwards); both counts survive a new runtime and a D8b restore to a point before the removal.
 import assert from "node:assert/strict";
 
 import { randomBase64Url } from "../../server/src/base64url";
 import { sha256Hex } from "../../server/src/hex";
-import { IDENTITY_V2_MIGRATION, IDENTITY_V3_MIGRATION, VAULT_IDENTITY_SCHEMA } from "../../server/src/vault/schema";
-import { STREAM_SCHEMA } from "../../server/src/streams/store";
 import { suite } from "../harness.ts";
 import type { FakeSocket } from "./helpers/fakePorts.ts";
-import { VaultCluster, newDevice, newVaultId, type DeviceSeed, type VaultObject } from "./helpers/workerHarness.ts";
+import { newDevice, type DeviceSeed, type VaultObject } from "./helpers/workerHarness.ts";
 import { ORIGIN, claim, deviceFetch, enrollVia, json, ownerCode, resetRows, withWorld, type World } from "./helpers/operatorWorld.ts";
 
 const s = suite("rekey-signal");
@@ -209,38 +206,6 @@ s.test("D8b: a restore to a point before the removal keeps the removal and its a
 		assert.deepEqual(signal(vault), { removals: 2, rekeyed: 1 }, "the rewound meta row takes the pre-restore counts");
 		assert.deepEqual(connect(vault, kept.store.deviceId).last("VAULT_READY")?.rekey, { removals: 2, rekeyed: 1 });
 	}, { pitr: true });
-});
-
-s.test("identity v4: a vault made before it gains removals and rekeyed (0, 0) at its next load", async () => {
-	const cluster = new VaultCluster();
-	try {
-		const vaultId = newVaultId();
-		const object = cluster.object(vaultId);
-		object.storage.transactionSync(() => {
-			object.storage.sql.exec(STREAM_SCHEMA);
-			object.storage.sql.exec(VAULT_IDENTITY_SCHEMA);
-			for (const ddl of [...IDENTITY_V2_MIGRATION, ...IDENTITY_V3_MIGRATION]) object.storage.sql.exec(ddl);
-			object.storage.sql.exec("INSERT INTO vault_meta (id, vault_id, vault_generation, ticket_key, created_at)"
-				+ " VALUES (1, ?, ?, ?, ?)", vaultId, "G".repeat(22), new Uint8Array(32).buffer, object.timers.now);
-		});
-		const owner = newDevice("owner-device-0001");
-		const hash = Buffer.from(await sha256Hex(new TextEncoder().encode(owner.token)), "hex");
-		object.storage.sql.exec("INSERT INTO device (token_hash, device_id, device_name, enrollment_request_id, enrolled_at)"
-			+ " VALUES (?, ?, ?, ?, ?)", hash, owner.deviceId, "Owner", "req-owner-device-0001", object.timers.now);
-		object.model.forgetSchema();
-		object.restart();
-		object.statements.length = 0;
-		const meta = object.host.load()!.meta;
-		assert.deepEqual([meta.removals, meta.rekeyed], [0, 0]);
-		assert.equal(object.statements.filter((sql) => /^\s*ALTER\b/i.test(sql)).length, 2, "two ALTERs, once");
-		assert.deepEqual(connect(object, owner.deviceId).last("VAULT_READY")?.rekey, { removals: 0, rekeyed: 0 });
-		object.restart();
-		object.statements.length = 0;
-		object.host.load();
-		assert.equal(object.statements.filter((sql) => /^\s*ALTER\b/i.test(sql)).length, 0, "no second migration");
-	} finally {
-		cluster.close();
-	}
 });
 
 await s.done();

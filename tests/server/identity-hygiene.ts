@@ -5,7 +5,7 @@
 //   most INACTIVITY_RETIRE_BATCH devices a sweep, never a device with an open socket; the threshold's env override;
 // - grant rotation: the operator's "Rotate secret" kills the old secret at once (every grant route 401), a live device
 //   of the grant fetches the new one with its token (`GET /vault/:id/auth/grant`), the secret is kept only wrapped,
-//   and survives a runtime restart and a D8b restore; the identity v3 migration of a v2 vault.
+//   and survives a runtime restart and a D8b restore.
 // Row counts are the CF model's (helpers/cfRowModel.ts).
 import assert from "node:assert/strict";
 
@@ -338,20 +338,6 @@ s.test("§3.4 rotate × D8b: a rotation after T survives the restore (a restore 
 			"the old secret stays dead");
 		assert.equal((await json(await fetchGrant(world, vaultId, store))).grantSecret, fresh, "the wrap crossed the rewind");
 	}, { pitr: true });
-});
-
-s.test("G65 identity v3: a v2 vault (no secret_wrap) migrates at its next load; its grants keep working", async () => {
-	await withWorld(async (world) => {
-		const { cookie, vaultId, vault } = await claim(world);
-		const secret = randomBase64Url(32);
-		const grantId = await pair(world, cookie, vaultId, secret);
-		vault.storage.sql.exec("ALTER TABLE pairing_grant DROP COLUMN secret_wrap");
-		vault.restart();
-		await registered(world, vaultId, grantAuth(secret), await newStore("migrated-store-01"));
-		assert.equal((await rotate(world, cookie, vaultId, grantId)).status, 200);
-		const columns = vault.storage.sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('pairing_grant')").toArray().map((c) => c.name);
-		assert.ok(columns.includes("secret_wrap"));
-	});
 });
 
 s.test("T-HOTPATH: GET /vault/:id/auth/grant makes zero config-DO calls", async () => {

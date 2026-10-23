@@ -141,10 +141,7 @@ export class GrantMap {
 	private readonly byGrantId = new Map<string, GrantRecord>();
 	private readonly bySecret = new Map<string, GrantRecord>();
 
-	/**
-	 * One scan of `pairing_grant` (G rows read). Throws "no such table" on a v1 vault and "no such column: secret_wrap"
-	 * on a v2 vault (schema.ts migrates both).
-	 */
+	/** One scan of `pairing_grant` (G rows read). */
 	static load(storage: StoragePort): GrantMap {
 		const map = new GrantMap();
 		const rows = storage.sql.exec<GrantRow>(

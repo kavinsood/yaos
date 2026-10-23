@@ -1,11 +1,25 @@
 // Vault DO schema (DECISIONS §6.1): the three stream tables of streams/store.ts plus the identity tables. The DDL
-// runs once, inside the vault-init transaction, and never on a request path (T-PAIR-NOWRITE), with one exception:
-// a vault created before identity v2 runs IDENTITY_V2_MIGRATION once, at the first load of a runtime (below).
+// runs once, inside the vault-init transaction, and never on a request path (T-PAIR-NOWRITE).
 import { STREAM_SCHEMA } from "../streams/store";
-import type { StoragePort } from "../ports";
 
-/** Identity v1 (DECISIONS §6.1 as approved): meta, devices, pairing codes. Never edited: v2 alters it. */
-export const VAULT_IDENTITY_SCHEMA = `
+/**
+ * The identity tables (DECISIONS §6.1, identity-per-store §3).
+ *
+ * - `vault_meta`: one row. `removals` counts the operator's removals that block a device ("Revoke pairing", and
+ *   "Revoke" of a device enrolled without a grant); `rekeyed` is the highest such count a device has since covered
+ *   with a new vault key (`VAULT_REKEYED`, relay-wire §4.2). A vault is due a key roll while `removals > rekeyed`
+ *   (e2ee-design §14.5). Authority, not content: a D8b restore carries both across the rewind.
+ * - `device`: a device enrolled the old way (`/enroll` with a deviceId) has `grant_id` NULL; a registered one has its
+ *   grant, the SHA-256 of its retire key (`retire_hash`) and `last_seen_day` (the UTC day of its last ticket, at most
+ *   one write a day).
+ * - `pairing_code`: `used_grant_id` is the D3 replay key of a grant enroll.
+ * - `pairing_grant` (not `grant`, a SQL keyword): `secret_wrap` is the grant secret a rotation minted, AES-GCM-wrapped
+ *   under a key derived from the vault's ticket key (grantWrap.ts), so a live device of the grant can fetch it
+ *   (`GET /vault/:id/auth/grant`). NULL for a grant never rotated: the server keeps only the hash of a secret the
+ *   client minted (G56).
+ * - `retired_device`: device tombstones, never deleted: a retired deviceId never registers or enrolls again.
+ */
+const VAULT_IDENTITY_SCHEMA = `
 	CREATE TABLE vault_meta (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		vault_id TEXT NOT NULL, vault_generation TEXT NOT NULL,
@@ -13,33 +27,25 @@ export const VAULT_IDENTITY_SCHEMA = `
 		created_at INTEGER NOT NULL,
 		pending_restore_id TEXT,
 		last_restore_id TEXT,
-		last_restore_at INTEGER
+		last_restore_at INTEGER,
+		removals INTEGER NOT NULL DEFAULT 0,
+		rekeyed INTEGER NOT NULL DEFAULT 0
 	) WITHOUT ROWID;
 	CREATE TABLE device (
 		token_hash BLOB PRIMARY KEY,
 		device_id TEXT NOT NULL, device_name TEXT NOT NULL,
-		enrollment_request_id TEXT NOT NULL, enrolled_at INTEGER NOT NULL
+		enrollment_request_id TEXT NOT NULL, enrolled_at INTEGER NOT NULL,
+		grant_id TEXT,
+		retire_hash BLOB,
+		last_seen_day INTEGER
 	) WITHOUT ROWID;
 	CREATE TABLE pairing_code (
 		code_hash BLOB PRIMARY KEY,
 		purpose TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER,
-		used_request_id TEXT, used_device_id TEXT
+		used_request_id TEXT, used_device_id TEXT,
+		used_grant_id TEXT
 	) WITHOUT ROWID;
-`;
-
-/**
- * Identity v2 (identity-per-store §3.1, phase 1): pairing grants, device tombstones, and three device columns. A
- * device enrolled the old way (`/enroll` with a deviceId) has `grant_id` NULL; a registered one has its grant, the
- * SHA-256 of its retire key and `last_seen_day` (the UTC day of its last ticket, at most one write a day).
- * `pairing_code.used_grant_id` is the D3 replay key of a grant enroll. The table is `pairing_grant`, not `grant`
- * (a SQL keyword). Tombstones are never deleted: a retired deviceId never registers or enrolls again.
- */
-export const IDENTITY_V2_MIGRATION = [
-	"ALTER TABLE device ADD COLUMN grant_id TEXT",
-	"ALTER TABLE device ADD COLUMN retire_hash BLOB",
-	"ALTER TABLE device ADD COLUMN last_seen_day INTEGER",
-	"ALTER TABLE pairing_code ADD COLUMN used_grant_id TEXT",
-	`CREATE TABLE pairing_grant (
+	CREATE TABLE pairing_grant (
 		grant_id TEXT PRIMARY KEY,
 		secret_hash BLOB NOT NULL,
 		grant_name TEXT NOT NULL,
@@ -47,70 +53,15 @@ export const IDENTITY_V2_MIGRATION = [
 		created_at INTEGER NOT NULL,
 		revoked_at INTEGER,
 		registered_day INTEGER NOT NULL DEFAULT 0,
-		registered_count INTEGER NOT NULL DEFAULT 0
-	) WITHOUT ROWID`,
-	`CREATE TABLE retired_device (
+		registered_count INTEGER NOT NULL DEFAULT 0,
+		secret_wrap BLOB
+	) WITHOUT ROWID;
+	CREATE TABLE retired_device (
 		device_id TEXT PRIMARY KEY,
 		grant_id TEXT,
 		retired_at INTEGER NOT NULL
-	) WITHOUT ROWID`,
-] as const;
+	) WITHOUT ROWID;
+`;
 
-/**
- * Identity v3 (identity-per-store §3.4, phase 5): `pairing_grant.secret_wrap`, the grant secret a rotation minted,
- * AES-GCM-wrapped under a key derived from the vault's ticket key (grantWrap.ts), so a live device of the grant can
- * fetch it (`GET /vault/:id/auth/grant`). NULL for a grant never rotated: the server keeps only the hash of a secret
- * the client minted (G56).
- */
-export const IDENTITY_V3_MIGRATION = [
-	"ALTER TABLE pairing_grant ADD COLUMN secret_wrap BLOB",
-] as const;
-
-/**
- * Identity v4 (the key-roll signal, e2ee-design §14.5): `vault_meta.removals` counts the operator's removals that
- * block a device ("Revoke pairing", and "Revoke" of a device enrolled without a grant); `vault_meta.rekeyed` is the
- * highest such count a device has since covered with a new vault key (`VAULT_REKEYED`, relay-wire §4.2). A vault is
- * due a key roll while `removals > rekeyed`. Authority, not content: a D8b restore carries both across the rewind.
- */
-export const IDENTITY_V4_MIGRATION = [
-	"ALTER TABLE vault_meta ADD COLUMN removals INTEGER NOT NULL DEFAULT 0",
-	"ALTER TABLE vault_meta ADD COLUMN rekeyed INTEGER NOT NULL DEFAULT 0",
-] as const;
-
-/** Every vault DO table, in creation order: init runs v1 and then the migrations, so every vault ends identical. */
-export const VAULT_SCHEMA = [
-	STREAM_SCHEMA, VAULT_IDENTITY_SCHEMA, ...IDENTITY_V2_MIGRATION, ...IDENTITY_V3_MIGRATION, ...IDENTITY_V4_MIGRATION,
-] as const;
-
-/**
- * DECISIONS-GAP (G54): identity v2 on a vault initialized before it. `VaultHost.load` reads `pairing_grant` first; "no
- * such table" means a v1 vault, and this runs the v2 DDL in one transaction (so a v1 vault never half-migrates) before
- * the device scan. Once per vault, at the first load of a runtime; an unknown vault never gets here (no `vault_meta`),
- * so T-PAIR-NOWRITE holds. A D8b rewind to a point before the migration simply migrates again on the next load.
- */
-export function migrateIdentityV2(storage: StoragePort): void {
-	storage.transactionSync(() => {
-		for (const ddl of [...IDENTITY_V2_MIGRATION, ...IDENTITY_V3_MIGRATION]) storage.sql.exec(ddl);
-	});
-}
-
-/**
- * DECISIONS-GAP (G65): identity v3 on a vault migrated to v2 before it, the same way as G54: the grant scan names
- * `secret_wrap`, "no such column" means a v2 vault, and this adds the column (one `ALTER`) before the scan runs again.
- * Once per vault, at the first load of a runtime; a v1 vault gets v2 and v3 together (migrateIdentityV2).
- */
-export function migrateIdentityV3(storage: StoragePort): void {
-	storage.transactionSync(() => {
-		for (const ddl of IDENTITY_V3_MIGRATION) storage.sql.exec(ddl);
-	});
-}
-
-/**
- * Identity v4 on a vault made before it, the same way as G54/G65: the meta read names `removals`, "no such column"
- * means a vault before v4, and this adds both columns (two `ALTER`s, one transaction) before the read runs again.
- */
-export function migrateIdentityV4(storage: StoragePort): void {
-	storage.transactionSync(() => {
-		for (const ddl of IDENTITY_V4_MIGRATION) storage.sql.exec(ddl);
-	});
-}
+/** Every vault DO table, in creation order. */
+export const VAULT_SCHEMA = [STREAM_SCHEMA, VAULT_IDENTITY_SCHEMA] as const;

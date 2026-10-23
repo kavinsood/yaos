@@ -581,7 +581,7 @@ the same exposure. The relay cannot tell that from a reconnect overlap. This is 
      is kept, so the current client enrolls and syncs unchanged. Also built: retire by key (the successor fence's
      route, used from phase 3), grant pairing codes, `last_seen_day`, "Revoke pairing", and a D8b restore that
      carries grants and tombstones across the rewind. Not built: grant rotation and inactivity retirement (phase 5).
-     The schema migrates in place (identity v2, G54); old device rows are kept, since the current client uses them.
+     Old device rows are kept, since the current client uses them.
 2. **Per-store identity, no recovery yet.**
    - Client grant pairing; data.json shape; installKey and lineage record.
    - `yaos3:` DB names by installKey, identity in `meta.identity`, mint on create, `self` from the store.
@@ -683,7 +683,7 @@ the same exposure. The relay cannot tell that from a reconnect overlap. This is 
        IDENTITY-HYGIENE). Done in phase 5.
 5. **Hygiene (optional).** Inactivity retirement; grant rotation and re-fetch with the device token; orphan DB sweep;
    ring compaction; `rebuildLocalCache` as a store reset.
-   - **Landed** on `identity/phase5-hygiene` (DECISIONS §10.1 G65–G66, operations.md "Device identity routes",
+   - **Landed** on `identity/phase5-hygiene` (DECISIONS §10.1 G66, operations.md "Device identity routes",
      DESIGN §i.5, tests/server/identity-hygiene.ts, src/sim/identityHygiene*.test.ts). As built:
      - **Inactivity retirement** (`VaultHost.retireInactive`, `server/src/vault/host.ts`). A device whose
        `last_seen_day` (or, for a pre-phase-1 enroll, its enroll day) is more than `INACTIVITY_RETIRE_DAYS` (90)
@@ -704,9 +704,9 @@ the same exposure. The relay cannot tell that from a reconnect overlap. This is 
        midnight, with the sim registry's threshold at 0 days).
      - **Rotation** (`POST /operator/vaults/:id/grants/:grantId/rotate`, console "Rotate secret"). The server mints
        the secret (32 random bytes, base64url) and replaces `secret_hash` in one UPDATE; the old secret is unknown
-       from that moment (401 `unauthorized` on registration, pairing codes, leave). It also stores `secret_wrap`
-       (identity v3, G65): AES-GCM under an HKDF key derived from the vault's ticket key, AAD vaultId and grantId
-       (`server/src/vault/grantWrap.ts`), so `GET /vault/:id/auth/grant` (device bearer) can return it to any live
+       from that moment (401 `unauthorized` on registration, pairing codes, leave). It also stores
+       `pairing_grant.secret_wrap`: AES-GCM under an HKDF key derived from the vault's ticket key, AAD vaultId and
+       grantId (`server/src/vault/grantWrap.ts`), so `GET /vault/:id/auth/grant` (device bearer) can return it to any live
        store of the grant. A grant never rotated has no wrap: `404 grant_secret_unavailable`, and the client keeps its
        secret. Revoked: `401 grant_revoked`; a pre-grant enroll: `403 grant_required`. The client fetches lazily, when
        the old secret is refused: `registerPending` retries once after `ProtocolEngine.refreshGrant` (fetch, then
@@ -751,8 +751,8 @@ No released client has the current format, so there is no in-place migration.
 3. On first start the new build deletes `yaos2:<vaultId>:*` DBs and the flat `state/outbox-*.bin` and
    `state/synced-*.bin` (identity-less legacy layout). Unsent edits there are on disk and are re-derived by the
    onboarding scan.
-4. In the console, remove the old device rows. The phase-1 migration keeps them (the current client still enrolls and
-   syncs through them); phase 2 may drop device rows without a grant when it removes the old `/enroll` body.
+4. Re-create each server vault in the console: the vault schema is created at vault init and never migrated, so a
+   vault made before the current schema does not load.
 
 Optional convenience, if re-pairing many dev installs is a burden: a one-shot `POST /vault/:id/auth/grant-from-device`
 (device bearer) that converts the old device row into a grant plus its first device.

@@ -32,11 +32,6 @@ export function isMissingTableError(error: unknown, table: string): boolean {
 	return error instanceof Error && error.message.includes(`no such table: ${table}`);
 }
 
-/** SQLite's "no such column: <column>" (a schema migration not run yet). */
-export function isMissingColumnError(error: unknown, column: string): boolean {
-	return error instanceof Error && error.message.includes(`no such column: ${column}`);
-}
-
 /**
  * `name: message` for logs. An error that crossed a DO RPC logs as its local stack only (measured on scratch-3: the
  * `restore step failed` lines carried no message), so log sites print this instead of the error object.

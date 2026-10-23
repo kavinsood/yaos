@@ -232,7 +232,7 @@ bound to the vaultId only. *Why:* an epoch means only "the stream space was repl
   seqs ≤ the stream cursor"): silent divergence. Only finish's new epoch heals it (§11 step 3 drops all cursors).
   The vault cannot detect its own rewind (the restored state is a genuine past state), so the intent lives in the
   config DO, with a config-DO alarm that resumes it.
-- **Crosses the rewind:** the device rows only; since identity v2 also the grant rows and the tombstones (§10), so a
+- **Crosses the rewind:** the device rows, the grant rows and the tombstones (§10), so a
   restore never brings back a revoked pairing or a retired deviceId. Not pairing codes (all deleted), the epoch
   (finish mints a new random one, so no collision with a post-T epoch), the ticket key or the daily latch.
 
@@ -502,46 +502,41 @@ CREATE TABLE vault_meta (
   created_at INTEGER NOT NULL,
   pending_restore_id TEXT,             -- D8b: set by prepare, erased by a real rewind
   last_restore_id TEXT,                -- D8b: step 2 skip, finish idempotency
-  last_restore_at INTEGER
+  last_restore_at INTEGER,
+  removals INTEGER NOT NULL DEFAULT 0, -- key-roll signal (§10.2): blocking operator removals
+  rekeyed INTEGER NOT NULL DEFAULT 0   -- the highest `removals` a device has covered with a new vault key
 ) WITHOUT ROWID;
 CREATE TABLE device (
   token_hash BLOB PRIMARY KEY,         -- SHA-256(deviceToken)
   device_id TEXT NOT NULL, device_name TEXT NOT NULL,
-  enrollment_request_id TEXT NOT NULL, enrolled_at INTEGER NOT NULL
+  enrollment_request_id TEXT NOT NULL, enrolled_at INTEGER NOT NULL,
+  grant_id TEXT,                       -- §10; NULL for an old `/enroll`
+  retire_hash BLOB,                    -- SHA-256(retire key)
+  last_seen_day INTEGER                -- UTC day of the last ticket
 ) WITHOUT ROWID;                       -- no secondary index: revoke scans (a few rows)
 CREATE TABLE pairing_code (
   code_hash BLOB PRIMARY KEY,          -- SHA-256(secret)
   purpose TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER,
-  used_request_id TEXT, used_device_id TEXT   -- D3 replay key
+  used_request_id TEXT, used_device_id TEXT,  -- D3 replay key
+  used_grant_id TEXT                   -- D3 replay key of a grant enroll
 ) WITHOUT ROWID;
-```
-
-Identity v2 (identity-per-store phase 1, §10): `device` gains `grant_id TEXT`, `retire_hash BLOB` (SHA-256 of the
-retire key) and `last_seen_day INTEGER` (UTC day); `pairing_code` gains `used_grant_id TEXT` (the D3 replay key of a
-grant enroll); and two tables:
-
-```sql
 CREATE TABLE pairing_grant (
   grant_id TEXT PRIMARY KEY,           -- base64url(16 B), minted by the server
   secret_hash BLOB NOT NULL,           -- SHA-256(grantSecret)
   grant_name TEXT NOT NULL, enrollment_request_id TEXT NOT NULL, created_at INTEGER NOT NULL,
   revoked_at INTEGER,                  -- set once; the row is kept
-  registered_day INTEGER NOT NULL DEFAULT 0, registered_count INTEGER NOT NULL DEFAULT 0  -- 20 a UTC day
+  registered_day INTEGER NOT NULL DEFAULT 0, registered_count INTEGER NOT NULL DEFAULT 0,  -- 20 a UTC day
+  secret_wrap BLOB                     -- §10.1: null until the first rotation
 ) WITHOUT ROWID;
 CREATE TABLE retired_device (           -- tombstones, never deleted, never loaded into memory
   device_id TEXT PRIMARY KEY, grant_id TEXT, retired_at INTEGER NOT NULL
 ) WITHOUT ROWID;
 ```
 
-Identity v3 (phase 5, §10.1): `pairing_grant` gains `secret_wrap BLOB` (null until the grant's first rotation: IV ||
-AES-GCM of the rotated secret under an HKDF key of `ticket_key`, AAD vaultId and grantId).
+`secret_wrap` is IV || AES-GCM of the rotated secret under an HKDF key of `ticket_key`, AAD vaultId and grantId.
 
-Identity v4 (key-roll signal, §10.2): `vault_meta` gains `removals INTEGER NOT NULL DEFAULT 0` and
-`rekeyed INTEGER NOT NULL DEFAULT 0`.
-
-Init runs the v1 DDL above and then the v2, v3 and v4 migrations, so a new vault and a migrated one are identical. A
-vault made before v2 migrates once, at the first load of a runtime (G54); one made before v3 or v4 likewise (G65,
-G67).
+This is the one vault schema, created whole in the vault-init transaction. A vault made before it does not load and
+is re-created.
 
 Probing an unknown vault reads `vault_meta`; "no such table" means unknown, cached in memory (init runs in the same
 object, so the cache stays coherent). Rows read per runtime: meta 1 + grants G + devices N, then 0 per bearer auth.
@@ -681,12 +676,9 @@ WB files in `tests/server/` (WB file names are suggestions).
 | T-GRANT-CODE | `POST /auth/pairing-code` with the grant secret; schemes never mix | WB | n/a (new) | grants.ts |
 | T-LAST-SEEN | `last_seen_day` ≤ 1 write a device a UTC day; the listing has no secret material | WB | n/a (new) | grants.ts |
 | T-RESTORE-GRANTS | a restore keeps a revoked pairing revoked and a tombstone | WB | n/a (new) | grants.ts |
-| T-MIGRATE-V2 | a v1 vault migrates once at its first load, rows intact, 0 CF rows (G54) | WB | n/a (new) | vault-host.ts |
 | T-INACTIVE | not seen > 90 UTC days → retired with a tombstone at the next register / device status / listing; exactly 90 kept; an open socket kept and marked seen; an unused registration retired; once a UTC day; ≤ 50 a call; skipped while latched; threshold override | WB | n/a (new) | identity-hygiene.ts |
 | T-ROTATE | rotate: old secret 401 at once, a live store fetches the new one, 1 row; unknown / revoked 0 rows; 404 before any rotation; 403 old enroll; 401 revoked; survives a D8b restore; zero config-DO calls on the fetch | WB | n/a (new) | identity-hygiene.ts |
-| T-MIGRATE-V3 | a v2 vault gains `secret_wrap` at its next load; its grants keep working (G65) | WB | n/a (new) | identity-hygiene.ts |
 | T-REKEY-SIGNAL | VAULT_READY.rekey on every connect; revoke pairing and a grantless revoke count and broadcast VAULT_REKEY; remove-under-grant, leave and self-retire do not; VAULT_REKEYED taken only in (rekeyed, removals], then broadcast; a removed device cannot ack; a restore keeps both counts | WB | n/a (new) | rekey-signal.ts |
-| T-MIGRATE-V4 | a v3 vault gains `removals` and `rekeyed` (0, 0) at its next load (G67) | WB | n/a (new) | rekey-signal.ts |
 
 ---
 
@@ -934,10 +926,6 @@ in relay-wire §2.4–§2.5; tests in §7 (grants.ts).
 
 Gap calls (accepted with phase 1; marked `DECISIONS-GAP` in code where they sit in one place):
 
-- G54 Identity v2 is the one DDL on a request path: a vault initialized before it runs the v2 migration (4 `ALTER`,
-  2 `CREATE`, one transaction) at its first load, detected by "no such table: pairing_grant" on the grant scan, which
-  every runtime does anyway (0 extra reads). An unknown vault never reaches it (T-PAIR-NOWRITE holds). The
-  `[[migrations]]` tags in `wrangler.toml` are class migrations and do not change: no class is added or removed.
 - G55 The table is `pairing_grant` (`grant` is a SQL keyword).
 - G56 The client mints the grant secret (the design had the server mint it): the D3 replay must answer the same 200
   after a lost response, and the server keeps only a hash, exactly as for device tokens. `grantId` is server-minted.
@@ -982,9 +970,6 @@ The server half of identity-per-store §12.2 phase 5. Routes in §2.2; schema in
 
 Gap calls (phase 5):
 
-- G65 Identity v3 (`ALTER TABLE pairing_grant ADD COLUMN secret_wrap BLOB`) migrates like G54: detected by "no such
-  column: secret_wrap" on the grant scan every runtime does anyway, run in one transaction at the first load; a vault
-  older than v2 runs both. Not an `identityWrites` write.
 - G66 Inactivity retirements and rotations are `identityWrites` writes (authority): one that lands in a D8b rewind
   window forces the re-rewind, as an operator revoke would. The rotation is also under D8b's freeze (FrozenAction
   "revoke"). The journal carries `secretWrap` with each grant, so a restore keeps a rotation as it is now.
@@ -1010,8 +995,6 @@ removal that blocks an install, the other devices' plugins ask the user to make 
 
 Gap calls:
 
-- G67 Identity v4 (`ALTER TABLE vault_meta ADD COLUMN removals …`, `… rekeyed …`) migrates like G54 and G65:
-  detected by "no such column: removals" on the meta read every runtime does anyway, run once at the first load.
 - G68 Both counters are authority (`identityWrites`): a count or an ack in a D8b rewind window forces the re-rewind.
   The D8b snapshot carries `rekey: {removals, rekeyed}`; an older snapshot without it restores the counters as they
   are now. A reset keeps them (authority, not content). An ack refused by the daily write limit is dropped; the
