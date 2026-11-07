@@ -18,6 +18,7 @@ export class PairDeviceModal extends Modal {
 		app: App,
 		private readonly deepLink: string,
 		private readonly mobileUrl: string,
+		private readonly newVaultId?: string,
 	) {
 		super(app);
 	}
@@ -27,9 +28,21 @@ export class PairDeviceModal extends Modal {
 		contentEl.empty();
 		contentEl.addClass("yaos-pair-device-modal");
 
-		contentEl.createEl("h3", { text: "Pair another device" });
+		contentEl.createEl("h3", { text: this.newVaultId ? "Set up a separate vault" : "Pair another device" });
 		contentEl.createEl("p", {
-			text: "Scan this setup code on your phone to open the setup page. If the plugin is not installed yet, the page will guide you through the beta install flow first.",
+			text: this.newVaultId
+				? "Create or open the new local vault in Obsidian first, then scan this code or use a setup link below with that vault active. Install YAOS there if needed. This creates an independent sync room on the same server; it does not change this vault or copy its notes."
+				: "Scan this setup code on your phone to open the setup page. If the plugin is not installed yet, the page will guide you through the beta install flow first.",
+			cls: "yaos-modal-copy",
+		});
+		if (this.newVaultId) {
+			contentEl.createEl("p", { text: `New vault ID: ${this.newVaultId}` });
+			contentEl.createEl("p", {
+				text: "Keep this link to connect other devices to the same new vault. Opening this dialog again generates a different vault ID. Do not open the link in your current vault, as it would switch its sync room.",
+			});
+		}
+		contentEl.createEl("p", {
+			text: "Treat this QR code and these links like a password: they contain the shared server token, which grants access to all vaults on this server.",
 			cls: "yaos-modal-copy",
 		});
 

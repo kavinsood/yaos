@@ -50,6 +50,14 @@ From the claim page, open the setup link or scan the QR code. YAOS fills in the 
 
 That's it. Your vault is syncing.
 
+### Sync a separate vault on the same server
+
+In an already connected vault, open **YAOS settings → Sync status → Set up a separate vault**. This generates a fresh vault ID and displays a QR code and setup links without changing the current vault.
+
+Create or open the new local vault in Obsidian, install YAOS there, and use the generated setup link with that vault active. Save the link to connect additional devices to that same vault; opening **Set up a separate vault** again generates another independent vault ID. Use **Pair another device** instead when you want to sync the current vault on another device.
+
+Treat setup links and QR codes like passwords. Vaults have separate sync data, but share the server token; this is not per-vault access control.
+
 ## Attachments and snapshots
 
 Text sync works out of the box. To sync images, PDFs, and other attachments, add a Cloudflare R2 bucket — it takes about a minute.

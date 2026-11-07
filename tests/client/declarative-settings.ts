@@ -119,6 +119,40 @@ s.section("Declarative settings inventory");
 	s.check(!("display" in tab), "imperative display fallback is absent");
 }
 
+s.section("Separate vault setup preserves the current connection");
+{
+	const { tab, host, settings, updateReasons } = createFixture();
+	settings.host = "https://sync.example.com";
+	settings.token = "shared-token";
+	settings.vaultId = "existing-vault";
+	const originalSettings = JSON.stringify(settings);
+	const deepLinkIds: (string | undefined)[] = [];
+	const mobileIds: (string | undefined)[] = [];
+	host.buildSetupDeepLink = (id) => {
+		deepLinkIds.push(id);
+		return "obsidian://yaos?action=setup";
+	};
+	host.buildMobileSetupUrl = (id) => {
+		mobileIds.push(id);
+		return "https://sync.example.com/mobile-setup";
+	};
+	const definitions = collectDefinitions(tab.getSettingDefinitions());
+	const create = definitions.find((item) => item.name === "Set up a separate vault");
+	s.check(typeof create?.action === "function", "configured server exposes separate vault setup");
+	const actionEl = {} as HTMLElement;
+	await create?.action?.(actionEl, 0);
+	await create?.action?.(actionEl, 0);
+	s.check(!!deepLinkIds[0] && deepLinkIds[0] !== settings.vaultId, "setup uses a new vault ID");
+	s.check(deepLinkIds[0] !== deepLinkIds[1], "each setup generates an independent room");
+	s.check(mobileIds[0] === deepLinkIds[0] && mobileIds[1] === deepLinkIds[1], "QR and desktop links target the same new room");
+	await definitions.find((item) => item.name === "Pair another device")?.action?.(actionEl, 0);
+	s.check(deepLinkIds[2] === undefined && mobileIds[2] === undefined, "existing pairing still uses the current vault");
+	s.check(JSON.stringify(settings) === originalSettings, "generating links leaves settings unchanged");
+	s.check(updateReasons.length === 0, "generating links does not reconnect or persist settings");
+	settings.host = "";
+	s.check(!collectDefinitions(tab.getSettingDefinitions()).some((item) => item.name === "Set up a separate vault"), "separate vault setup is hidden until server is configured");
+}
+
 s.section("Control persistence and side effects");
 {
 	const { tab, settings, updateReasons, attachmentRefreshReasons } = createFixture();

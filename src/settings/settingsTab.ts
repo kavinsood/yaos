@@ -10,6 +10,7 @@ import { PairDeviceModal } from "./PairDeviceModal";
 import { RecoveryKitModal } from "./RecoveryKitModal";
 import {
 	attachmentSizeCapKB,
+	generateVaultId,
 	type ExternalEditPolicy,
 	type VaultSyncSettings,
 } from "./settingsStore";
@@ -59,8 +60,8 @@ export interface VaultSyncSettingsHost {
 	refreshAttachmentSyncRuntime(reason?: string): Promise<void>;
 	getSettingsStatusSummary(): { state: SettingsStatusState; label: string };
 	getUpdateState(): SettingsUpdateState;
-	buildSetupDeepLink(): string | null;
-	buildMobileSetupUrl(): string | null;
+	buildSetupDeepLink(vaultId?: string): string | null;
+	buildMobileSetupUrl(vaultId?: string): string | null;
 	buildRecoveryKitText(): string | null;
 }
 
@@ -158,6 +159,11 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					name: "Pair another device",
 					desc: "Open a setup code and link for another device.",
 					action: () => this.openPairing(),
+				},
+				{
+					name: "Set up a separate vault",
+					desc: "Generate a QR code and links for a new, independent vault on this server. This vault stays unchanged.",
+					action: () => this.openPairing(true),
 				},
 				{
 					name: "Back up connection details",
@@ -514,14 +520,15 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		}
 	}
 
-	private openPairing(): void {
-		const deepLink = this.host.buildSetupDeepLink();
-		const mobileUrl = this.host.buildMobileSetupUrl();
+	private openPairing(separateVault = false): void {
+		const vaultId = separateVault ? generateVaultId() : undefined;
+		const deepLink = this.host.buildSetupDeepLink(vaultId);
+		const mobileUrl = this.host.buildMobileSetupUrl(vaultId);
 		if (!deepLink || !mobileUrl) {
 			new Notice("Configure the server URL, sync token, and vault ID before pairing.", 7000);
 			return;
 		}
-		new PairDeviceModal(this.app, deepLink, mobileUrl).open();
+		new PairDeviceModal(this.app, deepLink, mobileUrl, vaultId).open();
 	}
 
 	private openRecoveryKit(): void {

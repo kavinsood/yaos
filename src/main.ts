@@ -2148,10 +2148,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.capabilityUpdateService?.capabilities?.maxBlobUploadBytes ?? null;
 	}
 
-	buildSetupDeepLink(): string | null {
+	buildSetupDeepLink(targetVaultId = this.settings.vaultId): string | null {
 		const host = this.settings.host?.trim().replace(/\/$/, "");
 		const token = this.settings.token?.trim();
-		const vaultId = this.settings.vaultId?.trim();
+		const vaultId = targetVaultId?.trim();
 		if (!host || !token || !vaultId) return null;
 		const params = new URLSearchParams({
 			action: "setup",
@@ -2162,10 +2162,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return `obsidian://yaos?${params.toString()}`;
 	}
 
-	buildMobileSetupUrl(): string | null {
+	buildMobileSetupUrl(targetVaultId = this.settings.vaultId): string | null {
 		const host = this.settings.host?.trim().replace(/\/$/, "");
 		const token = this.settings.token?.trim();
-		const vaultId = this.settings.vaultId?.trim();
+		const vaultId = targetVaultId?.trim();
 		if (!host || !token || !vaultId) return null;
 		const hash = new URLSearchParams({
 			host,
