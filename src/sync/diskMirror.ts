@@ -11,6 +11,7 @@ import {
 	type FrontmatterValidationResult,
 } from "./frontmatterGuard";
 import { isLocalOrigin } from "./origins";
+import { isMarkdownConflictArtifactPath } from "./markdownConflictArtifact";
 import { contentBaselineHash } from "./diskIndex";
 import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
 export { isLocalOrigin };
@@ -502,6 +503,11 @@ export class DiskMirror {
 
 	async flushWrite(path: string, force = false): Promise<void> {
 		path = normalizePath(path);
+		// Older clients admitted safety copies into the shared document. The
+		// upload filter alone cannot protect a user deleting one locally: its
+		// CRDT entry survives, so reconciliation or a remote edit can recreate
+		// it. Enforce locality on every writeback, including forced writes.
+		if (isMarkdownConflictArtifactPath(path)) return;
 		return this.runPathWriteLocked(path, () => this.flushWriteUnlocked(path, force));
 	}
 
