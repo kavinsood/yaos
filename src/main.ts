@@ -18,6 +18,7 @@ import { isMarkdownSyncable, isBlobSyncable } from "./types";
 import { planCategoryRenameAction } from "./sync/policy/renameAdmissionPolicy";
 import { classifySyncPath } from "./paths/pathCategory";
 import { isCanonicalPathFileIdCollision } from "./paths/pathCollision";
+import { waitForWorkspaceLayoutReady } from "./runtime/waitForLayoutReady";
 import type { TraceSink } from "./observability/traceSink";
 import type { FlightEventInput, FlightPathEventInput } from "./observability/flightEnvelope";
 import { NoopTraceSink } from "./observability/noopTraceSink";
@@ -1044,6 +1045,22 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			const mode = this.vaultSync.getSafeReconcileMode();
 			this.log(`Reconciliation mode: ${mode}`);
+
+			// Issue #77: wait for Obsidian to finish restoring the previous
+			// session's open panes before running the FIRST authoritative
+			// reconcile. Before this gate, a note left open across a restart had
+			// no MarkdownView leaf yet — isOpenOrBound was a false negative — so
+			// the closed-file planner treated a note the user was actively
+			// typing in as closed, and (with no baseline hash for a fresh note)
+			// dumped the in-progress disk content into a conflict artifact.
+			// Same pattern as AttachmentOrchestrator's download gate.
+			if (!this.app.workspace.layoutReady) {
+				this.log("Startup reconciliation: waiting for workspace layout to finish restoring...");
+				this.trace("trace", "startup-reconcile-awaiting-layout-ready", {});
+				await waitForWorkspaceLayoutReady(this.app.workspace);
+				if (abortIfStale("workspace layout ready")) return;
+				this.log("Startup reconciliation: workspace layout ready, proceeding");
+			}
 
 			await this.runReconciliation(mode);
 			if (abortIfStale("startup reconciliation")) return;
